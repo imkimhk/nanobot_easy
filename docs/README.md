@@ -8,7 +8,19 @@ Most JSON examples in these docs are snippets to merge into `~/.nanobot/config.j
 
 Provider examples are concrete walkthroughs, not rankings or endorsements. Use the provider whose key, endpoint, and model ID you actually control.
 
-If you find a docs mistake, outdated command, or confusing step, please open an issue: <https://github.com/HKUDS/nanobot/issues>.
+If you find a docs mistake, outdated command, or confusing step in the upstream nanobot pages, please open an issue: <https://github.com/HKUDS/nanobot/issues>. Pages specific to the nanobot-easy fork (skills registry, stepwise reasoning, complex research, pinned runtimes) describe this repository, not the upstream release.
+
+## nanobot-easy fork
+
+| Goal | Read |
+|---|---|
+| Korean overview and setup | [`../README.md`](../README.md), [`nanobot-easy-usage-ko.md`](./nanobot-easy-usage-ko.md) |
+| Implementation status and design/implementation gaps | [`design/skill-framework-implementation-v3.3---14b5c557-d23d-4fec-80ed-09b60e10a786.md`](./design/skill-framework-implementation-v3.3---14b5c557-d23d-4fec-80ed-09b60e10a786.md) |
+| Source-level map, including opt-in paths | [`architecture.md`](./architecture.md#opt-in-execution-paths) |
+| Coding guidance and evaluation protocol | [`development.md`](./development.md#coding-guidance-and-evaluation) |
+| Research skills and evaluation results | [`complex-research.md`](./complex-research.md) |
+| Stepwise reasoning (opt-in) | [`design/stepwise-llm-reasoning.md`](./design/stepwise-llm-reasoning.md) |
+| Pinned runtime deployment | [`../deploy/README.md`](../deploy/README.md) |
 
 ## Pick a Track
 
@@ -19,7 +31,7 @@ If you find a docs mistake, outdated command, or confusing step, please open an 
 | Operating a long-running bot | [`concepts.md`](./concepts.md) | [`chat-apps.md`](./chat-apps.md), [`webui.md`](./webui.md), and [`deployment.md`](./deployment.md) |
 | Integrating or extending nanobot | [`architecture.md`](./architecture.md) | [`configuration.md`](./configuration.md), [`openai-api.md`](./openai-api.md), [`python-sdk.md`](./python-sdk.md), [`development.md`](./development.md), and [`channel-plugin-guide.md`](./channel-plugin-guide.md) |
 | Using the nanobot-easy fork locally | [`nanobot-easy-usage-ko.md`](./nanobot-easy-usage-ko.md) | Project-local setup, scripts, Telegram, WebUI, and skill registry operations |
-| Designing the student-friendly distribution | [`student-mode-distribution-ko.md`](./student-mode-distribution-ko.md) | Windows-first setup, student/general mode, safe mode, and local study data |
+| Designing the student-friendly distribution (currently unsupported) | [`student-mode-distribution-ko.md`](./student-mode-distribution-ko.md) | Design record for student/general mode, safe mode, and local study data; student mode is hidden in the WebUI |
 
 ## Start Here
 

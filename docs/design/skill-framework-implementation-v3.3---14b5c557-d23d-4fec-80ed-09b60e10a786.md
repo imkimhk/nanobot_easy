@@ -1,4 +1,4 @@
-# Skill-Orchestrated Agent Framework — 구현 설계서 v3.4.14
+# Skill-Orchestrated Agent Framework — 구현 설계서 v3.4.15
 (Implementation-Ready / HKUDS nanobot v0.2.2 포크 기반)
 
 대상 독자: 코드 생성 도구(Claude Code, Codex) 및 구현자.
@@ -15,6 +15,7 @@ v3.4.11 변경: 워크플로우 설계 지시서 v2를 반영해 durable workflo
 v3.4.12 변경: PR #23 병합 결과(`a725c559 Merge pull request #23`)를 기준으로 문서를 실제 구현 상태에 맞춰 현행화한다. Stage 0~4는 구현·테스트 완료, Stage 5는 평가 도구만 구현했고 실제 모델 on/off 평가는 미실시, Stage 6 확장 harness는 별도 `feat/workflow-extension-stage6` 브랜치로 분리, 서브에이전트 scope 노출은 안전한 context/registry 연결 전까지 보류, LLM tool `input`은 세션 원문 대체값으로 쓰지 않는 것으로 정정한다.
 v3.4.13 변경: PR #24(`16dfbb9f`)에서 빠진 이전 설치·온보딩·에이전트 관리 개정안(구 v3.4.11 패치)은 적용되지 않았고 이번 v3.4.13에 통합한다. 구 v3.4.11 패치는 현재의 워크플로우 v3.4.11 명칭과 충돌하고 PR #24 이후 문서에 직접 적용되지 않으므로 참고 자료로만 보며, 현재 코드 확인 결과에 따라 3.8 설치/LLM 연결, 3.10 설치 경로, 3.11 브라우저 온보딩, 3.12 에이전트 관리, 12장 relay 현황, 13장 설계서와 구현의 차이를 갱신한다.
 v3.4.14 변경: v3.4.13 이후 병합된 PR #26·#27, #29~#36, #38·#39(최신 `6e475bcd`)를 반영한다. ① 학생 모드 미지원 결정(#27)을 0장 요약·2장 매핑·3.11·9장·10장까지 일관되게 반영하고, 관련 테스트·마일스톤은 "재도입 시"로 보류 표시한다. ② xAI Grok OAuth 프로바이더(#38)와 클라이언트 버전 상향(#39)을 3.13으로 신설하고 3.8 LLM 연결·11장 미결 사항에 반영한다. ③ WebUI 디자인 정렬 작업(#29~#36: 테마 토큰, 공용 부품, 화면별 정렬, 셸·홈 예시 문장)을 3.14로 신설한다.
+v3.4.15 변경(확인일 2026-11-04, 대상 소스 `3933fed9` — 개발 기준 `17b445e1` 위의 런타임 통합 브랜치): ① 2장 구현 지도의 "신규 #1~#5"를 실제 구현 상태로 바꾸고 opt-in 경로(contextSelection·time-allocation·stepwise·evidence)와 대화 사건 기억·고정 런타임을 추가 ② 3.2 검색 인덱스를 실제 구현(FTS5 BM25 기본, 임베딩 선택)으로 정정 ③ 13.6에 이번 대조 결과·운영 적용 범위·남은 차이를 기록. 코드·설정 변경은 없다.
 
 ---
 
@@ -30,6 +31,7 @@ v3.4.14 변경: v3.4.13 이후 병합된 PR #26·#27, #29~#36, #38·#39(최신 `
 - v3.4.13은 PR #24에서 빠진 설치·온보딩·에이전트 관리·relay-setup 현황과 설계서/구현 차이를 문서에 통합한다. 구현 차이와 결정 필요 항목은 13장을 먼저 확인한다.
 - v3.4.14 기준 모델 연결은 OpenAI Codex·GitHub Copilot에 더해 xAI Grok 구독 계정 OAuth를 지원한다(3.13). xAI의 비공개 클라이언트 계약에 의존하므로 예고 없이 멈출 수 있다.
 - WebUI는 목업 기준으로 테마 토큰·공용 부품(`Chip`, `OptionCard`, `PageHeader`)·셸을 통일했다(3.14). 새 화면은 이 토큰과 부품을 먼저 쓴다.
+- v3.4.15 확인 기준(2026-11-04): 구현 설명은 소스 `3933fed9` 기준이다. 이 커밋은 개발 브랜치 `17b445e1`에 운영 런타임 기능(`5cbb18b7`)을 통합한 별도 브랜치이며 개발 브랜치에는 아직 병합되지 않았다. 운영 적용 범위와 남은 차이는 13.6을 본다. 스키마 기본값과 로컬 인스턴스 설정은 구분한다.
 
 ---
 
@@ -53,20 +55,27 @@ v3.4.14 변경: v3.4.13 이후 병합된 PR #26·#27, #29~#36, #38·#39(최신 `
 | Conversation Runtime | 기존 AgentLoop | 있음 (메인 프롬프트에 3.1/3.4 규칙 추가) |
 | Harness | 패치된 SubagentManager | 완료 |
 | Hot Path | 프로파일 config `skills` 사전 로드 | 완료 |
-| Cold Path | `agent/tools/skill_search.py` (배치 지원) | **신규 #1** |
-| Skill Registry + Trace | `workspace/.skillstore/skillstore.db` | **신규 #2** |
+| Cold Path | `agent/tools/skill_search.py` (배치 지원) + `agent/tools/skill_decision.py` | 구현됨 — candidate·verified만 검색, 최종 선택은 `skill_decision` 기록(3.2) |
+| Skill Registry + Trace | `nanobot/skill_store.py` → `workspace/.skillstore/skillstore.db` | 구현됨 — FTS5 검색 행, trace, 상태(draft/candidate/verified), 통계 |
 | Skill Repository | `workspace/skills/` + git | 있음 |
-| 시스템 스킬 | 코드 저장소 `skills-system/` (composite-task, Composer 스킬군) | **신규 산출물 (문서)** |
+| 시스템 스킬 | `nanobot/skills-system/` (composite-task, Composer 스킬군 8종) | 구현됨 (SKILL.md) |
 | Trigger Relation Graph | frontmatter → Registry 적재 시 파싱 | #2에 포함 |
-| Composer | skill-creator 확장 + 검토 스킬 4종 + `nanobot skill` CLI | **신규 #3** |
-| 동기 위임 | `delegate` 툴 | **신규 #4** |
+| Composer | `nanobot/skill_composer.py` + `nanobot skill` CLI + WebUI 관리 API | 구현됨 — 초안·검토 의견·routing case를 모델이 한 번에 생성. 검토 스킬별 개별 실행 보장은 확인 필요. 승인은 사람 |
+| 동기 위임 | `agent/tools/delegate.py` | 구현됨 |
 | Task Ledger | tasks.md 규약 (composite-task가 사용) + 기존 timeout/iteration | 코드 최소 |
 | Workflow Tool | `nanobot/agent/tools/workflow.py :: WorkflowTool` | 완료 — opt-in, `_scopes={"core"}`, `config.tools.workflow.enabled=false` 기본 |
 | Workflow Service | `nanobot/workflow/service.py :: WorkflowService` + `store.py` SQLite | 완료 — run/resume/status/cancel/list, lease, restart recovery |
 | Workflow Runtime 연결 | `agent/context.py`, `workflow/runtime_lines.py`, `workflow/control.py`, `workflow/delivery.py` | 완료 — enabled일 때만 대기 줄·명시 resume·최종 전달 훅 연결 |
 | Workflow Definition/Executor | `workflow/schema.py`, `validator.py`, `executor.py`, `definitions/situation_judgment.v1.json` | 완료 — 5개 단계 유형, validators, branch pruning |
 | 대화 메모리 | 기존 memory 시스템(sessions/*.jsonl, Consolidator, MEMORY.md, Dream) | 있음 (3.7의 소규모 보강) |
-| 멀티토픽 보강 | topic-recall 스킬 + topics/ 스냅샷 규약 + Consolidator 템플릿 수정 | **신규 #5 (스킬·규약 위주)** |
+| 멀티토픽 보강 | `nanobot/skills/topic-recall` + Consolidator 템플릿의 주제별 묶음 지침 | 구현됨 (스킬·템플릿) — 회상 품질 측정은 미실시 |
+| 대화 사건 기억 | `nanobot/memory/` (event_store, search, task_context, privacy) | 구현됨 — 명시적 forget/purge 제공, 저장 시 민감정보 자동 제거는 구현 근거 없음 |
+| 완료 약속 보정 | `agent/premature_final.py` | 구현됨 — 기본 AgentLoop 경로, 새 승인 부여 없음 |
+| Intent-first 문맥 선택 | `agent/context_selection.py` | 구현됨, opt-in — `contextSelection.enabled=false` 기본 |
+| 시간 배분 계약 | `agent/time_allocation.py` | 구현됨, opt-in — 문맥 선택 경로에서만 적용 |
+| 단계별 추론 | `nanobot/reasoning/` + `nanobot stepwise` CLI | 구현됨, opt-in — 에이전트별 apply, 기본 120초·8회 상한 |
+| 검색 근거 패킷 | `nanobot/evidence/` + `agent/tools/web.py` | 구현됨, opt-in — `tools.web.evidence.enabled=false` 기본, 조건 충족 검증 안 함 |
+| 고정 런타임 배포 | `scripts/runtime.sh`, `scripts/runtime_launcher.py`, `deploy/` | 구현됨 — 통합 브랜치에만 존재(13.6) |
 | 설치 모드 | Quick Start의 General/Student mode + `config.studentMode` | **신규 #6** — 현재 미지원(PR #27), WebUI 선택 UI 숨김 |
 | 학생 학습 스킬 | `highschool-study`, `spaced-review` | **신규 #7 (내장 스킬)** — 학생 모드와 함께 보류 |
 | 학생 학습 데이터 | `student_learning` 툴 + `study_log.jsonl` + `review_queue.jsonl` | **신규 #8** — 학생 모드와 함께 보류 |
@@ -108,6 +117,7 @@ v3.4.14 변경: v3.4.13 이후 병합된 PR #26·#27, #29~#36, #38·#39(최신 `
 - query 작성 규칙(v3.4.6): 메인 LLM이 사용자 원문을 의미 단위로 재작성한다. 포함할 것: 무엇을(대상), 어떤 작업을(동사), 어떤 형태로(산출물). 예: "이직할지 말지 고민인데 장단점 목록으로" → "단일 의사결정의 찬반·장단점 구조화 분석".
 - 출력(후보별): name, description, when_to_use/not, risk_level, requires_exec, category, score, match_grade(strong/moderate/weak), 후보 간 관계(conflicts_with/supersedes/fallback_to).
 - 랭킹 Phase 1: 임베딩 유사도 + specificity 가점. 통계 가중은 Phase 2.
+- v3.4.15 구현 현황: 기본 순위는 SQLite FTS5 BM25(상한을 둔 검색 신호)이며, `skills.embedding`을 설정한 경우에만 임베딩을 쓴다. 기본 설정에서는 벡터가 없다. 검색 순위·routing test는 후보 탐색 품질 신호이고, 최종 적용·작업 성능·실행 완료를 보장하지 않는다.
 - score/match_grade는 후보 탐색 품질 신호다. weak는 "낮은 검색 신뢰도" 표시일 뿐 자동 미적용 판정이 아니다. 최종 적용 여부는 메인 LLM이 후보 카드의 when_to_use/not와 관계 정보를 읽고 결정한다.
 - 충돌 확인 발동: 1·2위가 conflicts_with 관계이고 점수차 < 설정값(기본 10%)일 때만 "사용자 확인 권고" 플래그.
 - 검색 범위: status가 candidate 이상. draft·system은 검색 제외 (system은 상시 로드라 검색 불필요).
@@ -548,6 +558,7 @@ M3 — delegate 툴. 수용: 동기 왕복 + 게이트 error 재위임.
 M4 — 수동 스킬 15~20개 + **composite-task 작성** + **topic-recall 작성 + 주제 스냅샷 규약 + Consolidator 템플릿 수정(3.7)** + Routing Test 러너. 수용: 라우팅 정확도 ≥90%, C1~C5, T1~T2.
 M5 — Composer 스킬군 + approve CLI + 생명주기. 수용: P1 E2E.
 M6 — 통계 가중 랭킹(Phase 2), Hot Path 승격 리포트, 강등 규칙.
+v3.4.15 확인 — M1~M3의 코드(스토어·검색·delegate)는 존재한다. 각 수용 기준(라우팅 정확도 등)의 재측정은 이번 문서 작업에서 수행하지 않았다(확인 필요).
 M7 — Student mode 배포 흐름. **보류(PR #27 미지원 결정).** 설치(`bootstrap.*`, `nanobot up`)·브라우저 온보딩·locale 자동 선택은 일반 배포 흐름으로 이미 동작한다(3.10, 3.11). 재개 조건은 WebUI 경로의 `tools.safe_mode` ToolLoader 연동이다(13.3). 재개 시 수용: `bootstrap.sh`/`bootstrap.command`/`bootstrap.ps1`/`bootstrap.bat`와 `nanobot up` 경로, 브라우저 온보딩, 설정 화면 Student mode 전환, `highschool-study`/`spaced-review`, `student_learning`, safe mode, locale 자동 선택이 ST1~ST4를 통과한다.
 
 ## 11. 미결 사항
@@ -601,7 +612,7 @@ WebUI에는 relay 발급 화면을 만들지 않는 방침을 유지한다. 발�
 
 ---
 
-## 13. 설계서와 구현의 차이 (v3.4.13, v3.4.14 갱신)
+## 13. 설계서와 구현의 차이 (v3.4.13, v3.4.14, v3.4.15 갱신)
 
 이 장은 구현 지시가 아니라 현재 문서와 코드가 어긋났던 지점과 아직 결정이 필요한 지점을 기록한다. 확인하지 않은 항목은 구현됨으로 쓰지 않는다.
 
@@ -645,6 +656,32 @@ WebUI에는 relay 발급 화면을 만들지 않는 방침을 유지한다. 발�
 
 - PR #23 기준 전체 pytest 기존 실패는 94개로 기록되어 있다(이전 101개에서 감소).
 - 일부 테스트가 저장소 루트에 `memory/conversation_memory.db`, `memory/eval_report.json`, `<MagicMock ...>/memory/...`를 만드는 문제가 알려져 있다. 원인 후보는 `tests/test_memory_eval.py`의 기본 작업 폴더 사용과 워크스페이스로 MagicMock 객체를 넘기는 테스트다.
+
+---
+
+### 13.6 v3.4.15 대조 결과 (2026-11-04)
+
+대상 소스는 `3933fed9`이다. 판정 근거는 코드·스키마 기본값·CLI `--help`·커밋 기록이며, 동작을 확인하지 못한 항목은 "확인 필요"로 둔다.
+
+| 항목 | 이전 문서 | 확인한 현황 | 처리 |
+|---|---|---|---|
+| 구현 지도 | Cold Path·Registry·Composer·delegate·멀티토픽이 "신규 #1~#5" | 모두 코드·스킬로 존재 | 2장 상태를 구현됨으로 갱신 |
+| 검색 인덱스 | sqlite-vec/chromadb 임베딩 | FTS5 BM25 기본, 임베딩은 선택 설정 | 3.2 현황 추가 |
+| 자동 회귀 검증 | README: 스킬 추가 시 자동 회귀 검증 | `nanobot skill test-routing`을 실행할 때만 수행, 검색 순위만 확인 | README 정정 |
+| 초안 자동 검토 | README: 다른 스킬들이 검토해 자동으로 걸러냄 | 초안 생성 호출이 검토 의견을 함께 생성, 차단 보장 없음. 승인은 사람 | README 정정 |
+| 삭제·발송 차단 | README: 의도가 명시되지 않으면 실행 자체가 막힘 | 셸 deny-pattern 가드(최선 노력)와 프롬프트 지침. 모호한 변경의 확인 질문은 opt-in 문맥 선택 경로에만 존재 | README 정정 |
+| 민감정보 | README: 저장 단계에서 걸러짐 | 저장 시 자동 제거 근거 없음. 명시적 forget/purge만 있음 | README 정정 |
+| 단계별 추론 수치 | README: 보통 2회, 120초·8회 | 단계별 추론 기본값(`reasoning/bridge.py`). 호출 수는 layout에 따름 | 범위 한정 |
+| 조사 스킬 | — | complex-research 1.1.2, research-brief 1.0.2. 개요는 스킬 탐색 없이 웹 도구 직접 사용 | README·complex-research 연결 |
+| 코딩 지침 | — | 공유 tool_contract와 code-debugging/code-review/debug-procedure 1.0.2. 실행하지 않은 계획·테스트 명령은 검증이 아님 | README에서 development 연결 |
+
+운영 적용 범위(2026-11-04 확인): 로컬 운영 인스턴스 6개가 모두 `3933fed9`의 고정 런타임 checkout에서 실행 중이며 각 health 응답은 200이다. 전환 기록에 따르면 재시작 직후와 reindex 후에 스킬 ID·상태·통계가 보존됐다. 개발 브랜치(`17b445e1`)에는 통합 커밋이 아직 병합되지 않았고 원격 게시도 하지 않았다. 전환 후 실제 모델 응답 품질은 확인하지 않았다. 따라서 "통합 브랜치 기준 운영 전환"까지는 기록이 있고, 개발 브랜치 통합은 남은 작업이다.
+
+평가 결과의 범위: 복합 조사 개선은 스킬·지침·근거 코드 묶음 전체의 합성 실험 결과다. 1.1.1 비용 실험에서는 개요 입력 토큰이 늘었다. 1.1.2 빠른 확인(8회, 합성 자료)에서는 비교 가능한 개요 2문항의 입력 토큰이 평균 44.8% 줄었다. 표본이 작고 품질 검토가 간이 방식이므로 유의성·실웹 성능·청구액 절감은 주장하지 않는다. 상세는 [complex-research.md](../complex-research.md).
+
+남은 차이(코드 작업, 이번 범위 밖):
+- 전체 pytest 기존 실패 중 문맥 선택 코드의 잠재 결함 1건은 확인 필요다. 문맥 선택은 기본 꺼짐이다.
+- 새 런타임 checkout에는 Git 제외 대상인 WebUI 빌드 산출물이 포함되지 않는다. 배포 후보 준비 절차에 빌드 산출물 포함을 넣어야 한다.
 
 ---
 
