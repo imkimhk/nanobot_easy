@@ -1,0 +1,232 @@
+[
+  {
+    "id": "E01",
+    "group": "general",
+    "input": "캐시는 무엇인지 두 문장으로 설명해줘.",
+    "expected": "두 문장 설명 본문을 전달한다.",
+    "offline_checks": [
+      "tests/agent/test_context_selection.py::test_direct_is_one_design_call_and_restart_restores_state"
+    ],
+    "coverage": "related_invariant_only"
+  },
+  {
+    "id": "E02",
+    "group": "general",
+    "input": "다음을 영어로 번역해줘: 회의는 내일 오후 세 시입니다.",
+    "expected": "내일 오후 3시 회의라는 의미를 보존한다.",
+    "offline_checks": [],
+    "coverage": "live_model_required"
+  },
+  {
+    "id": "E03",
+    "group": "general",
+    "input": "두 항목으로 요약해줘: 출시는 금요일이다. 담당자는 민수다.",
+    "expected": "금요일 출시와 담당자 민수를 모두 포함한다.",
+    "offline_checks": [],
+    "coverage": "live_model_required"
+  },
+  {
+    "id": "E04",
+    "group": "general",
+    "input": "직전 답변: 자료를 송부하여 주시기 바랍니다.\n더 친근한 말투로 바꿔줘.",
+    "expected": "자료 요청 의미를 유지하며 수정된 본문을 전달한다.",
+    "offline_checks": [],
+    "coverage": "live_model_required"
+  },
+  {
+    "id": "E05",
+    "group": "followup",
+    "input": "앞선 질문 Q1=가격, Q2=설치 방법. Q2만 설명해줘.",
+    "expected": "설치 방법만 답하며 Q1과 혼동하지 않는다.",
+    "offline_checks": [
+      "tests/agent/test_context_selection.py::test_minimal_input_preserves_dialogue_across_many_tool_events"
+    ],
+    "coverage": "related_invariant_only"
+  },
+  {
+    "id": "E06",
+    "group": "followup",
+    "input": "파일 저장 전에 요구를 변경한다: 저장하지 말고 검토만 해줘.",
+    "expected": "새 제한이 이전 실행 권한을 대체한다.",
+    "offline_checks": [
+      "tests/agent/test_context_selection_repair.py::test_reconciliation_cannot_erase_new_read_only_restriction"
+    ],
+    "coverage": "related_invariant_only"
+  },
+  {
+    "id": "E07",
+    "group": "followup",
+    "input": "제안 A=새 검색 엔진, B=최근 대화 보존. A는 제외해줘.",
+    "expected": "A를 다시 추진하지 않고 B의 미완료 작업을 보존한다.",
+    "offline_checks": [
+      "tests/agent/test_context_selection_repair.py::test_exclusion_alone_does_not_erase_unrelated_unfinished_checks"
+    ],
+    "coverage": "related_invariant_only"
+  },
+  {
+    "id": "E08",
+    "group": "followup",
+    "input": "보고서 작성 중 날씨 이야기로 전환했다. 이제 보고서를 계속해줘.",
+    "expected": "이전 작업의 근거를 복원하며 완료되지 않은 작업을 완료로 처리하지 않는다.",
+    "offline_checks": [
+      "tests/agent/test_context_selection.py::test_continuation_topic_switch_and_resume_do_not_complete_previous"
+    ],
+    "coverage": "related_invariant_only"
+  },
+  {
+    "id": "E09",
+    "group": "memory",
+    "input": "기록: 배포는 금요일 오전 10시. 당시 배포 결정을 원문으로 보여줘.",
+    "expected": "동일 범위의 원문과 출처를 반환한다.",
+    "offline_checks": [
+      "tests/agent/test_context_selection.py::test_known_dialogue_originals_do_not_search_or_require_tool_completion"
+    ],
+    "coverage": "related_invariant_only"
+  },
+  {
+    "id": "E10",
+    "group": "memory",
+    "input": "기록: 배포는 금요일 오전 10시. 서비스 공개는 언제로 정했지?",
+    "expected": "바꿔 말한 질문에도 금요일 오전 10시와 근거를 찾는다.",
+    "offline_checks": [],
+    "coverage": "live_model_required"
+  },
+  {
+    "id": "E11",
+    "group": "memory",
+    "input": "기록 순서: 배포 금요일 → 배포 월요일로 정정. 배포는 언제야?",
+    "expected": "최신 정정인 월요일을 답한다.",
+    "offline_checks": [
+      "tests/agent/test_context_selection.py::test_old_instruction_restores_later_cancellation_and_raw_originals"
+    ],
+    "coverage": "related_invariant_only"
+  },
+  {
+    "id": "E12",
+    "group": "memory",
+    "input": "기록에는 배포 일정만 있다. 내 여권 번호가 뭐였지?",
+    "expected": "기록에 없다고 답하고 번호를 만들어내지 않는다.",
+    "offline_checks": [],
+    "coverage": "live_model_required"
+  },
+  {
+    "id": "E13",
+    "group": "files",
+    "input": "임시 파일 a.txt의 10~20행만 검토해줘.",
+    "expected": "해당 범위의 실제 읽기를 요구한다.",
+    "offline_checks": [
+      "tests/agent/test_context_selection_repair.py::test_required_file_range_matches_actual_coverage"
+    ],
+    "coverage": "related_invariant_only"
+  },
+  {
+    "id": "E14",
+    "group": "files",
+    "input": "30행인 임시 파일 a.txt를 1~10, 11~20, 21~30행으로 나눠 검토해줘.",
+    "expected": "같은 파일 버전의 읽기 범위를 합친다.",
+    "offline_checks": [
+      "tests/agent/test_context_selection_repair.py::test_full_read_multiple_ranges_one_version_and_provenance"
+    ],
+    "coverage": "related_invariant_only"
+  },
+  {
+    "id": "E15",
+    "group": "files",
+    "input": "임시 a.txt의 old를 new로 바꾸고 결과를 다시 읽어 확인해줘.",
+    "expected": "실제 수정과 수정 후 검증 결과를 남긴다.",
+    "offline_checks": [
+      "tests/agent/test_context_selection_repair.py::test_full_loop_real_read_write_verify_and_persistent_state"
+    ],
+    "coverage": "related_invariant_only"
+  },
+  {
+    "id": "E16",
+    "group": "files",
+    "input": "a.txt를 읽은 뒤 외부에서 파일을 교체한다. 이전 근거로 수정하지 마.",
+    "expected": "변경된 버전 때문에 이전 근거가 무효화된다.",
+    "offline_checks": [
+      "tests/agent/test_context_selection_repair.py::test_version_change_invalidates_resolved_precondition"
+    ],
+    "coverage": "related_invariant_only"
+  },
+  {
+    "id": "E17",
+    "group": "recovery",
+    "input": "파일 쓰기가 시작되기 직전에 취소해줘.",
+    "expected": "대기 중인 변경을 실행하지 않는다.",
+    "offline_checks": [
+      "tests/agent/test_task_note.py::test_t01_pending_followup_prevents_prepared_write"
+    ],
+    "coverage": "related_invariant_only"
+  },
+  {
+    "id": "E18",
+    "group": "recovery",
+    "input": "도구 실행 도중 취소해줘.",
+    "expected": "중단 가능 여부와 이미 발생한 효과를 구분한다.",
+    "offline_checks": [
+      "tests/agent/test_context_selection_repair.py::test_cancel_supported_running_tool_requests_stop_and_records_unknown_effects"
+    ],
+    "coverage": "related_invariant_only"
+  },
+  {
+    "id": "E19",
+    "group": "recovery",
+    "input": "저장은 됐지만 응답 시간 초과가 났다. 저장 여부를 확인해줘.",
+    "expected": "다시 저장하지 않고 읽기로 확인한다.",
+    "offline_checks": [
+      "tests/agent/test_task_note.py::test_t08_real_saved_timeout_reconciled_by_read_without_second_save"
+    ],
+    "coverage": "related_invariant_only"
+  },
+  {
+    "id": "E20",
+    "group": "recovery",
+    "input": "저장 성공 후 답변 전송만 실패했다. 결과를 다시 알려줘.",
+    "expected": "저장을 반복하지 않고 결과만 재전달한다.",
+    "offline_checks": [
+      "tests/agent/test_task_note.py::test_t07_real_save_and_failed_send_preserve_execution"
+    ],
+    "coverage": "related_invariant_only"
+  },
+  {
+    "id": "E21",
+    "group": "skills",
+    "input": "임시 카탈로그: 번역 스킬과 표 분석 스킬. 표의 합계를 계산해줘.",
+    "expected": "표 분석 스킬 선택과 실제 합계 산출을 별도로 평가한다.",
+    "offline_checks": [
+      "tests/test_skill_store.py::test_skill_cli_test_routing"
+    ],
+    "coverage": "related_invariant_only"
+  },
+  {
+    "id": "E22",
+    "group": "skills",
+    "input": "2+2는 얼마야?",
+    "expected": "4를 답하고 불필요한 스킬을 사용하지 않는다.",
+    "offline_checks": [
+      "tests/agent/test_proactive_skill_cards.py::test_proactive_skill_cards_skipped_below_threshold"
+    ],
+    "coverage": "related_invariant_only"
+  },
+  {
+    "id": "E23",
+    "group": "skills",
+    "input": "잘못 고른 번역 스킬을 표 분석 스킬로 정정한다.",
+    "expected": "최종 선택만 해당 실행의 통계에 기여한다.",
+    "offline_checks": [
+      "tests/test_skill_store.py::test_skill_trace_reassignment_preserves_unrelated_outcomes"
+    ],
+    "coverage": "related_invariant_only"
+  },
+  {
+    "id": "E24",
+    "group": "skills",
+    "input": "분석 스킬 선택 후 상태 메시지만 왔다. 실제 분석 결과를 보여줘.",
+    "expected": "선택만으로 완료 처리하지 않고 본문 산출물을 요구한다.",
+    "offline_checks": [
+      "tests/agent/test_task_note.py::test_analysis_complete_without_public_answer_is_not_completion"
+    ],
+    "coverage": "related_invariant_only"
+  }
+]
