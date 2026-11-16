@@ -980,6 +980,78 @@ def test_skill_trace_updates_usage_counters(tmp_path: Path) -> None:
     assert row["routing_failure_count"] == 1
 
 
+def test_replayed_skill_trace_does_not_inflate_success_counters(tmp_path: Path) -> None:
+    _write_skill(tmp_path / "skills", "alpha", description="Alpha helper")
+    store = SkillStore(tmp_path)
+    store.reindex(builtin_dir=tmp_path / "empty_builtin")
+    for _ in range(2):
+        store.record_trace(trace_id="same-run", selected_skill="alpha", gate_result="ok")
+
+    row = store.get_skill("alpha")
+    assert (row["usage_count"], row["success_count"], row["failure_count"]) == (1, 1, 0)
+    assert len(store.recent_traces_for_skill("alpha")) == 1
+
+
+def test_skill_trace_outcome_correction_replaces_previous_counts(tmp_path: Path) -> None:
+    _write_skill(tmp_path / "skills", "alpha", description="Alpha helper")
+    store = SkillStore(tmp_path)
+    store.reindex(builtin_dir=tmp_path / "empty_builtin")
+    store.record_trace(trace_id="run", selected_skill="alpha")
+    row = store.get_skill("alpha")
+    assert (row["usage_count"], row["success_count"], row["failure_count"]) == (1, 0, 0)
+    store.record_trace(trace_id="run", selected_skill="alpha", gate_result="ok")
+    store.record_trace(trace_id="run", selected_skill="alpha", gate_result="error",
+                       user_feedback="wrong_skill")
+    row = store.get_skill("alpha")
+    assert (row["usage_count"], row["success_count"], row["failure_count"],
+            row["routing_failure_count"]) == (1, 0, 1, 1)
+    store.record_trace(trace_id="run", selected_skill="alpha", gate_result="ok")
+    row = store.get_skill("alpha")
+    assert (row["usage_count"], row["success_count"], row["failure_count"],
+            row["routing_failure_count"]) == (1, 1, 0, 0)
+
+
+def test_skill_trace_reassignment_preserves_unrelated_outcomes(tmp_path: Path) -> None:
+    for name in ("alpha", "beta"):
+        _write_skill(tmp_path / "skills", name, description=f"{name} helper")
+    store = SkillStore(tmp_path)
+    store.reindex(builtin_dir=tmp_path / "empty_builtin")
+    store.record_skill_outcome("alpha", gate_result="ok")
+    store.record_trace(trace_id="run", selected_skill="alpha", gate_result="error")
+    store.record_trace(trace_id="run", selected_skill="beta", gate_result="ok")
+    alpha, beta = store.get_skill("alpha"), store.get_skill("beta")
+    assert (alpha["usage_count"], alpha["success_count"], alpha["failure_count"]) == (1, 1, 0)
+    assert (beta["usage_count"], beta["success_count"]) == (1, 1)
+    store.record_trace(trace_id="run", selected_skill=None)
+    beta = store.get_skill("beta")
+    assert (beta["usage_count"], beta["success_count"]) == (0, 0)
+
+
+def test_skill_trace_and_counters_roll_back_together(tmp_path: Path) -> None:
+    _write_skill(tmp_path / "skills", "alpha", description="Alpha helper")
+    store = SkillStore(tmp_path)
+    store.reindex(builtin_dir=tmp_path / "empty_builtin")
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("""CREATE TRIGGER reject_counters BEFORE UPDATE OF usage_count ON skills
+                        BEGIN SELECT RAISE(ABORT, 'counter update failed'); END""")
+    with pytest.raises(sqlite3.IntegrityError, match="counter update failed"):
+        store.record_trace(trace_id="run", selected_skill="alpha", gate_result="ok")
+    assert store.recent_traces_for_skill("alpha") == []
+    assert store.get_skill("alpha")["usage_count"] == 0
+
+
+def test_replacing_legacy_trace_without_counters_does_not_make_counts_negative(tmp_path: Path) -> None:
+    _write_skill(tmp_path / "skills", "alpha", description="Alpha helper")
+    store = SkillStore(tmp_path)
+    store.reindex(builtin_dir=tmp_path / "empty_builtin")
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("""INSERT INTO traces (trace_id, ts, selected_skill, selection_reason, gate_result)
+                        VALUES ('run', '2026-11-01', 'alpha', 'cold', 'ok')""")
+    store.record_trace(trace_id="run", selected_skill="alpha", gate_result="error")
+    row = store.get_skill("alpha")
+    assert (row["usage_count"], row["success_count"], row["failure_count"]) == (1, 0, 1)
+
+
 def test_skill_trace_records_compact_intent_summary(tmp_path: Path) -> None:
     store = SkillStore(tmp_path)
     long_summary = "사용자는 " + ("아주 긴 의도 설명 " * 40)

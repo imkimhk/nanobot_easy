@@ -3326,24 +3326,35 @@ class SkillStore:
         user_feedback: str | None = None,
     ) -> None:
         """Update usage counters for one selected skill."""
+        with self._connect() as conn:
+            self._adjust_skill_outcome(conn, name, gate_result, user_feedback, delta=1)
+
+    @staticmethod
+    def _adjust_skill_outcome(
+        conn: sqlite3.Connection,
+        name: str,
+        gate_result: str | None,
+        user_feedback: str | None,
+        *,
+        delta: int,
+    ) -> None:
         gate = (gate_result or "").strip().lower()
         feedback = (user_feedback or "").strip().lower()
-        success_inc = 1 if gate == "ok" else 0
-        failure_inc = 1 if gate == "error" else 0
-        routing_failure_inc = 1 if feedback in {"routing_failure", "wrong_skill"} else 0
-        with self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE skills
-                SET usage_count = usage_count + 1,
-                    success_count = success_count + ?,
-                    failure_count = failure_count + ?,
-                    routing_failure_count = routing_failure_count + ?,
-                    updated_at = ?
-                WHERE name = ? AND status != 'system'
-                """,
-                (success_inc, failure_inc, routing_failure_inc, _utc_now(), name),
-            )
+        # Older releases could commit a trace before its counter update failed.
+        # Replacing such a trace must not create negative counters.
+        conn.execute(
+            """
+            UPDATE skills
+            SET usage_count = MAX(0, usage_count + ?),
+                success_count = MAX(0, success_count + ?),
+                failure_count = MAX(0, failure_count + ?),
+                routing_failure_count = MAX(0, routing_failure_count + ?),
+                updated_at = ?
+            WHERE name = ? AND status != 'system'
+            """,
+            (delta, delta if gate == "ok" else 0, delta if gate == "error" else 0,
+             delta if feedback in {"routing_failure", "wrong_skill"} else 0, _utc_now(), name),
+        )
 
     def record_trace(
         self,
@@ -3362,7 +3373,18 @@ class SkillStore:
         user_feedback: str | None = None,
         notes: str | None = None,
     ) -> None:
+        """Upsert a trace and replace its counter contribution in one transaction."""
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            previous = conn.execute(
+                "SELECT selected_skill, gate_result, user_feedback FROM traces WHERE trace_id = ?",
+                (trace_id,),
+            ).fetchone()
+            if previous is not None and previous["selected_skill"]:
+                self._adjust_skill_outcome(
+                    conn, previous["selected_skill"], previous["gate_result"],
+                    previous["user_feedback"], delta=-1,
+                )
             conn.execute(
                 """
                 INSERT OR REPLACE INTO traces (
@@ -3388,9 +3410,5 @@ class SkillStore:
                     notes,
                 ),
             )
-        if selected_skill:
-            self.record_skill_outcome(
-                selected_skill,
-                gate_result=gate_result,
-                user_feedback=user_feedback,
-            )
+            if selected_skill:
+                self._adjust_skill_outcome(conn, selected_skill, gate_result, user_feedback, delta=1)
