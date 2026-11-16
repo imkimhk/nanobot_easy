@@ -118,6 +118,45 @@ def event(env, text, *, actor="user", session="s", kind=None):
                               content=text)
 
 
+@pytest.mark.parametrize("metadata", [
+    {"_hidden_history": True},
+    {"_hidden_history": {}},
+    {"_automation_turn": {"kind": "cron"}},
+])
+def test_recent_events_count_visible_dialogue_after_internal_feedback(env, metadata):
+    from nanobot.agent.premature_final import CORRECTION
+
+    original = event(env, "Q1. 첫 번째 방법\nQ2. 두 번째 방법", actor="assistant")
+    for _ in range(4):
+        env[0].append_event(scope=env[1], conversation_id="s", session_id="s",
+                            actor="user", event_type="USER_MESSAGE",
+                            content="internal recovery", metadata=metadata)
+    event(env, CORRECTION)
+    followup = event(env, "Q2만 설명해줘")
+
+    events = TaskContextStore(env[0]).events(env[1], "s", tail=2)
+
+    assert [e.event_id for e in events] == [original.event_id, followup.event_id]
+
+
+def test_minimal_input_preserves_dialogue_across_many_tool_events(env):
+    original = event(env, "Q1. 첫 번째 방법\nQ2. 두 번째 방법", actor="assistant")
+    results = [event(env, f"tool output {index}", actor="tool", kind="TOOL_RESULT")
+               for index in range(90)]
+    followup = event(env, "Q2만 설명해줘")
+    selector = ContextSelector(env[0], ContextSelectionConfig(enabled=True))
+
+    payload = selector.minimal_input(followup.content, env[1], "s", env[2], env[3])
+
+    sources = {row["event_id"] for row in payload["sources"]}
+    assert original.event_id in sources
+    assert followup.event_id in sources
+    assert payload["references"]["questions"]["source_ids"] == [original.event_id]
+    assert not sources.intersection(row.event_id for row in results)
+    assert payload["material_refs"][-1]["event_id"] == results[-1].event_id
+    assert len(payload["material_refs"]) <= 12
+
+
 async def select(env, design, request="2+2?", responses=None):
     store, scope, registry, skills = env
     selector = ContextSelector(store, ContextSelectionConfig(enabled=True))

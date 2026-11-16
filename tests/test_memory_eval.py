@@ -6,7 +6,8 @@ from nanobot.memory.event_store import ConversationEventStore
 from nanobot.memory.models import EventWindow, MemoryScope, RawEvent, SearchResult
 
 
-def test_eval_runner_accepts_question_list_yaml(tmp_path: Path):
+def test_eval_runner_accepts_question_list_yaml(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     workspace = tmp_path / "workspace"
     store = ConversationEventStore(workspace)
     scope = MemoryScope.from_runtime(owner_id="u1", workspace_id=str(workspace), agent_id=None)

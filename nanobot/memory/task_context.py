@@ -45,7 +45,11 @@ class TaskContextStore:
             """)
 
     def events(self, scope: MemoryScope, session_id: str, *, after: int = 0,
-               user_only: bool = False, tail: int | None = None) -> list[RawEvent]:
+               user_only: bool = False, tail: int | None = None,
+               event_types: tuple[str, ...] | None = None) -> list[RawEvent]:
+        """Return the latest visible events, in chronological order, within the scope."""
+        if (tail is not None and tail <= 0) or event_types == ():
+            return []
         agent_sql, agent_params = self.store._agent_scope_sql(scope)
         sql = f"""SELECT * FROM events WHERE owner_id=?
             AND workspace_id IN ({','.join('?' for _ in scope.workspace_ids)})
@@ -53,16 +57,24 @@ class TaskContextStore:
         params: list[Any] = [scope.owner_id, *scope.workspace_ids, *agent_params, session_id, after]
         if user_only:
             sql += " AND event_type='USER_MESSAGE'"
+        if event_types is not None:
+            sql += f" AND event_type IN ({','.join('?' for _ in event_types)})"
+            params.extend(event_types)
         sql += " ORDER BY sequence DESC, event_rowid DESC"
-        if tail is not None:
-            sql += " LIMIT ?"
-            params.append(tail)
+        events: list[RawEvent] = []
         with self.store.connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
-        events = [self.store._row_to_event(row) for row in reversed(rows)]
-        return [e for e in events if not is_hidden_history_message(
-            self.store._metadata_obj(e.metadata_json)) and not (
-                e.actor == "user" and _runtime_feedback(e.content or ""))]
+            # Count after visibility filtering: internal recovery messages must not
+            # consume the dialogue window. Iterate so a bounded tail stays bounded in memory.
+            for row in conn.execute(sql, params):
+                event = self.store._row_to_event(row)
+                if is_hidden_history_message(self.store._metadata_obj(event.metadata_json)):
+                    continue
+                if event.actor == "user" and _runtime_feedback(event.content or ""):
+                    continue
+                events.append(event)
+                if tail is not None and len(events) >= tail:
+                    break
+        return list(reversed(events))
 
     def list(self, scope: MemoryScope, session_id: str) -> list[dict[str, Any]]:
         agent_sql, agent_params = self.store._agent_scope_sql(scope)
