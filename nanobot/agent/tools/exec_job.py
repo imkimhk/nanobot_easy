@@ -238,7 +238,11 @@ def format_job(job: ExecJob, tail_lines: int) -> str:
     tail = read_tail(job.log_path, tail_lines)
     lines.append(f"--- last {tail_lines} log lines ---")
     lines.append(tail or "(no output yet)")
-    return "\n".join(lines)
+    result = ToolResult("\n".join(lines))
+    result.execution_target = f"exec-job://{job.job_id}"
+    result.job_evidence = {"target": result.execution_target,
+                           "state": job.state, "exit_code": job.returncode}
+    return result
 
 
 def format_untracked(job_id: str, log_dir: Path, tail_lines: int,
@@ -268,7 +272,11 @@ def format_untracked(job_id: str, log_dir: Path, tail_lines: int,
              read_tail(log_path, tail_lines) or "(no output)"]
     if not state.startswith(("exited", "timed_out", "killed")):
         lines.append("Verify the actual state (versions, processes) before relying on this job.")
-    return "\n".join(lines)
+    result = ToolResult("\n".join(lines))
+    result.execution_target = f"exec-job://{job_id}"
+    result.job_evidence = {"target": result.execution_target,
+                           "state": state, "exit_code": exit_code}
+    return result
 
 
 @tool_parameters(

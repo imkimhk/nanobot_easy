@@ -421,13 +421,15 @@ class ExecTool(Tool):
         except Exception as exc:
             return ToolResult.error(f"Error starting background job: {exc}")
         limit = f"{prepared.timeout}s" if prepared.timeout else "none"
-        return (
+        result = ToolResult(
             f"Background job started. job_id: {job.job_id}\n"
             f"pid: {job.pid}\nlog: {job.log_path}\ntimeout: {limit}\n"
             "The command keeps running after this reply. Check it with "
             f"exec_job(action='status', job_id='{job.job_id}') before reporting "
             "completion; do not start the same command again while it runs."
         )
+        result.execution_target = f"exec-job://{job.job_id}"
+        return result
 
     def _resolve_timeout(self, timeout: int | None) -> int | None:
         """Resolve the effective hard timeout in seconds (None = no limit).

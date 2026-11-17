@@ -23,6 +23,11 @@ _NO_WRITE = re.compile(r"저장\s*(?:하지\s*(?:마|말)|금지)|수정\s*하�
 _FILES = re.compile(r"(?:[\w.~/-]+/)?[\w.~-]+\.(?:md|txt|py|json|pdf|docx|xlsx|csv|yaml|yml|ts|tsx)(?![A-Za-z0-9_])", re.I)
 _SAVE = re.compile(r"저장|수정해|고쳐|\b(?:save|write|edit|fix)\b", re.I)
 _FILE_REQUEST = re.compile(r"파일|설계서|문서|\b(?:file|document)\b", re.I)
+_FILE_PROHIBITION = re.compile(
+    r"파일\s*(?:수정|변경|저장|생성|삭제)(?:은|는|을|를)?\s*하지\s*"
+    r"(?:마(?:세요|십시오)?|말아(?:줘|주세요|라)?)(?=[.!?\s]|$)"
+    r"|do not (?:modify|edit|write|save|create|delete) (?:any |the )?files?\b", re.I,
+)
 _PROVIDED_REQUEST = re.compile(r"(?:이|아래|제공된)\s*(?:내용|본문)|붙여|provided text|following text", re.I)
 active_task_note: ContextVar[Any] = ContextVar("genie_task_note", default=None)
 
@@ -225,6 +230,11 @@ class TaskNote:
             "reasoning. Update the plan only when the approach changes; runtime coalesces notices.\n"
             "If a read was offloaded/truncated for model context, read smaller ranges from "
             "the original selected file until the requested scope is covered.\n"
+            "For background command status, use source=none; a selected job target is "
+            "exec-job://<job_id> with action=read, unit=all. exec_job status supplies job "
+            "state, exit code and a log tail, not full coverage of its log file. Starting "
+            "a job is not completion; report running/unknown as partial and never relaunch "
+            "to repair reporting. A known nonzero exit or timeout must be reported honestly.\n"
             + json.dumps({"cached_reads": self.evidence[-20:],
                           "write_results": self.write_results(),
                           "superseded_mutations": self.superseded_mutations[-20:]},
@@ -293,6 +303,8 @@ class TaskNote:
                           ensure_ascii=False)
 
     def mutation_error(self, name: str, params: dict) -> str | None:
+        if name == "exec_job" and params.get("action") in {"status", "list"}:
+            return None
         if self.reporting_only:
             return "Only the final report needs correction. Do not repeat or start state-changing work."
         if not self.update:
@@ -320,11 +332,18 @@ class TaskNote:
 
     def observe(self, name: str, params: dict, result: Any, tool: Any, status: str,
                 call_id: str = "") -> None:
+        from nanobot.agent.tools.exec_job import ExecJobTool
         from nanobot.agent.tools.filesystem import ReadFileTool
+        from nanobot.agent.tools.shell import ExecTool
 
         target = self.canonical(params["path"]) if params.get("path") else ""
+        job = getattr(result, "job_evidence", None) if isinstance(tool, ExecJobTool) else None
+        if isinstance(tool, (ExecTool, ExecJobTool)):
+            target = getattr(result, "execution_target", None) or target
+        read_only = bool(getattr(tool, "read_only", True)) or (
+            isinstance(tool, ExecJobTool) and params.get("action") in {"status", "list"})
         event = {"name": name, "status": status, "target": target,
-                 "mutating": not bool(getattr(tool, "read_only", True)),
+                 "mutating": not read_only,
                  "request_id": self.request_id, "id": call_id or uuid.uuid4().hex[:12],
                  "signature": action_signature(name, {**params, "path": target} if target else params)}
         if name == "write_file" and isinstance(params.get("content"), str):
@@ -336,6 +355,9 @@ class TaskNote:
             elif re.search(r"timeout|timed out|unknown", detail, re.I):
                 event["status"] = "unknown"
         self.events.append(event)
+        if status == "ok" and isinstance(job, dict) and params.get("action") == "status":
+            self.evidence.append({**job, "id": event["id"], "request_id": self.request_id})
+            self.evidence = self.evidence[-40:]
         if self.update is not None and not getattr(tool, "observability", False):
             self.update.analysis_complete = False
         coverage = getattr(result, "read_evidence", None)
@@ -355,6 +377,10 @@ class TaskNote:
         path = self.canonical(target.path)
         evidence = [e for e in self.evidence if e.get("target") == path and
                     (e.get("request_id") == self.request_id or self.valid_evidence(e))]
+        if path.startswith("exec-job://"):
+            return bool(target.unit == "all" and evidence
+                        and evidence[-1].get("state") in {"exited", "killed", "timed_out"}
+                        and type(evidence[-1].get("exit_code")) is int)
         for unit in ("lines", "pages"):
             ranges = [e for e in evidence if e.get("unit") == unit and e.get("extraction_ok")]
             if not ranges or (target.unit != "all" and target.unit != unit):
@@ -417,7 +443,7 @@ class TaskNote:
         if update.source == "provided" and explicit and any(
                 target.action == "read" and not self.covered(target) for target in update.targets):
             defects.append("target_unresolved")
-        if (_FILE_REQUEST.search(instruction) and not update.targets
+        if (_FILE_REQUEST.search(_FILE_PROHIBITION.sub("", instruction)) and not update.targets
                 and not (update.source == "provided" and _PROVIDED_REQUEST.search(instruction))):
             defects.append("target_unresolved")
         for target in update.targets:
