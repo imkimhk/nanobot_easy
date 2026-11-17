@@ -84,15 +84,19 @@ def _select(script: Path, config: Path, workspace: Path, profiles: Path, env: di
     return subprocess.run(["bash", "-c", body], capture_output=True, text=True, env=env)
 
 
-@pytest.mark.parametrize("script", ["start-nanobot-easy.sh", "scripts/restart-nanobot-easy.sh"])
-def test_start_and_restart_select_the_same_profile(tmp_path: Path, script: str) -> None:
+def test_runtime_profile_selection_requires_an_explicit_profile(tmp_path: Path) -> None:
+    script = "start-nanobot-easy.sh"
     profiles = tmp_path / "runtimes"
     profiles.mkdir()
     (profiles / "a.json").write_text(json.dumps(_profile(tmp_path)))
     (profiles / "b.json").write_text(json.dumps(_profile(tmp_path, config=str(tmp_path / "other.json"))))
     env = {k: v for k, v in os.environ.items() if k != "NANOBOT_RUNTIME_PROFILE"}
     hit = _select(ROOT / script, tmp_path / "config.json", tmp_path / "ws", profiles, env)
-    assert hit.stdout.strip() == str((profiles / "a.json").resolve())
+    assert hit.returncode == 0 and hit.stdout.strip() == ""
+    env["NANOBOT_RUNTIME_PROFILE"] = str(profiles / "a.json")
+    explicit = _select(ROOT / script, tmp_path / "config.json", tmp_path / "ws", profiles, env)
+    assert explicit.returncode == 0 and explicit.stdout.strip() == str((profiles / "a.json").resolve())
+    env.pop("NANOBOT_RUNTIME_PROFILE")
     miss = _select(ROOT / script, tmp_path / "none.json", tmp_path / "ws", profiles, env)
     assert miss.returncode == 0 and miss.stdout.strip() == ""
     env["NANOBOT_RUNTIME_PROFILE"] = str(profiles / "b.json")

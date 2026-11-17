@@ -2689,6 +2689,7 @@ class AgentLoop:
             message.get("tool_calls"),
             message.get("reasoning_content"),
             message.get("thinking_blocks"),
+            message.get("provider_state"),
         )
 
     def _restore_runtime_checkpoint(self, session: Session) -> bool:

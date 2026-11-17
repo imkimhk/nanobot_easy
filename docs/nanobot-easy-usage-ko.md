@@ -105,13 +105,13 @@ Windows의 `start-nanobot.bat`은 repo-local 설정으로 `nanobot webui --backg
 
 ### 컴패니언 게이트웨이 (선택 기능)
 
-`start-nanobot-easy.sh`는 기본적으로 컴패니언 게이트웨이(`scripts/start-learning-coach-gateway.sh` 등)를 띄우지 않습니다. 이 기능을 쓰지 않는 대다수 사용자에게는 실행할 때마다 뜨는 경고 메시지가 불필요한 노이즈였기 때문입니다. 컴패니언 게이트웨이가 필요하면 아래처럼 명시적으로 켜세요.
+`start-nanobot-easy.sh`는 메인 게이트웨이를 띄운 뒤, 설정이 메인 설정일 때 Rees, Elle, Genie, Heart, Testy를 시작하거나 이미 실행 중이면 재시작합니다. 메인만 켜려면 `NANOBOT_START_PERSONAS=0 ./start-nanobot-easy.sh`를 사용합니다. 학습 코치와 agent-b 같은 선택 컴패니언은 기본적으로 띄우지 않습니다. 이 기능을 쓰지 않는 대다수 사용자에게는 실행할 때마다 뜨는 경고 메시지가 불필요한 노이즈였기 때문입니다. 컴패니언 게이트웨이가 필요하면 아래처럼 명시적으로 켜세요.
 
 ```bash
 NANOBOT_START_COMPANIONS=1 ./start-nanobot-easy.sh
 ```
 
-`restart-nanobot-easy.sh`도 동일한 환경변수를 따릅니다. Windows에는 이 기능이 없습니다.
+메인만 재시작하려면 `scripts/restart-main-gateway.sh`를 사용합니다. Windows에는 컴패니언 시작 기능이 없습니다.
 
 ## 설정 파일과 개인정보
 
@@ -162,7 +162,7 @@ Linux/macOS:
 
 ```bash
 ./scripts/stop-nanobot-easy.sh
-./scripts/restart-nanobot-easy.sh
+./scripts/restart-main-gateway.sh
 ```
 
 로그 확인:

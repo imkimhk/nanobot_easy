@@ -1770,12 +1770,17 @@ function ManagedSkillDetailPanel({
         </div>
       ) : (
         <div className="max-h-[min(62vh,40rem)] overflow-y-auto p-4">
-          <div className="grid gap-2 sm:grid-cols-4">
+          <div className="grid gap-2 sm:grid-cols-5">
             <MetaItem label="Risk" value={skill.risk_level} />
             <MetaItem label="Version" value={skill.version || "n/a"} />
+            <MetaItem label="Selections" value={String(skill.selection_count ?? 0)} />
             <MetaItem label="Usage" value={String(skill.usage_count)} />
             <MetaItem label="Success" value={successRateTitle(skill.success_rate)} />
           </div>
+          <p className="mt-2 text-xs text-muted-foreground">
+            Selections include unused choices. Usage records applied methods and legacy usage;
+            it does not establish success.
+          </p>
 
           <div className="mt-5 grid gap-4 xl:grid-cols-[minmax(0,3fr)_18rem]">
             <div className="space-y-5">
@@ -1805,12 +1810,17 @@ function ManagedSkillDetailPanel({
                     {detail.traces.slice(0, 5).map((trace) => (
                       <div key={trace.trace_id} className="rounded-[12px] bg-muted/30 px-3 py-2">
                         <div className="flex items-center justify-between gap-2 text-[12px]">
-                          <span className="truncate font-medium">{trace.selection_reason || "trace"}</span>
+                          <span className="truncate font-medium">
+                            {trace.phase ?? "legacy"} · {trace.selection_reason || "trace"}
+                          </span>
                           <span className="shrink-0 text-muted-foreground">{trace.gate_result ?? "none"}</span>
                         </div>
                         <p className="mt-1 truncate text-[12px] text-muted-foreground">
                           {trace.query_digest || trace.session_key || trace.trace_id}
                         </p>
+                        {trace.application_evidence && (
+                          <p className="mt-1 text-[12px] text-muted-foreground">{trace.application_evidence}</p>
+                        )}
                       </div>
                     ))}
                   </div>

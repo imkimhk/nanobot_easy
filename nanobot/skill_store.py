@@ -277,6 +277,8 @@ class SkillTraceRecord:
     gate_result: str | None
     user_feedback: str | None
     notes: str | None
+    phase: str = "legacy"
+    application_evidence: str | None = None
 
 
 @dataclass(frozen=True)
@@ -407,6 +409,7 @@ def row_to_skill_payload(row: sqlite3.Row) -> dict[str, Any]:
         "required_tools": json.loads(row["required_tools_json"] or "[]"),
         "install_sources": json.loads(row["install_sources_json"] or "[]"),
         "usage_count": int(row["usage_count"]),
+        "selection_count": int(row["selection_count"]),
         "success_count": int(row["success_count"]),
         "failure_count": int(row["failure_count"]),
         "routing_failure_count": int(row["routing_failure_count"]),
@@ -1539,6 +1542,30 @@ class SkillStore:
             except sqlite3.OperationalError:
                 # Some embedded SQLite builds omit FTS5. Search falls back to LIKE.
                 pass
+        self._migrate_trace_accounting()
+
+    def _migrate_trace_accounting(self) -> None:
+        """Reclassify identifiable old routing-only traces once, preserving other history."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            skill_columns = {row["name"] for row in conn.execute("PRAGMA table_info(skills)")}
+            trace_columns = {row["name"] for row in conn.execute("PRAGMA table_info(traces)")}
+            if "selection_count" not in skill_columns:
+                conn.execute("ALTER TABLE skills ADD COLUMN selection_count INTEGER NOT NULL DEFAULT 0")
+            if "application_evidence" not in trace_columns:
+                conn.execute("ALTER TABLE traces ADD COLUMN application_evidence TEXT")
+            if "phase" in trace_columns:
+                return
+            conn.execute("ALTER TABLE traces ADD COLUMN phase TEXT NOT NULL DEFAULT 'legacy'")
+            conn.execute("""UPDATE traces SET phase = 'selected'
+                            WHERE trace_id GLOB 'skill_decision:*'
+                              AND gate_result IS NULL AND user_feedback IS NULL""")
+            conn.execute("""UPDATE skills SET
+                            selection_count = (SELECT COUNT(*) FROM traces
+                                WHERE selected_skill = skills.name AND phase = 'selected'),
+                            usage_count = MAX(0, usage_count - (SELECT COUNT(*) FROM traces
+                                WHERE selected_skill = skills.name AND phase = 'selected'))
+                            WHERE status != 'system'""")
 
     def reindex(
         self,
@@ -1624,7 +1651,7 @@ class SkillStore:
                 row["id"]: row
                 for row in conn.execute(
                     """
-                    SELECT id, usage_count, success_count, failure_count, routing_failure_count
+                    SELECT id, selection_count, usage_count, success_count, failure_count, routing_failure_count
                     FROM skills
                     """
                 )
@@ -1647,9 +1674,9 @@ class SkillStore:
                     INSERT INTO skills (
                         id, name, version, status, risk_level, category, requires_exec,
                         path, source, description, when_to_use, when_not_to_use,
-                        required_tools_json, install_sources_json, usage_count, success_count, failure_count,
+                        required_tools_json, install_sources_json, selection_count, usage_count, success_count, failure_count,
                         routing_failure_count, content_hash, search_text, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record.id,
@@ -1666,6 +1693,7 @@ class SkillStore:
                         record.when_not_to_use,
                         json.dumps(record.required_tools),
                         json.dumps(record.install_sources),
+                        int(row_counts["selection_count"]) if row_counts else 0,
                         int(row_counts["usage_count"]) if row_counts else 0,
                         int(row_counts["success_count"]) if row_counts else 0,
                         int(row_counts["failure_count"]) if row_counts else 0,
@@ -2223,6 +2251,8 @@ class SkillStore:
                     gate_result=row["gate_result"],
                     user_feedback=row["user_feedback"],
                     notes=row["notes"],
+                    phase=row["phase"],
+                    application_evidence=row["application_evidence"],
                 )
             )
         return traces
@@ -3325,7 +3355,7 @@ class SkillStore:
         gate_result: str | None = None,
         user_feedback: str | None = None,
     ) -> None:
-        """Update usage counters for one selected skill."""
+        """Record one execution outcome, independently of routing-only choices."""
         with self._connect() as conn:
             self._adjust_skill_outcome(conn, name, gate_result, user_feedback, delta=1)
 
@@ -3337,6 +3367,7 @@ class SkillStore:
         user_feedback: str | None,
         *,
         delta: int,
+        phase: str = "legacy",
     ) -> None:
         gate = (gate_result or "").strip().lower()
         feedback = (user_feedback or "").strip().lower()
@@ -3345,14 +3376,18 @@ class SkillStore:
         conn.execute(
             """
             UPDATE skills
-            SET usage_count = MAX(0, usage_count + ?),
+            SET selection_count = MAX(0, selection_count + ?),
+                usage_count = MAX(0, usage_count + ?),
                 success_count = MAX(0, success_count + ?),
                 failure_count = MAX(0, failure_count + ?),
                 routing_failure_count = MAX(0, routing_failure_count + ?),
                 updated_at = ?
             WHERE name = ? AND status != 'system'
             """,
-            (delta, delta if gate == "ok" else 0, delta if gate == "error" else 0,
+            (delta if phase in {"selected", "applied"} else 0,
+             delta if phase != "selected" else 0,
+             delta if phase != "selected" and gate == "ok" else 0,
+             delta if phase != "selected" and gate == "error" else 0,
              delta if feedback in {"routing_failure", "wrong_skill"} else 0, _utc_now(), name),
         )
 
@@ -3372,26 +3407,45 @@ class SkillStore:
         gate_result: str | None = None,
         user_feedback: str | None = None,
         notes: str | None = None,
-    ) -> None:
+        phase: Literal["legacy", "selected", "applied"] = "legacy",
+        application_evidence: str | None = None,
+        existing_selection: bool = False,
+    ) -> str | None:
         """Upsert a trace and replace its counter contribution in one transaction."""
+        if phase not in {"legacy", "selected", "applied"}:
+            raise ValueError("phase must be legacy, selected, or applied")
+        if phase == "applied" and (not selected_skill or not (application_evidence or "").strip()):
+            raise ValueError("applied requires a skill and application_evidence")
+        if phase == "selected" and gate_result is not None:
+            raise ValueError("a selection alone cannot have an execution gate result")
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             previous = conn.execute(
-                "SELECT selected_skill, gate_result, user_feedback FROM traces WHERE trace_id = ?",
+                "SELECT * FROM traces WHERE trace_id = ?",
                 (trace_id,),
             ).fetchone()
+            if existing_selection:
+                if (previous is None or previous["phase"] not in {"selected", "applied"}
+                        or previous["session_key"] != session_key
+                        or previous["selected_skill"] != selected_skill
+                        or previous["wave_no"] != wave_no):
+                    raise ValueError("trace_id must identify this session's same skill and wave selection")
+                if previous["phase"] == "applied" and phase == "selected":
+                    return "applied"  # A delayed selection replay cannot undo observed application.
+                # Routing/application updates cannot erase a separately recorded outcome.
+                gate_result, user_feedback = previous["gate_result"], previous["user_feedback"]
             if previous is not None and previous["selected_skill"]:
                 self._adjust_skill_outcome(
                     conn, previous["selected_skill"], previous["gate_result"],
-                    previous["user_feedback"], delta=-1,
+                    previous["user_feedback"], delta=-1, phase=previous["phase"],
                 )
             conn.execute(
                 """
                 INSERT OR REPLACE INTO traces (
                     trace_id, ts, session_key, query_digest, intent_summary, candidates_json,
                     selected_skill, selection_reason, executed_by, wave_no,
-                    duration_ms, gate_result, user_feedback, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    duration_ms, gate_result, user_feedback, notes, phase, application_evidence
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trace_id,
@@ -3408,7 +3462,11 @@ class SkillStore:
                     gate_result,
                     user_feedback,
                     notes,
+                    phase,
+                    _short_text(application_evidence, 1000) if application_evidence else None,
                 ),
             )
             if selected_skill:
-                self._adjust_skill_outcome(conn, selected_skill, gate_result, user_feedback, delta=1)
+                self._adjust_skill_outcome(conn, selected_skill, gate_result, user_feedback,
+                                           delta=1, phase=phase)
+        return phase if phase != "legacy" else None

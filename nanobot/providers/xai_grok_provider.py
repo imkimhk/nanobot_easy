@@ -15,6 +15,7 @@ import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 from typing import Any
 
 import httpx
@@ -122,7 +123,17 @@ class XAIGrokProvider(LLMProvider):
         on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         wire_model = _strip_model_prefix(model or self.default_model)
-        system_prompt, input_items = convert_messages(messages)
+        system_prompt, input_items = convert_messages(
+            messages, reasoning_scope=("xai_grok", wire_model),
+        )
+        reasoning_items: list[dict[str, Any]] = []
+
+        def capture_completed(response: dict[str, Any]) -> None:
+            reasoning_items[:] = [
+                deepcopy(item) for item in response.get("output") or []
+                if isinstance(item, dict) and item.get("type") == "reasoning"
+                and item.get("encrypted_content")
+            ]
 
         stage = "oauth_token"
         try:
@@ -169,11 +180,14 @@ class XAIGrokProvider(LLMProvider):
             reasoning = _build_reasoning_options(reasoning_effort)
             if reasoning:
                 body["reasoning"] = reasoning
-                body["include"] = ["reasoning.encrypted_content"]
-            # effort=none sends neither field. Grok may still reason internally,
-            # so callers must not treat this as a guaranteed disable.
+            # Grok can reason even without an explicit effort. With store=False,
+            # encrypted state must be requested and replayed across tool rounds.
             if self._extra_body:
                 body.update(self._extra_body)
+            include = list(body.get("include") or [])
+            if "reasoning.encrypted_content" not in include:
+                include.append("reasoning.encrypted_content")
+            body["include"] = include
 
             observe("wire_options", model=body.get("model"), stream=body.get("stream"),
                     reasoning_effort=(body.get("reasoning") or {}).get("effort"),
@@ -198,6 +212,7 @@ class XAIGrokProvider(LLMProvider):
                     on_content_delta=on_content_delta,
                     on_thinking_delta=on_thinking_delta,
                     on_tool_call_delta=on_tool_call_delta,
+                    on_response_completed=capture_completed,
                 )
             except _XAIHTTPError as exc:
                 if exc.status_code != 401:
@@ -222,6 +237,7 @@ class XAIGrokProvider(LLMProvider):
                     on_content_delta=on_content_delta,
                     on_thinking_delta=on_thinking_delta,
                     on_tool_call_delta=on_tool_call_delta,
+                    on_response_completed=capture_completed,
                 )
 
             content, tool_calls, finish_reason, usage, reasoning_content = result
@@ -231,6 +247,11 @@ class XAIGrokProvider(LLMProvider):
                 finish_reason=finish_reason,
                 usage=usage,
                 reasoning_content=reasoning_content,
+                provider_state={
+                    "provider": "xai_grok",
+                    "model": wire_model,
+                    "reasoning_items": reasoning_items,
+                } if reasoning_items else None,
                 request_options={"reasoning": body.get("reasoning")},
             )
         except Exception as exc:
@@ -463,6 +484,7 @@ async def _request_xai(
     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
     on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    on_response_completed: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[str, list[ToolCallRequest], str, dict[str, int], str | None]:
     client_kwargs: dict[str, Any] = {"timeout": resolve_stream_idle_timeout_s()}
     if proxy:
@@ -485,6 +507,7 @@ async def _request_xai(
             on_content_delta=on_content_delta,
             on_tool_call_delta=on_tool_call_delta,
             on_reasoning_delta=on_thinking_delta,
+            on_response_completed=on_response_completed,
         )
     finally:
         # Async context-manager exits may themselves hang or raise. A completed

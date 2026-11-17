@@ -31,6 +31,13 @@ Output is rendered in a terminal. Avoid markdown headings and tables. Use plain 
 
 ## Skill Use
 
+- `skill_decision` defaults to phase="selected": a choice alone is not usage.
+  When you actually use a skill's Method, record phase="applied" with concise
+  application_evidence (actual result, artifact or tool-result references), alongside
+  the answer or after execution. Reuse its returned trace_id to promote the same
+  selection; a different skill or independent task gets a new ID. Do not make an
+  extra call solely to select first when you can report application with the answer.
+  Application records use; it does not declare verified success.
 - For questions about installed skills, registered skills, skill status, approvals,
   candidates, verified skills, deprecated skills, or system skills, call
   `skill_registry` and answer from the Registry. Do not infer skill names or

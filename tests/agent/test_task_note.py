@@ -10,8 +10,10 @@ from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.task_note import (
     TaskNote,
     TaskUpdate,
+    UpdateTaskTool,
     active_task_note,
     bounded_operation,
+    needs_note,
 )
 from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool
@@ -80,7 +82,8 @@ async def run(tmp_path, steps, request="a.md 전체 파일을 검토해 줘", **
     provider = Script(steps)
     metadata = kwargs.pop("task_note_metadata", {})
     spec = AgentRunSpec(initial_messages=[{"role": "user", "content": request}],
-                        tools=tools, model="test", max_iterations=12, max_tool_result_chars=8000,
+                        tools=tools, model="test", max_iterations=kwargs.pop("max_iterations", 12),
+                        max_tool_result_chars=8000,
                         workspace=tmp_path, task_note_enabled=True,
                         task_note_metadata=metadata, **kwargs)
     result = await AgentRunner(provider).run(spec)
@@ -122,6 +125,132 @@ async def test_t01_pending_followup_prevents_prepared_write(tmp_path):
     assert result.stop_reason == "incomplete"
     assert result.tool_events[0]["status"] == "superseded"
     assert metadata["task_note"]["intent"] == "new"
+
+
+@pytest.mark.parametrize("status", ["completed", "cancelled"])
+@pytest.mark.parametrize("iterations", [3, 6])
+async def test_withdrawal_before_write_is_cancelled_without_goal_resume(tmp_path, status, iterations):
+    (tmp_path / "a.md").write_text("original", encoding="utf-8")
+    prepared = False
+    injected = False
+
+    def prepare_write(kwargs):
+        nonlocal prepared
+        prepared = True
+        return call("write_file", **write_args("changed"))
+
+    async def cancel(**kwargs):
+        nonlocal injected
+        if prepared and not injected:
+            injected = True
+            return [{"role": "user", "content": "취소해줘. a.md를 수정하거나 저장하지 마."}]
+        return []
+
+    result, provider, metadata = await run(tmp_path, [
+        control(targets=[target(action="write")], status="active", analysis_complete=False),
+        prepare_write,
+        control(intent="withdraw", targets=[target(action="write")], source="none",
+                status=status, answer="취소했습니다. 저장 작업은 실행되지 않았습니다."),
+    ], request="a.md에 changed를 저장해줘.", injection_callback=cancel,
+        max_iterations=iterations, goal_active_predicate=lambda: True)
+    assert result.stop_reason == "cancelled"
+    assert "취소했습니다" in result.final_content
+    assert "execution_required" not in result.final_content
+    assert "미완료" not in result.final_content
+    assert (tmp_path / "a.md").read_text() == "original"
+    assert len(provider.calls) == 3
+    assert next(e for e in result.tool_events if e["name"] == "write_file")["status"] == "superseded"
+    assert metadata["task_note"]["status"] == "cancelled"
+
+
+async def test_withdrawal_keeps_prior_mutation_audit_without_claiming_rollback(tmp_path):
+    injected = False
+
+    async def cancel_after_save(**kwargs):
+        nonlocal injected
+        if (tmp_path / "a.md").exists() and not injected:
+            injected = True
+            return [{"role": "user", "content": "저장 작업을 취소해줘. 추가 변경하지 마."}]
+        return []
+
+    result, provider, metadata = await run(tmp_path, [
+        control(targets=[target(action="write")], status="active", analysis_complete=False),
+        call("write_file", **write_args("already saved")),
+        control(intent="withdraw", targets=[target(action="write")], source="none",
+                answer="취소했습니다."),
+    ], request="a.md를 저장해줘.", injection_callback=cancel_after_save)
+    assert result.stop_reason == "cancelled"
+    assert (tmp_path / "a.md").read_text() == "already saved"
+    assert result.tools_used.count("write_file") == 1
+    prior = metadata["task_note"]["superseded_mutations"]
+    assert len(prior) == 1 and prior[0]["status"] == "ok"
+    assert prior[0]["request_id"] != metadata["task_note"]["request_id"]
+    assert "superseded_mutations" in str(provider.calls[-1]["messages"])
+    assert "원복" in result.final_content
+
+
+async def test_withdrawal_unknown_save_is_preserved_and_can_be_verified_read_only(tmp_path):
+    note = TaskNote([{"role": "user", "content": "a.md 저장"}], tmp_path, {})
+    note.accept(update(note, targets=[target(action="write")], status="active"))
+    tool = WriteFileTool(workspace=tmp_path)
+    args = write_args("saved content")
+    await tool.execute(**args)
+    note.observe("write_file", args, "timeout after saving", tool, "error", "uncertain-write")
+    note.revise([{"role": "user", "content": "취소해줘. 추가 저장하지 마."}])
+    note.accept(update(note, intent="withdraw", source="none", targets=[target(action="write")],
+                       status="cancelled", analysis_complete=True, final_answer="취소했습니다."))
+    assert note.defects() == []
+    assert note.mutation_error("write_file", args)
+    assert "결과 미확인" in note.final_report()
+    await read(note, tmp_path)
+    assert note.superseded_mutations[0]["verification"] == "read_after_unknown_write"
+    note.accept(update(note, intent="withdraw", source="none", targets=[target(action="write")],
+                       status="cancelled", analysis_complete=True, final_answer="취소했습니다."))
+    assert "실행 성공" in note.final_report()
+    assert (tmp_path / "a.md").read_text() == "saved content"
+
+
+def test_withdrawal_requires_report_and_cancelled_status_requires_withdrawal(tmp_path):
+    assert needs_note([{"role": "user", "content": "취소해줘"}])
+    note = TaskNote([{"role": "user", "content": "취소해줘"}], tmp_path, {})
+    note.accept(update(note, intent="withdraw", targets=[], source="none", status="cancelled",
+                       analysis_complete=True, final_answer=""))
+    assert note.defects() == ["answer_required"]
+    tool = UpdateTaskTool(note)
+    with pytest.raises(ValueError, match="requires intent=withdraw"):
+        update(note, intent="new", status="cancelled")
+    assert "cancelled" in tool.parameters["properties"]["status"]["enum"]
+
+
+async def test_cancellation_during_write_records_unknown_effect_without_undo(tmp_path):
+    started = asyncio.Event()
+
+    class PartialWrite(WriteFileTool):
+        supports_cancellation = True
+
+        async def execute(self, **kwargs):
+            self._resolve_write(kwargs["path"]).write_text("partial effect", encoding="utf-8")
+            started.set()
+            await asyncio.Event().wait()
+
+    metadata = {}
+    task = asyncio.create_task(run(tmp_path, [
+        control(targets=[target(action="write")], status="active", analysis_complete=False),
+        call("write_file", **write_args("complete effect")),
+    ], request="a.md 저장해줘", write_tool=PartialWrite(workspace=tmp_path),
+        task_note_metadata=metadata))
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    note = metadata["task_note"]
+    assert note["status"] == "cancelled"
+    assert note["events"][0]["status"] == "unknown"
+    assert note["events"][0]["target"] == str((tmp_path / "a.md").resolve())
+    assert note["attempts"][-1]["cleanup"] == "settled"
+    assert (tmp_path / "a.md").read_text() == "partial effect"
 
 
 async def test_t02_all_targets_required_and_wrong_file_rejected(tmp_path):

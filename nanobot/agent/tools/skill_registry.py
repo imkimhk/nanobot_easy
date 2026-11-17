@@ -10,7 +10,12 @@ from typing import Any
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR, SYSTEM_SKILLS_DIR
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.context import ContextAware
-from nanobot.agent.tools.schema import BooleanSchema, IntegerSchema, StringSchema, tool_parameters_schema
+from nanobot.agent.tools.schema import (
+    BooleanSchema,
+    IntegerSchema,
+    StringSchema,
+    tool_parameters_schema,
+)
 from nanobot.skill_store import SkillStore
 
 _VALID_STATUSES = ("system", "draft", "candidate", "verified", "deprecated", "rejected")
@@ -119,6 +124,7 @@ class SkillRegistryTool(Tool, ContextAware):
                 "risk_level": row.get("risk_level"),
                 "requires_exec": bool(row.get("requires_exec")),
                 "usage_count": int(row.get("usage_count") or 0),
+                "selection_count": int(row.get("selection_count") or 0),
                 "success_count": int(row.get("success_count") or 0),
                 "failure_count": int(row.get("failure_count") or 0),
                 "routing_failure_count": int(row.get("routing_failure_count") or 0),

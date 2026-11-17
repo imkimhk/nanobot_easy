@@ -2650,6 +2650,9 @@ def skill_stats(
     by_status = store.status_counts()
     console.print(f"DB: {store.db_path}")
     console.print(f"Skills: {sum(by_status.values())}")
+    rows = store.list_skills(include_deprecated=True)
+    console.print(f"Selections: {sum(int(row['selection_count']) for row in rows)}")
+    console.print(f"Usage: {sum(int(row['usage_count']) for row in rows)}")
     for status, count in sorted(by_status.items()):
         console.print(f"- {status}: {count}")
 
