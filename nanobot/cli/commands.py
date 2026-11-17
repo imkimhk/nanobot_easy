@@ -1351,7 +1351,7 @@ def _run_gateway(
 
     # Self-heal the gateway state file with the current PID after any restart.
     from nanobot.config.loader import get_config_path
-    from nanobot.gateway.runtime import GatewayRuntime, GatewayRuntimePaths
+    from nanobot.gateway.runtime import GatewayRuntime, GatewayRuntimePaths, GatewayStartOptions
 
     config_path = str(get_config_path().resolve(strict=False))
     GatewayRuntime.refresh_state_pid(
@@ -1360,7 +1360,15 @@ def _run_gateway(
             if not is_default_workspace(config.workspace_path)
             else None,
             config_path=config_path,
-        )
+        ),
+        options=GatewayStartOptions(
+            port=port, workspace=str(config.workspace_path), config_path=config_path,
+        ),
+        active_settings={
+            "model": config.agents.defaults.model,
+            "provider": config.agents.defaults.provider,
+            "context_selection_enabled": config.agents.defaults.context_selection.enabled,
+        },
     )
 
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
@@ -2642,6 +2650,9 @@ def skill_stats(
     by_status = store.status_counts()
     console.print(f"DB: {store.db_path}")
     console.print(f"Skills: {sum(by_status.values())}")
+    rows = store.list_skills(include_deprecated=True)
+    console.print(f"Selections: {sum(int(row['selection_count']) for row in rows)}")
+    console.print(f"Usage: {sum(int(row['usage_count']) for row in rows)}")
     for status, count in sorted(by_status.items()):
         console.print(f"- {status}: {count}")
 

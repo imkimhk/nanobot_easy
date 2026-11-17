@@ -15,9 +15,13 @@ data root (`.local/`, never tracked).
    import paths and bytes, templates, and the config invariants without
    starting anything.
 5. `scripts/runtime.sh <profile> up|restart|status|stop` controls only that
-   instance. `start-nanobot-easy.sh` / `scripts/restart-nanobot-easy.sh`
-   delegate automatically when a profile matches `NANOBOT_CONFIG` and
-   `NANOBOT_WORKSPACE` (or `NANOBOT_RUNTIME_PROFILE` is set).
+   instance. `start-nanobot-easy.sh` uses the current checkout by default. It
+   delegates only when `NANOBOT_RUNTIME_PROFILE` is explicitly set to a profile
+   matching `NANOBOT_CONFIG` and `NANOBOT_WORKSPACE`; stale local profiles do not
+   silently select another checkout. For ordinary main-only lifecycle use
+   `scripts/start-main-gateway.sh` / `scripts/restart-main-gateway.sh`. Explicit
+   all-persona actions use `scripts/start-all-gateways.sh` /
+   `scripts/restart-all-gateways.sh`. The old restart-nanobot-easy.sh is removed.
 6. The gateway process writes the profile's `record` (deployment manifest):
    instance, PID, process start time, commit, module paths/hashes, template
    hashes, config path/hash, workspace, port, deployment time. `status`

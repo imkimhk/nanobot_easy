@@ -135,20 +135,27 @@ async def consume_sse_with_reasoning(
     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
+    on_response_completed: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[str, list[ToolCallRequest], str, dict[str, int], str | None]:
-    """Consume a Responses API SSE stream, including visible reasoning summaries."""
-    return await _consume_response_events(iter_sse(response), on_content_delta, on_tool_call_delta, on_reasoning_delta)
+    """Consume SSE; optionally expose the certified completed response for opaque replay."""
+    return await _consume_response_events(
+        iter_sse(response), on_content_delta, on_tool_call_delta, on_reasoning_delta,
+        on_response_completed,
+    )
 
 
-async def _consume_response_events(events, on_content_delta=None, on_tool_call_delta=None, on_reasoning_delta=None):
+async def _consume_response_events(events, on_content_delta=None, on_tool_call_delta=None, on_reasoning_delta=None,
+                                   on_response_completed=None):
     # Diagnostics only: one content-free stream_event_log milestone per stream,
     # emitted on every exit (including a deadline cancellation). Never affects results.
     log = stream_event_log()
     if log is None:
-        return await _consume_events(events, on_content_delta, on_tool_call_delta, on_reasoning_delta)
+        return await _consume_events(events, on_content_delta, on_tool_call_delta, on_reasoning_delta,
+                                     on_response_completed=on_response_completed)
     status = "error"
     try:
-        result = await _consume_events(events, on_content_delta, on_tool_call_delta, on_reasoning_delta, log)
+        result = await _consume_events(events, on_content_delta, on_tool_call_delta, on_reasoning_delta, log,
+                                       on_response_completed=on_response_completed)
         status = "completed"
         return result
     except asyncio.CancelledError:
@@ -162,7 +169,7 @@ async def _consume_response_events(events, on_content_delta=None, on_tool_call_d
 
 
 async def _consume_events(events, on_content_delta=None, on_tool_call_delta=None, on_reasoning_delta=None,
-                          log=None):
+                          log=None, on_response_completed=None):
     content = ""
     tool_calls = []
     tool_call_buffers = {}
@@ -327,6 +334,8 @@ async def _consume_events(events, on_content_delta=None, on_tool_call_delta=None
                         result_hash=hashlib.sha256(json.dumps(
                             {"content": content, "tools": [c.arguments for c in tool_calls]},
                             sort_keys=True).encode()).hexdigest())
+                if event_type == "response.completed" and status == "completed" and on_response_completed:
+                    on_response_completed(response_obj)
                 return content, tool_calls, finish_reason, usage, reasoning_content
             elif event_type in {"error", "response.failed"}:
                 observe("terminal_event", event_type=event_type, status="failed")

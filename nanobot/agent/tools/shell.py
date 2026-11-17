@@ -18,6 +18,7 @@ from pydantic import Field
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import current_request_session_key
+from nanobot.agent.tools.exec_job import DEFAULT_EXEC_JOB_MANAGER, job_log_dir
 from nanobot.agent.tools.exec_session import (
     DEFAULT_EXEC_SESSION_MANAGER,
     DEFAULT_MAX_OUTPUT_CHARS,
@@ -56,6 +57,8 @@ class ExecToolConfig(Base):
     """Shell exec tool configuration."""
     enable: bool = True
     timeout: int = Field(default=60, ge=0)  # Hard timeout (s); 0 = no limit. Not capped by the per-call max.
+    # Hard timeout (s) for background=true jobs when the call gives none; 0 = no limit.
+    background_timeout: int = Field(default=1800, ge=0)
     path_prepend: str = ""
     path_append: str = ""
     sandbox: str = ""
@@ -84,10 +87,20 @@ class _PreparedCommand:
             60,
             description=(
                 "Timeout in seconds. Increase for long-running commands "
-                "like compilation or installation (default 60, max 600)."
+                "like compilation (default 60, max 600). With background=true "
+                "it is the job's hard limit (default 1800, max 3600)."
             ),
             minimum=1,
-            maximum=600,
+            maximum=3600,
+        ),
+        background=BooleanSchema(
+            description=(
+                "Start the command as a detached background job and return a "
+                "job_id immediately. Use for installs, upgrades and other "
+                "commands that may run for minutes; check it with exec_job."
+            ),
+            default=False,
+            nullable=True,
         ),
         shell=StringSchema(
             (
@@ -165,6 +178,7 @@ class ExecTool(Tool):
             allowed_env_keys=cfg.allowed_env_keys,
             allow_patterns=cfg.allow_patterns,
             deny_patterns=cfg.deny_patterns,
+            background_timeout=cfg.background_timeout,
         )
 
     def __init__(
@@ -181,8 +195,11 @@ class ExecTool(Tool):
         path_append: str = "",
         allowed_env_keys: list[str] | None = None,
         session_manager: Any | None = None,
+        job_manager: Any | None = None,
+        background_timeout: int = 1800,
     ):
         self.timeout = timeout
+        self.background_timeout = background_timeout
         self.working_dir = working_dir
         self.sandbox = sandbox
         self.deny_patterns = (deny_patterns or []) + [
@@ -213,6 +230,7 @@ class ExecTool(Tool):
         self.path_append = path_append
         self.allowed_env_keys = allowed_env_keys or []
         self._session_manager = session_manager or DEFAULT_EXEC_SESSION_MANAGER
+        self._job_manager = job_manager or DEFAULT_EXEC_JOB_MANAGER
 
     supports_cancellation = True
 
@@ -221,6 +239,7 @@ class ExecTool(Tool):
         return "exec"
 
     _MAX_TIMEOUT = 600
+    _MAX_BACKGROUND_TIMEOUT = 3600
     _MAX_OUTPUT = 10_000
 
     # Kernel device files safe as stdio redirect targets (#3599).
@@ -255,8 +274,10 @@ class ExecTool(Tool):
             f"{platform_note}"
             "For long-running or interactive commands, pass yield_time_ms; "
             "if the command keeps running, exec returns a session_id that can "
-            "be polled or written to with write_stdin. Output is truncated at "
-            "10 000 chars; timeout defaults to 60s."
+            "be polled or written to with write_stdin. For installs, upgrades "
+            "or other commands that may take minutes, pass background=true and "
+            "check the job with exec_job instead of raising timeout. Output is "
+            "truncated at 10 000 chars; timeout defaults to 60s."
         )
 
     @property
@@ -270,6 +291,7 @@ class ExecTool(Tool):
         login: bool | None = None, yield_time_ms: int | None = None,
         max_output_chars: int | None = None,
         max_output_tokens: int | None = None,
+        background: bool | None = None,
         **kwargs: Any,
     ) -> str:
         command = command or cmd
@@ -279,9 +301,14 @@ class ExecTool(Tool):
         if max_output_chars is None:
             max_output_chars = max_output_tokens
 
-        prepared = self._prepare_command(command, working_dir, timeout, shell, login)
+        prepared = self._prepare_command(
+            command, working_dir, timeout, shell, login, background=bool(background),
+        )
         if isinstance(prepared, str):
             return prepared
+
+        if background:
+            return await self._execute_background(prepared, str(command))
 
         if yield_time_ms is not None:
             return await self._execute_session(prepared, yield_time_ms, max_output_chars)
@@ -301,8 +328,10 @@ class ExecTool(Tool):
                     timeout=prepared.timeout,
                 )
             except asyncio.TimeoutError:
-                await self._kill_process(process)
-                return ToolResult.error(f"Error: Command timed out after {prepared.timeout} seconds")
+                info = await self._kill_process(process)
+                self.last_termination = dict(info or {}, command=str(command)[:200])
+                return ToolResult.error(timeout_error_text(prepared.timeout)
+                                        + termination_note(self.last_termination))
             except asyncio.CancelledError:
                 # t55: the outcome of the stop is kept (confirmed or not) for the caller's record.
                 self.last_termination = dict(await self._kill_process(process), command=str(command)[:200])
@@ -376,6 +405,30 @@ class ExecTool(Tool):
         except Exception as exc:
             return ToolResult.error(f"Error executing command: {exc}")
 
+    async def _execute_background(self, prepared: _PreparedCommand, display_command: str) -> str:
+        try:
+            job = await self._job_manager.start(
+                command=prepared.command,
+                display_command=display_command,
+                cwd=prepared.cwd,
+                env=prepared.env,
+                timeout=prepared.timeout,
+                shell_program=prepared.shell_program,
+                login=prepared.login,
+                log_dir=job_log_dir(self.working_dir or prepared.cwd),
+                owner_session_key=current_request_session_key(),
+            )
+        except Exception as exc:
+            return ToolResult.error(f"Error starting background job: {exc}")
+        limit = f"{prepared.timeout}s" if prepared.timeout else "none"
+        return (
+            f"Background job started. job_id: {job.job_id}\n"
+            f"pid: {job.pid}\nlog: {job.log_path}\ntimeout: {limit}\n"
+            "The command keeps running after this reply. Check it with "
+            f"exec_job(action='status', job_id='{job.job_id}') before reporting "
+            "completion; do not start the same command again while it runs."
+        )
+
     def _resolve_timeout(self, timeout: int | None) -> int | None:
         """Resolve the effective hard timeout in seconds (None = no limit).
 
@@ -390,6 +443,14 @@ class ExecTool(Tool):
             return self.timeout
         return None
 
+    def _resolve_background_timeout(self, timeout: int | None) -> int | None:
+        """Hard limit for a background job (None = no limit), capped like foreground."""
+        if timeout:
+            return min(timeout, self._MAX_BACKGROUND_TIMEOUT)
+        if self.background_timeout and self.background_timeout > 0:
+            return self.background_timeout
+        return None
+
     def _prepare_command(
         self,
         command: str,
@@ -397,6 +458,8 @@ class ExecTool(Tool):
         timeout: int | None = None,
         shell: str | None = None,
         login: bool | None = None,
+        *,
+        background: bool = False,
     ) -> _PreparedCommand | str:
         access = current_tool_workspace(
             self.working_dir,
@@ -446,7 +509,10 @@ class ExecTool(Tool):
                 command = wrap_command(self.sandbox, command, workspace, cwd)
                 cwd = str(Path(workspace).resolve())
 
-        effective_timeout = self._resolve_timeout(timeout)
+        effective_timeout = (
+            self._resolve_background_timeout(timeout) if background
+            else self._resolve_timeout(timeout)
+        )
         env = self._build_env()
 
         if self.path_prepend or self.path_append:
@@ -497,6 +563,8 @@ class ExecTool(Tool):
         login: bool = False,
         *,
         stdin: int = asyncio.subprocess.DEVNULL,
+        stdout: Any = asyncio.subprocess.PIPE,
+        stderr: Any = asyncio.subprocess.PIPE,
     ) -> asyncio.subprocess.Process:
         """Launch *command* in a platform-appropriate shell."""
         if _IS_WINDOWS:
@@ -511,8 +579,8 @@ class ExecTool(Tool):
                 return await asyncio.create_subprocess_shell(
                     command,
                     stdin=stdin,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                    stdout=stdout,
+                    stderr=stderr,
                     cwd=cwd,
                     env=cmd_env,
                 )
@@ -521,8 +589,8 @@ class ExecTool(Tool):
             return await asyncio.create_subprocess_exec(
                 program, "-NoProfile", "-NonInteractive", "-Command", command,
                 stdin=stdin,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stdout=stdout,
+                stderr=stderr,
                 cwd=cwd,
                 env=env,
             )
@@ -535,8 +603,8 @@ class ExecTool(Tool):
         return await asyncio.create_subprocess_exec(
             *args,
             stdin=stdin,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stdout=stdout,
+            stderr=stderr,
             cwd=cwd,
             start_new_session=not _IS_WINDOWS,
             env=env,
@@ -844,3 +912,16 @@ def termination_note(info: dict | None) -> str:
         return ""
     return ("종료 확인 불가·결과 불명: pid=" + str(info.get("pid")) + " pgid=" + str(info.get("pgid"))
             + " (" + str(info.get("command") or "")[:80] + "); 관련 대상을 다시 변경하기 전에 상태를 확인해야 합니다.")
+
+
+def timeout_error_text(timeout: int | None) -> str:
+    """Foreground timeout result: the work may have finished; verify before any retry."""
+    return (
+        f"Error: Command timed out after {timeout} seconds; termination was requested.\n"
+        "Outcome unknown: the command may have partially or fully completed before it "
+        "was stopped (e.g. an install or update may already be applied). Do not rerun "
+        "it automatically. First verify the actual state (installed version, running "
+        "processes, files, exit status/logs) with a short read-only check, then decide. "
+        "For commands that need more time, start them with background=true and check "
+        "them with exec_job."
+    )

@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import re
 import time
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
@@ -79,9 +81,47 @@ _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
+# A final reply with no tool call right after a failed/timed-out state-changing
+# tool call gets one structural resume per turn; a repeated no-tool final stops the turn.
+_STALL_FAILURE_STATUSES = frozenset({"error", "unknown"})
+# Safety-boundary refusals already carry their own "do not retry" guidance.
+_STALL_POLICY_DETAILS = ("ssrf_violation", "workspace_violation")
+_STALL_REPEAT_MIN_CHARS = 40
+_STALL_REPEAT_RATIO = 0.9
+# Only a complete request to replay an answer, never "repeat the operation" or
+# an answer request followed by more work. This exempts session history only.
+_STALL_ANSWER_REPLAY = re.compile(
+    r"(?:"
+    r"(?:(?:(?:그|이|해당)\s*(?:코드|번호|값|내용|답변|답|설명)"
+    r"|(?:이전|직전|마지막|방금)(?:의)?\s*(?:답변|답|응답|내용|설명))"
+    r"(?:을|를)?\s*)?(?:그대로\s*)?(?:다시|한\s*번\s*더)\s*"
+    r"(?:알려|말해|보여|설명해|답변해)\s*(?:줘|주세요|줄래(?:요)?)"
+    r"|(?:please\s+)?repeat\s+(?:your|the)\s+(?:last|previous)\s+(?:answer|response)"
+    r"(?:\s+(?:again|verbatim))?(?:,?\s+please)?"
+    r"|(?:please\s+)?(?:tell|show)\s+me\s+(?:that|the)\s+(?:code|answer|value)\s+again"
+    r"(?:,?\s+please)?"
+    r")[.!?。！？\s]*", re.I,
+)
+_STALL_RESUME_FEEDBACK = (
+    "[Runtime check] The previous tool call did not succeed ({failures}). Your reply above "
+    "has no tool call, so it was not delivered as the final answer. Do exactly one of: "
+    "(a) call a tool now to verify the actual state (versions, processes, exit status, "
+    "files) or to continue the remaining work; a timed-out command may already have "
+    "completed, so check before running it again; or (b) if you cannot continue, reply "
+    "with a blocked/partial report: what was verified, what failed, and the actual limit. "
+    "Do not announce further work without calling a tool."
+)
 # Backward-compatible module attribute for tests/extensions that monkeypatch
 # the former single-file tracker hook. Runtime uses prepare_file_edit_trackers.
 prepare_file_edit_tracker = _prepare_file_edit_tracker
+
+
+class _RefusedToolEvent(dict):
+    """Tool event for a call refused before execution (bad args, missing metadata, repeated lookup).
+
+    A plain-dict subclass so tool_events compare and serialize exactly as before; only the
+    stall guard checks the type, so a refusal never triggers the failed-tool resume.
+    """
 
 
 @dataclass(slots=True)
@@ -123,6 +163,7 @@ class AgentRunSpec:
     task_note_metadata: dict[str, Any] | None = None
     task_state: Any | None = None
     task_note_persist_callback: Any | None = None
+    stall_guard: bool = True
 
 
 @dataclass(slots=True)
@@ -440,6 +481,12 @@ class AgentRunner:
         answer_fix_corrections = 0
         task_corrections = 0
         report_corrections = 0
+        stall_resumes = 0
+        last_tool_failures: list[dict[str, str]] = []
+        stall_guard = spec.stall_guard and not (
+            spec.selected_context and not spec.selected_context.legacy_fallback
+        )
+        previous_finals = self._prior_session_final(spec.initial_messages) if stall_guard else []
 
         async def guard_final(clean, assistant_message, iteration, *, already_appended=False):
             nonlocal premature_final_corrections, task_corrections, report_corrections, stop_reason
@@ -494,7 +541,8 @@ class AgentRunner:
                     clean = spec.task_state.incomplete(defects)
                     assistant_message["content"] = clean
                     return clean, False
-                clean = spec.task_state.update.final_answer.strip()
+                clean = spec.task_state.final_report()
+                stop_reason = spec.task_state.final_status
                 assistant_message["content"] = clean
             if spec.selected_context and not spec.selected_context.legacy_fallback:
                 checked, checked_status = spec.selected_context.verdict(clean)
@@ -644,7 +692,27 @@ class AgentRunner:
                 session_key=spec.session_key,
             )
             await hook.before_iteration(context)
-            response = await self._request_model(spec, messages_for_model, hook, context)
+            request_started = time.monotonic()
+            logger.info(
+                "LLM request start: session={} iteration={} model={}",
+                spec.session_key or "-", iteration, spec.model,
+            )
+            try:
+                response = await self._request_model(spec, messages_for_model, hook, context)
+            except BaseException as exc:
+                logger.warning(
+                    "LLM request end: session={} iteration={} model={} duration={:.1f}s "
+                    "finish_reason=exception error_kind={}",
+                    spec.session_key or "-", iteration, spec.model,
+                    time.monotonic() - request_started, type(exc).__name__,
+                )
+                raise
+            logger.info(
+                "LLM request end: session={} iteration={} model={} duration={:.1f}s "
+                "finish_reason={} error_kind={} tool_calls={}",
+                spec.session_key or "-", iteration, spec.model, time.monotonic() - request_started,
+                response.finish_reason, response.error_kind or "-", len(response.tool_calls or []),
+            )
             context.response = response
             context.tool_calls = list(response.tool_calls)
 
@@ -665,7 +733,7 @@ class AgentRunner:
             if response.should_execute_tools:
                 context.tool_calls = list(response.tool_calls)
                 structured_report = spec.task_state is not None and any(
-                    call.name == "update_task" and call.arguments.get("status") == "completed"
+                    call.name == "update_task" and call.arguments.get("status") in {"completed", "cancelled"}
                     and str(call.arguments.get("final_answer") or "").strip()
                     for call in response.tool_calls
                 )
@@ -681,6 +749,7 @@ class AgentRunner:
                     tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
+                    provider_state=response.provider_state,
                 )
                 messages.append(assistant_message)
                 await self._emit_checkpoint(
@@ -722,6 +791,13 @@ class AgentRunner:
                     spec.selected_context.control.pending = []
                     had_injections = True
                 tool_events.extend(new_events)
+                last_tool_failures = [
+                    event for call, event in zip(response.tool_calls, new_events)
+                    if event.get("status") in _STALL_FAILURE_STATUSES
+                    and not isinstance(event, _RefusedToolEvent)
+                    and not str(event.get("detail") or "").startswith(_STALL_POLICY_DETAILS)
+                    and getattr(spec.tools.get(call.name), "read_only", False) is not True
+                ]
                 tools_used.extend(
                     tool_call.name
                     for tool_call, event in zip(response.tool_calls, new_events)
@@ -813,7 +889,7 @@ class AgentRunner:
                     should_continue, injection_cycles = await self._try_drain_injections(
                         spec, messages, None, injection_cycles, phase="after observability final",
                     )
-                    if not should_continue and stop_reason != "incomplete":
+                    if not should_continue and stop_reason not in {"incomplete", "cancelled"}:
                         predicate = spec.goal_active_predicate
                         if predicate is not None and predicate():
                             messages.append(self._build_goal_continue_message(spec))
@@ -938,6 +1014,7 @@ class AgentRunner:
                         clean,
                         reasoning_content=response.reasoning_content,
                         thinking_blocks=response.thinking_blocks,
+                        provider_state=response.provider_state,
                     ))
                     messages.append(build_length_recovery_message())
                     await hook.after_iteration(context)
@@ -949,7 +1026,54 @@ class AgentRunner:
                     clean,
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
+                    provider_state=response.provider_state,
                 )
+
+            if assistant_message is not None and stall_guard:
+                if self._repeats_previous_final(clean, previous_finals):
+                    # Same no-tool reply again: resending it cannot make progress.
+                    logger.warning(
+                        "Stopping turn for {}: no-tool final repeats an earlier final (iteration {})",
+                        spec.session_key or "default", iteration,
+                    )
+                    stop_reason = "incomplete"
+                    final_content = self._stall_report(tool_events)
+                    assistant_message["content"] = final_content
+                    messages.append(assistant_message)
+                    await self._emit_checkpoint(spec, {
+                        "phase": "final_response", "iteration": iteration, "model": spec.model,
+                        "assistant_message": assistant_message,
+                        "completed_tool_results": [], "pending_tool_calls": [],
+                    })
+                    context.final_content = final_content
+                    context.stop_reason = stop_reason
+                    if hook.wants_streaming():
+                        await hook.on_stream_end(context, resuming=False)
+                    await hook.after_iteration(context)
+                    break
+                previous_finals.append(clean)
+                if (last_tool_failures and stall_resumes == 0 and spec.task_state is None
+                        and iteration + 1 < spec.max_iterations):
+                    # Structural check only: the last tool batch failed and this reply has
+                    # no tool call. Response wording is not interpreted.
+                    stall_resumes += 1
+                    failures = ", ".join(
+                        f"{event.get('name')}: {event.get('status')}" for event in last_tool_failures
+                    )
+                    logger.info(
+                        "No-tool final after failed tool batch for {} ({}); resuming once",
+                        spec.session_key or "default", failures,
+                    )
+                    assistant_message["_hidden_history"] = True
+                    messages.append(assistant_message)
+                    messages.append({
+                        "role": "user", "_hidden_history": True,
+                        "content": _STALL_RESUME_FEEDBACK.format(failures=failures),
+                    })
+                    if hook.wants_streaming():
+                        await hook.on_stream_end(context, resuming=True)
+                    await hook.after_iteration(context)
+                    continue
 
             if assistant_message is not None:
                 clean, guard_resume = await guard_final(clean, assistant_message, iteration)
@@ -970,7 +1094,7 @@ class AgentRunner:
                 spec, messages, assistant_message, injection_cycles,
                 phase="after final response",
                 iteration=iteration,
-                allow_goal_continue=stop_reason != "incomplete",
+                allow_goal_continue=stop_reason not in {"incomplete", "cancelled"},
             )
             if should_continue:
                 had_injections = True
@@ -1032,6 +1156,7 @@ class AgentRunner:
                 clean,
                 reasoning_content=response.reasoning_content,
                 thinking_blocks=response.thinking_blocks,
+                provider_state=response.provider_state,
             ))
             await self._emit_checkpoint(
                 spec,
@@ -1069,7 +1194,7 @@ class AgentRunner:
                     spec.task_state.update.final_answer,
                 ) or ""
             if (spec.task_state is not None and not spec.task_state.defects()
-                    and spec.task_state.update.status == "completed"):
+                    and spec.task_state.update.status in {"completed", "cancelled"}):
                 final_content = spec.task_state.update.final_answer.strip()
             if final_content is None and spec.finalize_on_max_iterations and not spec.selected_context:
                 final_content = await self._try_finalize_after_max_iterations(
@@ -1090,8 +1215,8 @@ class AgentRunner:
                 if defects and not terminal:
                     final_content = spec.task_state.incomplete(defects)
                 elif not terminal:
-                    final_content = spec.task_state.update.final_answer.strip()
-                    stop_reason = "completed"
+                    final_content = spec.task_state.final_report()
+                    stop_reason = spec.task_state.final_status
                 elif terminal:
                     final_content = str(final_content or "") + "\n\n미완료 상태: " + spec.task_state.update.explanation
             if spec.premature_final_guard and needs_answer_body(final_content, messages):
@@ -1112,6 +1237,67 @@ class AgentRunner:
             tool_events=tool_events,
             had_injections=had_injections,
         )
+
+    @staticmethod
+    def _normalize_final(text: str | None) -> str:
+        return re.sub(r"[\W_]+", "", str(text or "").lower())[:2000]
+
+    @classmethod
+    def _prior_session_final(cls, messages: list[dict[str, Any]]) -> list[str]:
+        """Seed cross-turn repetition checks unless answer replay is explicitly requested."""
+        from nanobot.agent.task_note import user_text
+
+        if _STALL_ANSWER_REPLAY.fullmatch(user_text(messages).strip()):
+            # Replaying a delivered answer is the requested result. Finals produced
+            # during this run still enter previous_finals and retain the stall guard.
+            return []
+        for message in reversed(messages):
+            role = message.get("role")
+            if role == "user" and not is_hidden_history_message(message):
+                continue
+            if role != "assistant" or is_hidden_history_message(message):
+                continue
+            content = message.get("content")
+            if message.get("tool_calls") or not isinstance(content, str) or not content.strip():
+                return []
+            return [content]
+        return []
+
+    @classmethod
+    def _repeats_previous_final(cls, text: str | None, previous: list[str]) -> bool:
+        current = cls._normalize_final(text)
+        if len(current) < _STALL_REPEAT_MIN_CHARS:
+            return False
+        for earlier in previous:
+            other = cls._normalize_final(earlier)
+            if current == other or (
+                other and SequenceMatcher(None, current, other).ratio() >= _STALL_REPEAT_RATIO
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _stall_report(tool_events: list[dict[str, str]]) -> str:
+        labels = {"ok": "성공", "error": "실패", "unknown": "결과 불명", "blocked": "차단"}
+        lines = [
+            "작업을 계속 진행하지 못해 이번 응답을 중단했습니다. 도구 실행 없이 같은 답변이 "
+            "반복되어 다시 보내지 않았습니다."
+        ]
+        recent = [event for event in tool_events if event.get("status") != "superseded"][-3:]
+        if recent:
+            lines.append("마지막으로 확인된 상태:")
+            for event in recent:
+                status = str(event.get("status") or "unknown")
+                line = f"- {event.get('name')}: {labels.get(status, status)}"
+                if status != "ok" and event.get("detail"):
+                    line += " — " + " ".join(str(event["detail"]).split())[:160]
+                lines.append(line)
+        else:
+            lines.append("이번 응답에서는 실행된 도구가 없습니다.")
+        lines.append(
+            "실제 상태(버전·프로세스·종료 코드)를 먼저 확인한 뒤 다음 단계를 진행해야 합니다."
+        )
+        return "\n".join(lines)
 
     @staticmethod
     def _all_tool_calls_observability(
@@ -1517,6 +1703,7 @@ class AgentRunner:
             tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
             reasoning_content=response.reasoning_content,
             thinking_blocks=response.thinking_blocks,
+            provider_state=response.provider_state,
         )
         completion_tokens = estimate_message_tokens(assistant_message)
         total_tokens = max(0, prompt_tokens) + max(0, completion_tokens)
@@ -1664,9 +1851,15 @@ class AgentRunner:
             notice = note.progress.operation(tool_call.name, tool_call.arguments)
             if notice:
                 await spec.progress_callback(notice, tool_hint=False)
-        outcome = await bounded_operation(note, tool_call.name, lambda: self._run_tool_unchecked(
-            spec, tool_call, external_lookup_counts, workspace_violation_counts,
-        ))
+        try:
+            outcome = await bounded_operation(note, tool_call.name, lambda: self._run_tool_unchecked(
+                spec, tool_call, external_lookup_counts, workspace_violation_counts,
+            ))
+        except asyncio.CancelledError:
+            if tool is not None and not tool.read_only:
+                note.observe(tool_call.name, tool_call.arguments,
+                             "Cancelled during execution; result unknown.", tool, "unknown", tool_call.id)
+            raise
         if isinstance(outcome, tuple):
             result, event, error = outcome
         else:
@@ -1701,11 +1894,11 @@ class AgentRunner:
             external_lookup_counts,
         )
         if lookup_error:
-            event = {
+            event = _RefusedToolEvent({
                 "name": tool_call.name,
                 "status": "error",
                 "detail": "repeated external lookup blocked",
-            }
+            })
             if spec.fail_on_tool_error:
                 return lookup_error + hint, event, RuntimeError(lookup_error)
             return lookup_error + hint, event, None
@@ -1717,12 +1910,12 @@ class AgentRunner:
                 if isinstance(prepared, tuple) and len(prepared) == 3:
                     tool, params, prep_error = prepared
         if prep_error:
-            event = {
+            event = _RefusedToolEvent({
                 "name": tool_call.name,
                 "status": "error",
                 "detail": prep_error.split(": ", 1)[-1][:120],
                 "executed": False,   # t49: refused before execution
-            }
+            })
             handled = self._classify_violation(
                 raw_text=prep_error,
                 soft_payload=prep_error + hint,

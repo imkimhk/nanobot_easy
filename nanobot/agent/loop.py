@@ -283,6 +283,8 @@ class AgentLoop:
         restart_mode: str = "auto",
         local_trigger_store: Any | None = None,
         context_selection: Any | None = None,
+        compact_context: bool = False,
+        selective_memory: bool = False,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -311,6 +313,7 @@ class AgentLoop:
             else defaults.context_window_tokens
         )
         self.context_selection_config = context_selection or defaults.context_selection
+        self.compact_context = compact_context
         self.context_block_limit = context_block_limit
         self.reasoning_effort = reasoning_effort
         # Stepwise reasoning ("Genie method") is on only when applied explicitly.
@@ -405,6 +408,7 @@ class AgentLoop:
             hot_path_skills=self.hot_path_skills,
             preload_always_skills=preload_always_skills,
             on_demand_skills=on_demand_skills,
+            selective_memory=selective_memory and self.tools_config.file.enable,
         )
         self.conversation_memory = ConversationEventStore(workspace)
         self._memory_workspace_id = str(Path(workspace).expanduser().resolve())
@@ -532,6 +536,8 @@ class AgentLoop:
             context_window_tokens=context_window_tokens,
             context_block_limit=defaults.context_block_limit,
             context_selection=defaults.context_selection,
+            compact_context=defaults.compact_context,
+            selective_memory=defaults.selective_memory,
             reasoning_effort=getattr(resolved, "reasoning_effort", None) or defaults.reasoning_effort,
             stepwise_enabled=defaults.stepwise.enabled,
             stepwise_applied_at=defaults.stepwise.applied_at,
@@ -2082,6 +2088,17 @@ class AgentLoop:
             ctx.pending_summary,
             include_memory_recent_history=not ctx.ephemeral,
         )
+        if (self.compact_context and not ctx.ephemeral and not self._stepwise_enabled()
+                and ctx.msg.sender_id != "subagent"):
+            from nanobot.agent.compact_context import CompactTools
+            scope = self.workspace_scopes.for_message(ctx.msg, ctx.session.metadata)
+            full_guidance = ctx.initial_messages[0]["content"]
+            ctx.initial_messages[0] = {"role": "system", "content":
+                self.context.build_compact_system_prompt(
+                    channel=ctx.msg.channel, workspace=scope.project_path,
+                    session_summary=ctx.pending_summary,
+                    memory_query=None if ctx.history else ctx.msg.content)}
+            ctx.tools = CompactTools(ctx.tools or self.tools, full_guidance, ctx.initial_messages[0])
         ctx.user_persisted_early = self._persist_user_message_early(
             ctx.msg, ctx.session
         )
@@ -2672,6 +2689,7 @@ class AgentLoop:
             message.get("tool_calls"),
             message.get("reasoning_content"),
             message.get("thinking_blocks"),
+            message.get("provider_state"),
         )
 
     def _restore_runtime_checkpoint(self, session: Session) -> bool:

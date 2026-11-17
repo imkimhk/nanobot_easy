@@ -20,6 +20,7 @@ _SAFE_MODE_BLOCKED_TOOLS = frozenset({
     "apply_patch",
     "edit_file",
     "exec",
+    "exec_job",
     "list_exec_sessions",
     "run_cli_app",
     "write_file",

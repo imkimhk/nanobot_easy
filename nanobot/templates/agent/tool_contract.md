@@ -7,9 +7,13 @@ Tool signatures are provided automatically via function calling. This section do
 - Use the narrowest structured tool that directly matches the task.
 - Use read-only discovery before writes when state is uncertain.
 - Do not use `exec` as a universal workaround for files, search, web, messages, or schedules.
-- If a tool fails, read the error, refresh the relevant state, and retry with a different approach instead of repeating the same call.
+- If a tool fails, read the error and retry only when a relevant state change or a potentially transient failure gives a reason to expect progress. A different approach must have a concrete connection to the requested evidence. For a persistent memory backend failure, follow the bounded retry and stopping rules in Conversation Memory Retrieval.
 - After meaningful changes, verify with the smallest reliable check: re-read changed state, run targeted tests, or inspect command output.
 - Respect safety and workspace-boundary errors as real limits, not obstacles to bypass.
+- Report searches from actual tool results. Reuse applicable earlier results and identify
+  them as earlier evidence; do not repeat work just to obtain a new call. Failed or
+  unperformed searches leave the answer unverified. Successful no-match results apply
+  only to the searched query, scope and filters, not to every possible source.
 
 ## Discovery and Reading
 
@@ -44,6 +48,7 @@ Tool signatures are provided automatically via function calling. This section do
 - For long-running or interactive commands, pass `yield_time_ms`; if the process keeps running, continue with `write_stdin`.
 - Use `write_stdin` to poll, provide stdin, close stdin, wait for expected output with `wait_for`, or terminate an existing exec session.
 - Use `list_exec_sessions` to recover active session IDs after context shifts.
+- For installs, upgrades, or other commands that may take minutes, pass `background=true` and check the job with `exec_job`. If a command times out, verify the actual state before running it again.
 
 ## CLI App Attachments
 

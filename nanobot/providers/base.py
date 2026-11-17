@@ -6,12 +6,14 @@ import os
 import re
 import time
 from abc import ABC, abstractmethod
+from asyncio import timeout as _attempt_timeout
 from collections.abc import Awaitable, Callable
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from math import isfinite
 from typing import Any
 
 import json_repair
@@ -44,6 +46,70 @@ def resolve_stream_idle_timeout_s(
         logger.warning("Clamping {}={!r} to {}", STREAM_IDLE_TIMEOUT_ENV, raw, maximum)
         return maximum
     return value
+
+
+LLM_CALL_TIMEOUT_ENV = "NANOBOT_LLM_CALL_TIMEOUT_S"
+DEFAULT_LLM_CALL_TIMEOUT_S = 900.0
+MAX_LLM_CALL_TIMEOUT_S = 7200.0
+
+
+def resolve_llm_call_timeout_s(
+    *,
+    env_value: str | None = None,
+    default: float = DEFAULT_LLM_CALL_TIMEOUT_S,
+    maximum: float = MAX_LLM_CALL_TIMEOUT_S,
+) -> float | None:
+    """Wall-clock limit for one provider attempt (streaming or not); None = no limit.
+
+    Unlike the stream idle timeout, this also ends a stream that keeps trickling
+    bytes without ever completing. ``0`` disables the limit.
+    """
+    raw = os.environ.get(LLM_CALL_TIMEOUT_ENV) if env_value is None else env_value
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid {}={!r}; using {}", LLM_CALL_TIMEOUT_ENV, raw, default)
+        return default
+    if not isfinite(value):
+        return default
+    if value <= 0:
+        return None
+    if value > maximum:
+        logger.warning("Clamping {}={!r} to {}", LLM_CALL_TIMEOUT_ENV, raw, maximum)
+        return maximum
+    return value
+
+
+def _log_provider_attempt(
+    provider: Any, kwargs: dict[str, Any], *, stream: bool, elapsed_s: float,
+    response: "LLMResponse | None", outcome: str | None = None,
+) -> None:
+    """Content-free per-attempt log line: no prompt text, headers or keys."""
+    try:
+        from nanobot.agent.tools.context import current_request_session_key
+        session_key = current_request_session_key()
+    except Exception:
+        session_key = None
+    finish_reason = outcome or (response.finish_reason if response is not None else None)
+    error_kind = response.error_kind if response is not None else None
+    failed = finish_reason in {"error", "cancelled"}
+    log = logger.warning if failed else (logger.info if elapsed_s >= 60 else logger.debug)
+    log(
+        "LLM attempt end: provider={} model={} stream={} session={} duration={:.1f}s "
+        "finish_reason={} error_kind={}",
+        type(provider).__name__, kwargs.get("model"), stream, session_key or "-",
+        elapsed_s, finish_reason, error_kind,
+    )
+
+
+def _call_timeout_response(limit_s: float) -> "LLMResponse":
+    return LLMResponse(
+        content=f"Error calling LLM: no complete response within the {limit_s:g}s per-call limit",
+        finish_reason="error",
+        error_kind="timeout",
+    )
 
 
 @dataclass
@@ -187,6 +253,7 @@ class LLMResponse:
     error_should_retry: bool | None = None
     # Request fields a provider reports as actually sent (e.g. {"reasoning": ...}); None = not reported.
     request_options: dict[str, Any] | None = None
+    provider_state: dict[str, Any] | None = None  # Opaque, provider-scoped replay state.
 
     @property
     def has_tool_calls(self) -> bool:
@@ -660,28 +727,35 @@ class LLMProvider(ABC):
         observation_token = observer.set(partial(trace.mark, attempt=attempt) if trace else None)
         started = time.monotonic()
         clock_token = call_clock.set((started, time.time()))
+        call_limit = resolve_llm_call_timeout_s()
+        deadline = None
         try:
             observe("provider_call_started", provider=type(self).__name__, model=kwargs.get("model"),
                     reasoning_effort=kwargs.get("reasoning_effort"),
                     max_output_tokens=kwargs.get("max_tokens"), tool_choice=kwargs.get("tool_choice"),
                     tool_count=len(kwargs.get("tools") or []))
             limit = budget.cap(None) if budget is not None else None
-            if limit is not None:
-                async with asyncio.timeout(limit):     # whole-request deadline caps this wait
+            if call_limit is not None:
+                deadline = _attempt_timeout(call_limit)
+            async with deadline or nullcontext():
+                async with asyncio.timeout(limit) if limit is not None else nullcontext():
                     response = await self.chat(**kwargs)
-            else:
-                response = await self.chat(**kwargs)
         except asyncio.CancelledError:
             observe("cancellation_received")
             if trace:
                 trace.end(attempt, None, time.monotonic() - started, "cancelled")
+            _log_provider_attempt(self, kwargs, stream=False, elapsed_s=time.monotonic() - started,
+                                  response=None, outcome="cancelled")
             raise
-        except TimeoutError:
-            if budget is None or budget.cap(None) is None or budget.remaining_s() > 0:
-                raise
-            budget.stop("budget_deadline")
-            response = LLMResponse(content="Error calling LLM: request deadline reached", finish_reason="error",
-                                   error_kind="budget_exhausted", error_should_retry=False)
+        except TimeoutError as exc:
+            if budget is not None and budget.cap(None) is not None and budget.remaining_s() <= 0:
+                budget.stop("budget_deadline")
+                response = LLMResponse(content="Error calling LLM: request deadline reached", finish_reason="error",
+                                       error_kind="budget_exhausted", error_should_retry=False)
+            elif call_limit is not None and deadline is not None and deadline.expired():
+                response = _call_timeout_response(call_limit)
+            else:
+                response = LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
         except Exception as exc:
             response = LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
         finally:
@@ -691,6 +765,8 @@ class LLMProvider(ABC):
         if budget is not None:
             # t55: every SENT call is accounted; a call cut at the deadline has unknown usage (not 0).
             budget.record_usage(getattr(response, "usage", None))
+        _log_provider_attempt(self, kwargs, stream=False, elapsed_s=time.monotonic() - started,
+                              response=response)
         if trace:
             trace.end(attempt, response, time.monotonic() - started)
         return response
@@ -747,28 +823,35 @@ class LLMProvider(ABC):
         observation_token = observer.set(partial(trace.mark, attempt=attempt) if trace else None)
         started = time.monotonic()
         clock_token = call_clock.set((started, time.time()))
+        call_limit = resolve_llm_call_timeout_s()
+        deadline = None
         try:
             observe("provider_call_started", provider=type(self).__name__, model=kwargs.get("model"),
                     reasoning_effort=kwargs.get("reasoning_effort"),
                     max_output_tokens=kwargs.get("max_tokens"), stream=True,
                     tool_choice=kwargs.get("tool_choice"), tool_count=len(kwargs.get("tools") or []))
             limit = budget.cap(None) if budget is not None else None
-            if limit is not None:
-                async with asyncio.timeout(limit):     # whole-request deadline caps this wait
+            if call_limit is not None:
+                deadline = _attempt_timeout(call_limit)
+            async with deadline or nullcontext():
+                async with asyncio.timeout(limit) if limit is not None else nullcontext():
                     response = await self.chat_stream(**kwargs)
-            else:
-                response = await self.chat_stream(**kwargs)
         except asyncio.CancelledError:
             observe("cancellation_received")
             if trace:
                 trace.end(attempt, None, time.monotonic() - started, "cancelled")
+            _log_provider_attempt(self, kwargs, stream=True, elapsed_s=time.monotonic() - started,
+                                  response=None, outcome="cancelled")
             raise
-        except TimeoutError:
-            if budget is None or budget.cap(None) is None or budget.remaining_s() > 0:
-                raise
-            budget.stop("budget_deadline")
-            response = LLMResponse(content="Error calling LLM: request deadline reached", finish_reason="error",
-                                   error_kind="budget_exhausted", error_should_retry=False)
+        except TimeoutError as exc:
+            if budget is not None and budget.cap(None) is not None and budget.remaining_s() <= 0:
+                budget.stop("budget_deadline")
+                response = LLMResponse(content="Error calling LLM: request deadline reached", finish_reason="error",
+                                       error_kind="budget_exhausted", error_should_retry=False)
+            elif call_limit is not None and deadline is not None and deadline.expired():
+                response = _call_timeout_response(call_limit)
+            else:
+                response = LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
         except Exception as exc:
             response = LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
         finally:
@@ -778,6 +861,8 @@ class LLMProvider(ABC):
         if budget is not None:
             # t55: every SENT call is accounted; a call cut at the deadline has unknown usage (not 0).
             budget.record_usage(getattr(response, "usage", None))
+        _log_provider_attempt(self, kwargs, stream=True, elapsed_s=time.monotonic() - started,
+                              response=response)
         if trace:
             trace.end(attempt, response, time.monotonic() - started)
         return response

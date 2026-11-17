@@ -660,6 +660,7 @@ describe("App layout", () => {
       when_not_to_use: "",
       required_tools: [],
       usage_count: 4,
+      selection_count: 9,
       success_count: 3,
       failure_count: 1,
       routing_failure_count: 0,
@@ -726,6 +727,8 @@ describe("App layout", () => {
           query_digest: "review this diff",
           candidates: [],
           selected_skill: "review-helper",
+          phase: "applied",
+          application_evidence: "Reviewed the diff and reported its concrete findings.",
           selection_reason: "cold",
           executed_by: "main",
           wave_no: null,
@@ -854,6 +857,10 @@ describe("App layout", () => {
     expect(screen.getByText("Ready for review and registration.")).toBeInTheDocument();
     expect(screen.getAllByText("review-helper").length).toBeGreaterThan(0);
     expect(await screen.findByText("review this diff")).toBeInTheDocument();
+    expect(screen.getByText("Selections").parentElement).toHaveTextContent("9");
+    expect(screen.getByText("Usage").parentElement).toHaveTextContent("4");
+    expect(screen.getByText("applied · cold")).toBeInTheDocument();
+    expect(screen.getByText("Reviewed the diff and reported its concrete findings.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /verified로 승격/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Run test" }));

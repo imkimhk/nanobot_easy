@@ -3739,8 +3739,9 @@ class ContextSelector:
                       registry: ToolRegistry, skills: Any, *, media: bool = False) -> dict:
         tasks = self.tasks.list(scope, session_id)
         # Only human/assistant dialogue; old tool outputs are not designer input.
-        events = self.tasks.events(scope, session_id, tail=80)
-        dialogue = [e for e in events if e.event_type in {"USER_MESSAGE", "ASSISTANT_MESSAGE"}]
+        dialogue = self.tasks.events(scope, session_id, tail=80,
+                                     event_types=("USER_MESSAGE", "ASSISTANT_MESSAGE"))
+        events = self.tasks.events(scope, session_id, tail=12)
         references = resolve_references(request, dialogue, tasks)
         referenced = {sid for ref in references.values() for sid in ref.get("source_ids", [])}
         recent = [e for e in dialogue[-self.config.recent_messages:]

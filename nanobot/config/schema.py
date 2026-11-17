@@ -192,6 +192,8 @@ class AgentDefaults(Base):
     context_window_tokens: int = 200_000
     context_block_limit: int | None = None
     context_selection: ContextSelectionConfig = Field(default_factory=ContextSelectionConfig)
+    compact_context: bool = False  # Opt-in: defer execution tutorials/schemas until needed.
+    selective_memory: bool = False  # Opt-in: select explicitly marked reference notes only.
     temperature: float = 0.1
     fallback_models: list[FallbackCandidate] = Field(default_factory=list)
     max_tool_iterations: int = 200
