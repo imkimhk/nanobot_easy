@@ -1,5 +1,6 @@
 """v4.2 counterexamples: scripted models, real local tools, isolated targets."""
 import asyncio
+import json
 import re
 from unittest.mock import AsyncMock
 
@@ -383,17 +384,149 @@ async def test_t08_real_saved_timeout_reconciled_by_read_without_second_save(tmp
     assert writes[0]["verification"] == "read_after_unknown_write"
 
 
-async def test_t09_only_missing_result_reference_is_repaired(tmp_path):
-    result, provider, _ = await run(tmp_path, [
+async def test_t09_missing_result_reference_is_linked_without_another_model_call(tmp_path):
+    result, provider, metadata = await run(tmp_path, [
         control(targets=[target(action="write")], status="active", analysis_complete=False),
         call("write_file", **write_args()),
         control(targets=[target(action="write")], answer="저장했습니다."),
-        control(targets=[target(action="write")], result_refs=["write_file"], answer="a.md 저장을 확인했습니다."),
     ], request="a.md 저장해 줘")
     assert result.stop_reason == "completed"
     assert result.tools_used.count("write_file") == 1
-    assert len(provider.calls) == 4
-    assert any("answer_correction" in str(m.get("content")) for m in result.messages)
+    assert len(provider.calls) == 3
+    assert not any("Completion defects" in str(m.get("content")) for m in result.messages)
+    assert metadata["task_note"]["update"]["result_refs"] == ["write_file"]
+    assert metadata["task_note"]["runtime_linked_result_refs"] == ["write_file"]
+
+
+@pytest.mark.parametrize("changes", [
+    {"analysis_complete": False}, {"status": "active"}, {"status": "partial"},
+    {"final_answer": ""}, {"result_refs": ["invented-id"]},
+])
+def test_runtime_linking_does_not_repair_other_completion_defects(tmp_path, changes):
+    note = TaskNote([{"role": "user", "content": "a.md 저장해 줘"}], tmp_path, {})
+    note.observe("write_file", write_args(), "saved", WriteFileTool(workspace=tmp_path),
+                 "ok", "actual-write")
+    note.accept(update(note, targets=[target(action="write")],
+                       **{"result_refs": [], **changes}))
+    assert note.runtime_linked_result_refs == []
+    assert any("missing_result_reference" in d for d in note.defects())
+
+
+@pytest.mark.parametrize("status", ["unknown", "denied", "error"])
+def test_runtime_linking_never_uses_an_old_success_after_a_new_failure(tmp_path, status):
+    note = TaskNote([{"role": "user", "content": "a.md 저장해 줘"}], tmp_path, {})
+    writer = WriteFileTool(workspace=tmp_path)
+    note.observe("write_file", write_args(), "saved", writer, "ok", "earlier-write")
+    note.observe("write_file", write_args(), status, writer, status, "latest-write")
+    note.accept(update(note, targets=[target(action="write")], result_refs=[]))
+    assert note.runtime_linked_result_refs == []
+    assert note.update.result_refs == []
+    assert note.defects()
+
+
+def test_runtime_links_all_current_targets_and_resets_on_new_request(tmp_path):
+    note = TaskNote([{"role": "user", "content": "a.md와 b.md 저장해 줘"}], tmp_path, {})
+    writer = WriteFileTool(workspace=tmp_path)
+    for name, identity in [("a.md", "actual-a"), ("b.md", "actual-b")]:
+        note.observe("write_file", {**write_args(), "path": name}, "saved", writer, "ok", identity)
+    note.accept(update(note, targets=[target("a.md", action="write"), target("b.md", action="write")],
+                       result_refs=["actual-a"]))
+    assert note.defects() == []
+    assert note.update.result_refs == ["actual-a", "actual-b"]
+    assert note.runtime_linked_result_refs == ["actual-b"]
+    note.revise([{"role": "user", "content": "a.md 저장해 줘"}])
+    note.accept(update(note, targets=[target(action="write")], result_refs=[]))
+    assert note.runtime_linked_result_refs == []
+    assert note.defects() == ["execution_required:a.md"]
+
+
+async def test_runtime_linking_requires_read_coverage_and_verified_unknown_write(tmp_path):
+    result, provider, metadata = await run(tmp_path, [
+        control(targets=[target(action="write")], status="active", analysis_complete=False),
+        call("write_file", **write_args()), call("read_file", path="a.md"),
+        control(targets=[target(action="write"), target()], result_refs=[], answer="저장을 확인했습니다."),
+    ], request="a.md를 저장하고 다시 읽어 확인해줘.", write_tool=SaveThenTimeout(workspace=tmp_path))
+    note = metadata["task_note"]
+    assert result.stop_reason == "completed" and len(provider.calls) == 4
+    assert sum(e["name"] == "write_file" for e in note["events"]) == 1
+    assert result.tools_used.count("read_file") == 1
+    assert note["runtime_linked_result_refs"] == ["write_file"]
+    assert next(e for e in note["events"] if e["name"] == "write_file")["verification"] == "read_after_unknown_write"
+
+
+def test_missing_read_coverage_prevents_runtime_linking(tmp_path):
+    note = TaskNote([{"role": "user", "content": "a.md를 저장하고 b.md도 읽어줘"}], tmp_path, {})
+    note.observe("write_file", write_args(), "saved", WriteFileTool(workspace=tmp_path),
+                 "ok", "actual-write")
+    note.accept(update(note, targets=[target(action="write"), target("b.md")], result_refs=[]))
+    assert note.runtime_linked_result_refs == []
+    assert "coverage_unconfirmed:b.md" in note.defects()
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+async def test_write_reference_recovery_uses_only_model_visible_results(tmp_path, timeout):
+    call_id = "call_opaque_transport_id|fc_opaque_item_id"
+
+    def recover(kwargs):
+        response = next(m for m in reversed(kwargs["messages"])
+                        if m.get("role") == "tool" and "write_results" in m.get("content", ""))
+        writes = json.loads(response["content"])["write_results"]
+        assert len(writes) == 1
+        assert writes[0]["status"] == "ok"
+        if timeout:
+            assert writes[0]["verification"] == "read_after_unknown_write"
+        return control(targets=[target(action="write")],
+                       result_refs=[writes[0]["id"]], answer="a.md 저장을 확인했습니다.")(kwargs)
+
+    result, _, metadata = await run(tmp_path, [
+        control(targets=[target(action="write")], status="active", analysis_complete=False),
+        LLMResponse(content="", tool_calls=[ToolCallRequest(id=call_id, name="write_file",
+                                               arguments=write_args())]),
+        call("read_file", path="a.md"),
+        control(targets=[target(action="write")], result_refs=["functions.write_file"],
+                answer="저장했습니다."),
+        recover,
+    ], request="a.md 저장해 줘", write_tool=(SaveThenTimeout if timeout else WriteFileTool)(
+        workspace=tmp_path))
+    assert result.stop_reason == "completed"
+    assert len([e for e in metadata["task_note"]["events"] if e["name"] == "write_file"]) == 1
+    assert metadata["task_note"]["update"]["result_refs"] == [call_id]
+    assert any("missing_result_reference" in str(m.get("content")) for m in result.messages)
+
+
+def test_write_results_exclude_old_requests_and_keep_latest_status(tmp_path):
+    note = TaskNote([{"role": "user", "content": "a.md 저장"}], tmp_path, {})
+    tool = WriteFileTool(workspace=tmp_path)
+    note.observe("write_file", write_args(), "saved", tool, "ok", "old-success")
+    note.observe("write_file", write_args(), "timeout", tool, "error", "latest-unknown")
+    writes = note.write_results()
+    assert [e["id"] for e in writes] == ["latest-unknown"]
+    assert writes[0]["status"] == "unknown"
+    assert "write_results" in note.guidance()["content"]
+    note.revise([{"role": "user", "content": "저장 취소"}])
+    assert note.write_results() == []
+
+
+async def test_provided_write_payload_requires_execution_not_file_acquisition(tmp_path):
+    note = TaskNote([{"role": "user", "content": "a.md에 saved content 저장"}], tmp_path, {})
+    note.accept(update(note, source="provided", targets=[target(action="write")]))
+    assert note.defects() == ["execution_required:a.md"]
+    note.observe("write_file", write_args(), "saved", WriteFileTool(workspace=tmp_path),
+                 "ok", "write-id")
+    note.accept(update(note, source="provided", targets=[target(action="write")], result_refs=[]))
+    assert note.defects() == []
+    assert note.update.result_refs == ["write-id"]
+    note.accept(update(note, source="provided", targets=[target(action="write")]))
+    assert note.defects() == []
+    note.accept(update(note, source="provided", targets=[target()]))
+    assert "target_unresolved" in note.defects()
+    assert "coverage_unconfirmed:a.md" in note.defects()
+    note.accept(update(note, source="provided", targets=[]))
+    assert "target_unresolved" in note.defects()
+    (tmp_path / "a.md").write_text("saved content", encoding="utf-8")
+    await read(note, tmp_path)
+    note.accept(update(note, source="provided", targets=[target(action="write"), target()]))
+    assert note.defects() == []
 
 
 async def test_t06_noncooperative_late_result_is_audit_only(tmp_path):

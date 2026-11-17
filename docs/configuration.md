@@ -1298,6 +1298,21 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct --port 8000
 
 Contributor notes for adding new providers live in [`development.md`](./development.md#adding-an-llm-provider).
 
+## Compact Context and Selective Memory
+
+`agents.defaults.compactContext` defaults to `false`. Enabling it retains user
+policy, memory and dialogue while deferring execution tutorials and tool schemas
+until the model calls `activate_tools`. Tool activation preserves existing
+permissions and workspace checks. Read [the behavior and tradeoffs](./design/compact-context.md).
+
+`agents.defaults.selectiveMemory` also defaults to `false`. It selects only
+explicit `## Reference Notes` / `## 참고 메모` groups from MEMORY.md for new-session
+requests. Other sections and unclassified memory remain loaded. This does not
+classify, shorten or migrate records automatically. Read [the format and
+fallbacks](./design/selective-memory.md) before enabling it.
+
+Restart the selected gateway after changing either setting.
+
 ## Model Presets
 
 Model presets let you name a complete model configuration and switch it at runtime with `/model <preset>`. They are the recommended way to configure models because the same names can be reused for startup selection, chat-command switching, and fallback chains.

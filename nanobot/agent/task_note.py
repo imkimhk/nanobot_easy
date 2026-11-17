@@ -141,6 +141,7 @@ class TaskNote:
         self.attempts: list[dict] = []
         self.pending_messages: list[dict] = []
         self.reporting_only = False
+        self.runtime_linked_result_refs: list[str] = []
         self.progress = TaskProgress()
         self.started = time.monotonic()
         self.model_calls = 0
@@ -166,6 +167,7 @@ class TaskNote:
         self.request_id = uuid.uuid4().hex
         self.update = None
         self.reporting_only = False
+        self.runtime_linked_result_refs = []
         self.progress.reset()
         # Prior acquisitions remain candidates; prior writes are not approval or completion.
         self.events = []
@@ -197,16 +199,30 @@ class TaskNote:
             "never stop at 'I will close the judgment/conclusion' or 'records are checked'. "
             "If the user asks to continue a pending analysis, finish and report that analysis "
             "using valid existing evidence; do not merely repeat a closing notice.\n"
-            "Reference successful write tool_call IDs in result_refs so final reporting is tied "
-            "to recorded execution. A missing reference requires answer correction, not rewriting.\n"
+            "Copy the exact id of each applicable status=ok entry from write_results into "
+            "result_refs. write_results is runtime execution evidence, including writes verified "
+            "by reading after a timeout. Do not substitute tool names or cached_reads IDs. "
+            "For an otherwise complete report, omitted references can be linked from current "
+            "successful execution records. Incorrect references still need report correction, "
+            "never rewriting.\n"
             "At the start of substantial work, record status=active and planned_steps with a brief "
             "public plan in the user's language: what you will inspect first and what you will do "
             "next. Be specific to this task. Do not repeat generic working notices or expose hidden "
             "reasoning. Update the plan only when the approach changes; runtime coalesces notices.\n"
             "If a read was offloaded/truncated for model context, read smaller ranges from "
             "the original selected file until the requested scope is covered.\n"
-            + json.dumps({"cached_reads": self.evidence[-20:]}, ensure_ascii=False)
+            + json.dumps({"cached_reads": self.evidence[-20:],
+                          "write_results": self.write_results()}, ensure_ascii=False)
         )}
+
+    def write_results(self) -> list[dict]:
+        """Expose bounded execution references without tool arguments or result bodies."""
+        latest = {}
+        for event in self.events:
+            if event.get("mutating") and event.get("request_id") == self.request_id:
+                latest[event["target"]] = event
+        return [{key: event[key] for key in ("id", "name", "target", "status", "verification")
+                 if key in event} for event in list(latest.values())[-40:]]
 
     def persist(self, status: str) -> None:
         snapshot = {
@@ -215,6 +231,7 @@ class TaskNote:
             "update": self.update.model_dump() if self.update else None,
             "evidence": self.evidence[-40:], "events": self.events[-40:],
             "attempts": self.attempts[-40:], "delivery": "pending",
+            "runtime_linked_result_refs": self.runtime_linked_result_refs[-40:],
             "metrics": {"usage": None, "cost": None, "model_calls": self.model_calls,
                         "tool_calls": len(self.events),
                         "elapsed_ms": int((time.monotonic() - self.started) * 1000)},
@@ -233,10 +250,29 @@ class TaskNote:
         if value.request_id != self.request_id:
             return ToolResult.error("Stale request_id; reinterpret the latest user instruction.")
         self.update = value
-        self.persist("active")
         defects = self.defects()
+        if (value.status == "completed" and defects
+                and all(d.startswith("answer_correction:")
+                        and d.endswith(":missing_result_reference") for d in defects)):
+            targets = {self.canonical(t.path) for t in value.targets if t.action == "write"}
+            results = [e for e in self.write_results()
+                       if e["status"] == "ok" and e["target"] in targets]
+            refs = [e["id"] for e in results]
+            if ({e["target"] for e in results} == targets
+                    and set(value.result_refs).issubset(refs)):
+                # Link real execution identities only. No new success, permission,
+                # analysis or coverage is inferred; incorrect supplied IDs stay errors.
+                added = [ref for ref in refs if ref not in value.result_refs]
+                self.update = value.model_copy(update={"result_refs": [*value.result_refs, *added]})
+                self.runtime_linked_result_refs = list(dict.fromkeys(
+                    [*self.runtime_linked_result_refs, *added]))[-40:]
+                defects = self.defects()
+        self.persist("active")
         return json.dumps({"request_id": self.request_id, "defects": defects,
-                           "evidence": self.evidence[-20:]}, ensure_ascii=False)
+                           "evidence": self.evidence[-20:],
+                           "write_results": self.write_results(),
+                           "runtime_linked_result_refs": self.runtime_linked_result_refs[-40:]},
+                          ensure_ascii=False)
 
     def mutation_error(self, name: str, params: dict) -> str | None:
         if self.reporting_only:
@@ -348,7 +384,10 @@ class TaskNote:
             defects.append("target_unresolved")
         if update.source == "files" and not update.targets:
             defects.append("target_unresolved")
-        if update.source == "provided" and explicit:
+        # Supplied text may be a write payload, but cannot stand in for reading a file.
+        # Write targets still require successful execution and exact result references below.
+        if update.source == "provided" and explicit and any(
+                target.action == "read" and not self.covered(target) for target in update.targets):
             defects.append("target_unresolved")
         if (_FILE_REQUEST.search(instruction) and not update.targets
                 and not (update.source == "provided" and _PROVIDED_REQUEST.search(instruction))):

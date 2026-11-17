@@ -82,11 +82,13 @@ class ContextBuilder:
         hot_path_skills: list[str] | None = None,
         preload_always_skills: bool = True,
         on_demand_skills: list[str] | None = None,
+        selective_memory: bool = False,
     ):
         self.workspace = workspace
         self.timezone = timezone
         self.memory = MemoryStore(workspace)
         self.hot_path_skills = list(dict.fromkeys(hot_path_skills or []))
+        self.selective_memory = selective_memory
         self.preload_always_skills = preload_always_skills
         self.on_demand_skills = list(dict.fromkeys(on_demand_skills or []))
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
@@ -100,6 +102,7 @@ class ContextBuilder:
         include_memory_recent_history: bool = False,
         session_key: str | None = None,
         unified_session: bool = False,
+        memory_query: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         root = workspace or self.workspace
@@ -112,8 +115,8 @@ class ContextBuilder:
         parts.append(render_template("agent/tool_contract.md"))
         parts.append(MEMORY_TOOL_GUIDANCE)
 
-        memory = self.memory.get_memory_context()
-        if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
+        memory = self._memory_context(memory_query, root)
+        if memory:
             parts.append(f"# Memory\n\n{memory}")
 
         active_skills = list(dict.fromkeys([*(skill_names or []), *self.persistent_skill_names()]))
@@ -187,6 +190,38 @@ class ContextBuilder:
         """Skills every turn carries regardless of selection: configured hot-path + always."""
         always = self.skills.get_always_skills() if self.preload_always_skills else []
         return list(dict.fromkeys([*self.hot_path_skills, *always]))
+
+    def build_compact_system_prompt(self, channel=None, workspace=None, session_summary=None,
+                                    memory_query=None):
+        """Defer built-in execution tutorials, never user rules or conversation memory."""
+        root = workspace or self.workspace
+        parts = [render_template("agent/compact_identity.md",
+                                 workspace_path=str(root.expanduser().resolve()),
+                                 channel=channel or ""), self._load_bootstrap_files(root)]
+        memory = self._memory_context(memory_query, root)
+        if memory:
+            parts.append(f"# Memory\n\n{memory}")
+        # Custom always-on and configured hot skills may contain user policy.
+        always = set(self.skills.get_always_skills()) if self.preload_always_skills else set()
+        retained = list(dict.fromkeys([*self.hot_path_skills, *[
+            entry["name"] for entry in self.skills.list_skills()
+            if entry["name"] in always and entry["source"] != "builtin"]]))
+        if retained:
+            parts.append(self.skills.load_skills_for_context(retained))
+        if session_summary:
+            parts.append(f"[Archived Context Summary]\n\n{session_summary}")
+        return "\n\n---\n\n".join(part for part in parts if part)
+
+    def _memory_context(self, query: str | None = None, workspace: Path | None = None) -> str:
+        text = self.memory.read_memory()
+        if not text or self._is_template_content(text, "memory/MEMORY.md"):
+            return ""
+        if (self.selective_memory and query is not None
+                and (workspace is None or workspace.resolve() == self.workspace.resolve())):
+            from nanobot.agent.memory_selection import select_memory
+
+            text = select_memory(text, query, source=str(self.memory.memory_file))
+        return f"## Long-term Memory\n{text}"
 
     def build_selected_system_prompt(self, skill_names: list[str] | None = None,
                                      channel: str | None = None,
@@ -369,6 +404,8 @@ class ContextBuilder:
                     include_memory_recent_history=False,
                     session_key=session_key,
                     unified_session=unified_session,
+                    # Prior dialogue may refer to project constraints not named again.
+                    memory_query=None if history else current_message,
                 ),
             },
             *history,
