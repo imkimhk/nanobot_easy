@@ -99,7 +99,8 @@ def create_gateway_app(
         )
 
     def print_status(status: GatewayStatus) -> None:
-        console.print(f"Running: {'yes' if status.running else 'no'}")
+        running = "unverified" if status.reason == "identity_unverified" else ("yes" if status.running else "no")
+        console.print(f"Running: {running}")
         console.print(f"Reason: {status.reason}")
         if status.pid is not None:
             console.print(f"PID: {status.pid}")
@@ -107,6 +108,11 @@ def create_gateway_app(
             console.print(f"Port: {status.port}")
         if status.started_at is not None:
             console.print(f"Started At: {status.started_at}")
+        if status.startup:
+            console.print("Startup evidence (disk snapshot; settings may change after startup):")
+            console.print(status.startup)
+        elif status.running:
+            console.print("Startup evidence: unavailable (legacy record)")
         console.print(f"State: {status.state_path}")
         console.print(f"Logs: {status.log_path}")
 

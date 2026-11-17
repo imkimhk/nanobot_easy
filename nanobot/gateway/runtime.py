@@ -7,6 +7,7 @@ runtime owns process state, log files, and platform-specific detach/stop details
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import signal
@@ -46,6 +47,7 @@ class GatewayStatus:
     port: int | None = None
     command: tuple[str, ...] = ()
     reason: str = "not_started"
+    startup: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -128,22 +130,23 @@ class GatewayRuntime:
         self._sleep = sleep
 
     @classmethod
-    def refresh_state_pid(cls, *, paths: GatewayRuntimePaths) -> None:
-        """Update the PID in an existing state file to ``os.getpid()``.
-
-        Called early in gateway server startup so the state file self-heals
-        after any restart, regardless of platform or restart mechanism.
-        """
-        if not paths.state_path.exists():
-            return
-        try:
-            state = json.loads(paths.state_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return
-        state["pid"] = os.getpid()
+    def refresh_state_pid(
+        cls, *, paths: GatewayRuntimePaths, options: GatewayStartOptions | None = None,
+        active_settings: dict[str, Any] | None = None,
+    ) -> None:
+        """Publish this process's startup evidence, including foreground starts."""
         rt = cls(paths=paths)
-        state["identity"] = rt._process_identity(os.getpid())
-        state["started_at"] = _utc_now()
+        state = rt._read_state() or {}
+        state.update(pid=os.getpid(), identity=rt._process_identity(os.getpid()),
+                     started_at=_utc_now(), platform=rt.platform_name,
+                     log_path=str(paths.log_path))
+        if options is not None:
+            state.update(port=options.port, workspace=options.workspace,
+                         config_path=options.config_path,
+                         command=build_gateway_command(sys.executable, options))
+        state["startup"] = _startup_evidence(
+            options.config_path if options else None, active_settings
+        )
         rt._write_state(state)
 
     def start_background(self, options: GatewayStartOptions) -> RuntimeResult:
@@ -151,6 +154,9 @@ class GatewayRuntime:
         current = self.status()
         if current.running:
             return RuntimeResult(False, "gateway_already_running", current)
+
+        if current.reason == "identity_unverified":
+            return RuntimeResult(False, "gateway_identity_unverified", current)
 
         command = self._build_child_command(options)
         self.paths.run_dir.mkdir(parents=True, exist_ok=True)
@@ -171,8 +177,12 @@ class GatewayRuntime:
             return RuntimeResult(False, "gateway_exited_during_startup", self.status())
 
         identity = self._process_identity(pid)
+        child_state = self._read_state() or {}
         self._write_state(
             {
+                "startup": child_state.get("startup")
+                if child_state.get("pid") == pid and child_state.get("identity") == identity
+                else None,
                 "pid": pid,
                 "identity": identity,
                 "started_at": _utc_now(),
@@ -191,6 +201,9 @@ class GatewayRuntime:
         status = self.status()
         if not status.pid:
             return RuntimeResult(False, "gateway_not_running", status)
+
+        if status.reason == "identity_unverified":
+            return RuntimeResult(False, "gateway_identity_unverified", status)
 
         state = self._read_state()
         if not self._record_matches_process(state, status.pid):
@@ -222,7 +235,15 @@ class GatewayRuntime:
                 reason=reason or "not_started",
             )
 
-        if not self._is_pid_running(pid) or not self._record_matches_process(state, pid):
+        alive = self._is_pid_running(pid)
+        identity = self._process_identity(pid) if alive else None
+        recorded = state.get("identity")
+        if alive and (not isinstance(recorded, str) or not recorded or identity is None):
+            return GatewayStatus(
+                running=False, pid=pid, state_path=self.paths.state_path,
+                log_path=self.paths.log_path, reason="identity_unverified",
+            )
+        if not alive or recorded != identity:
             self._clear_state()
             return GatewayStatus(
                 running=False,
@@ -242,6 +263,7 @@ class GatewayRuntime:
             port=_as_int(state.get("port")),
             command=tuple(command) if isinstance(command, list) else (),
             reason=reason or "running",
+            startup=state.get("startup") if isinstance(state.get("startup"), dict) else None,
         )
 
     def read_log_tail(self, *, tail: int = 200) -> list[str]:
@@ -368,17 +390,27 @@ class GatewayRuntime:
         if self.platform_name == "Windows":
             return _windows_process_identity(pid)
         try:
-            return os.getpgid(pid)
-        except OSError:
+            if self.platform_name == "Linux":
+                # Field 22 is starttime; comm may itself contain spaces or ')'.
+                stat = Path(f"/proc/{pid}/stat").read_text()
+                ticks = stat.rsplit(")", 1)[1].split()[19]
+                boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+                return f"linux:{boot}:{ticks}"
+            result = self._subprocess_run(
+                ["ps", "-p", str(pid), "-o", "lstart="],
+                capture_output=True, text=True, check=False, timeout=2,
+                env={**os.environ, "LC_ALL": "C"},
+            )
+            value = result.stdout.strip()
+            return f"posix:{value}" if result.returncode == 0 and value else None
+        except (OSError, IndexError, subprocess.SubprocessError):
             return None
 
     def _record_matches_process(self, state: dict[str, Any] | None, pid: int) -> bool:
         if not state:
             return False
         recorded = state.get("identity")
-        if recorded is None:
-            return True
-        return recorded == self._process_identity(pid)
+        return isinstance(recorded, str) and bool(recorded) and recorded == self._process_identity(pid)
 
     def _read_state(self) -> dict[str, Any] | None:
         try:
@@ -484,3 +516,26 @@ def _windows_process_identity(pid: int) -> str | None:
         return str(creation_time.value)
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _startup_evidence(config_path: str | None, settings: dict[str, Any] | None) -> dict:
+    """Record disk source at startup, not a claim about every imported bytecode object."""
+    root = Path(__file__).resolve().parents[1]
+    digest = hashlib.sha256()
+    try:
+        for path in sorted(root.rglob("*.py")):
+            digest.update(path.relative_to(root).as_posix().encode() + b"\0")
+            digest.update(path.read_bytes())
+        source_hash = digest.hexdigest()
+    except OSError:
+        source_hash = None
+    try:
+        config_hash = hashlib.sha256(Path(config_path).read_bytes()).hexdigest() if config_path else None
+    except OSError:
+        config_hash = None
+    allowed = {"model", "provider", "context_selection_enabled"}
+    return {
+        "source_root": str(root), "source_disk_sha256_at_start": source_hash,
+        "config_disk_sha256_at_start": config_hash,
+        "active_settings_at_start": {k: v for k, v in (settings or {}).items() if k in allowed},
+    }

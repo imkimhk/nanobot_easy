@@ -97,6 +97,25 @@ def test_direct_workspace_skill_shadows_scoped_package_same_name(tmp_path: Path)
     assert "# Direct" in (loader.load_skill("obsidian") or "")
 
 
+def test_system_skills_use_explicit_root_and_can_be_excluded(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    builtin = tmp_path / "builtin"
+    system = tmp_path / "system"
+    system_path = _write_skill(system, "shared", body="# System")
+    workspace_path = _write_skill(workspace / "skills", "shared", body="# Workspace")
+    _write_skill(builtin, "shared", body="# Builtin")
+
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, system_skills_dir=system)
+    assert loader.list_skills(filter_unavailable=False) == [
+        {"name": "shared", "path": str(system_path), "source": "system"},
+    ]
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin,
+                          system_skills_dir=system, include_system=False)
+    assert loader.list_skills(filter_unavailable=False) == [
+        {"name": "shared", "path": str(workspace_path), "source": "workspace"},
+    ]
+
+
 def test_list_skills_skips_non_directories_and_missing_skill_md(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     skills_root = workspace / "skills"
@@ -107,7 +126,7 @@ def test_list_skills_skips_non_directories_and_missing_skill_md(tmp_path: Path) 
     builtin = tmp_path / "builtin"
     builtin.mkdir()
 
-    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, include_system=False)
     entries = loader.list_skills(filter_unavailable=False)
     names = {entry["name"] for entry in entries}
     assert names == {"ok"}
@@ -123,7 +142,7 @@ def test_list_skills_workspace_shadows_builtin_same_name(tmp_path: Path) -> None
     builtin = tmp_path / "builtin"
     _write_skill(builtin, "dup", body="# Builtin")
 
-    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, include_system=False)
     entries = loader.list_skills(filter_unavailable=False)
     assert len(entries) == 1
     assert entries[0]["source"] == "workspace"
@@ -138,7 +157,7 @@ def test_list_skills_merges_workspace_and_builtin(tmp_path: Path) -> None:
     builtin = tmp_path / "builtin"
     bi_path = _write_skill(builtin, "bi_only", body="# B")
 
-    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, include_system=False)
     entries = sorted(loader.list_skills(filter_unavailable=False), key=lambda item: item["name"])
     assert entries == [
         {"name": "bi_only", "path": str(bi_path), "source": "builtin"},
@@ -153,7 +172,7 @@ def test_list_skills_builtin_omitted_when_dir_missing(tmp_path: Path) -> None:
     ws_path = _write_skill(ws_skills, "solo", body="# S")
     missing_builtin = tmp_path / "no_such_builtin"
 
-    loader = SkillsLoader(workspace, builtin_skills_dir=missing_builtin)
+    loader = SkillsLoader(workspace, builtin_skills_dir=missing_builtin, include_system=False)
     entries = loader.list_skills(filter_unavailable=False)
     assert entries == [{"name": "solo", "path": str(ws_path), "source": "workspace"}]
 
@@ -179,7 +198,7 @@ def test_list_skills_filter_unavailable_excludes_unmet_bin_requirement(
 
     monkeypatch.setattr("nanobot.agent.skills.shutil.which", fake_which)
 
-    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, include_system=False)
     assert loader.list_skills(filter_unavailable=True) == []
 
 
@@ -204,7 +223,7 @@ def test_list_skills_filter_unavailable_includes_when_bin_requirement_met(
 
     monkeypatch.setattr("nanobot.agent.skills.shutil.which", fake_which)
 
-    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, include_system=False)
     entries = loader.list_skills(filter_unavailable=True)
     assert entries == [
         {"name": "has_bin", "path": str(skill_path), "source": "workspace"},
@@ -227,7 +246,7 @@ def test_list_skills_filter_unavailable_false_keeps_unmet_requirements(
 
     monkeypatch.setattr("nanobot.agent.skills.shutil.which", lambda _cmd: None)
 
-    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, include_system=False)
     entries = loader.list_skills(filter_unavailable=False)
     assert entries == [
         {"name": "blocked", "path": str(skill_path), "source": "workspace"},
@@ -250,7 +269,7 @@ def test_list_skills_filter_unavailable_excludes_unmet_env_requirement(
 
     monkeypatch.delenv("NANOBOT_SKILLS_TEST_ENV_VAR", raising=False)
 
-    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, include_system=False)
     assert loader.list_skills(filter_unavailable=True) == []
 
 
@@ -273,7 +292,7 @@ def test_list_skills_openclaw_metadata_parsed_for_requirements(
 
     monkeypatch.setattr("nanobot.agent.skills.shutil.which", lambda _cmd: None)
 
-    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, include_system=False)
     assert loader.list_skills(filter_unavailable=True) == []
 
     monkeypatch.setattr(
@@ -295,7 +314,7 @@ def test_disabled_skills_excluded_from_list(tmp_path: Path) -> None:
     builtin = tmp_path / "builtin"
     builtin.mkdir()
 
-    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, disabled_skills={"alpha"})
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, disabled_skills={"alpha"}, include_system=False)
     entries = loader.list_skills(filter_unavailable=False)
     assert len(entries) == 1
     assert entries[0]["name"] == "beta"
@@ -311,7 +330,7 @@ def test_disabled_skills_empty_set_no_effect(tmp_path: Path) -> None:
     builtin = tmp_path / "builtin"
     builtin.mkdir()
 
-    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, disabled_skills=set())
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, disabled_skills=set(), include_system=False)
     entries = loader.list_skills(filter_unavailable=False)
     assert len(entries) == 2
 
@@ -325,7 +344,7 @@ def test_disabled_skills_excluded_from_build_skills_summary(tmp_path: Path) -> N
     builtin = tmp_path / "builtin"
     builtin.mkdir()
 
-    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, disabled_skills={"alpha"})
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, disabled_skills={"alpha"}, include_system=False)
     summary = loader.build_skills_summary()
     assert "alpha" not in summary
     assert "beta" in summary
@@ -340,7 +359,7 @@ def test_disabled_skills_excluded_from_get_always_skills(tmp_path: Path) -> None
     builtin = tmp_path / "builtin"
     builtin.mkdir()
 
-    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, disabled_skills={"alpha"})
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, disabled_skills={"alpha"}, include_system=False)
     always = loader.get_always_skills()
     assert "alpha" not in always
     assert "beta" in always
@@ -369,7 +388,7 @@ def test_build_skills_summary_folded_description(tmp_path: Path) -> None:
     builtin = tmp_path / "builtin"
     builtin.mkdir()
 
-    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, include_system=False)
     summary = loader.build_skills_summary()
     assert "pdf" in summary
     assert "visual quality" in summary
@@ -395,7 +414,7 @@ def test_build_skills_summary_literal_description(tmp_path: Path) -> None:
     builtin = tmp_path / "builtin"
     builtin.mkdir()
 
-    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, include_system=False)
     meta = loader.get_skill_metadata("multi")
     assert meta is not None
     desc = meta.get("description")
@@ -424,7 +443,7 @@ def test_get_skill_metadata_handles_yaml_types(tmp_path: Path) -> None:
     builtin = tmp_path / "builtin"
     builtin.mkdir()
 
-    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin, include_system=False)
     meta = loader.get_skill_metadata("typed")
     assert meta is not None
     # YAML parsed 'true' to Python True

@@ -5,19 +5,31 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import re
+import time
 from contextlib import suppress
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
 from loguru import logger
 
+from nanobot.agent.answer_delivery import (
+    ANSWER_BODY_CORRECTION,
+    ANSWER_BODY_INCOMPLETE,
+    ANSWER_BODY_NOTICE,
+    needs_answer_body,
+)
 from nanobot.agent.context_governance import (
     ContextGovernanceConfig,
     ContextGovernor,
 )
+from nanobot.agent.context_selection import ContextCapacityError
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
+from nanobot.agent.premature_final import CORRECTION, INCOMPLETE, is_premature_final
+from nanobot.agent.repetition_guard import RepeatedSentenceGuard
 from nanobot.agent.tools.registry import ToolRegistry, is_tool_error_result
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.session.history_visibility import is_hidden_history_message
@@ -42,6 +54,7 @@ from nanobot.utils.helpers import (
 )
 from nanobot.utils.progress_events import (
     invoke_file_edit_progress,
+    invoke_on_progress,
     on_progress_accepts_file_edit_events,
 )
 from nanobot.utils.prompt_templates import render_template
@@ -68,9 +81,47 @@ _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 3
 _MAX_INJECTION_CYCLES = 5
+# A final reply with no tool call right after a failed/timed-out state-changing
+# tool call gets one structural resume per turn; a repeated no-tool final stops the turn.
+_STALL_FAILURE_STATUSES = frozenset({"error", "unknown"})
+# Safety-boundary refusals already carry their own "do not retry" guidance.
+_STALL_POLICY_DETAILS = ("ssrf_violation", "workspace_violation")
+_STALL_REPEAT_MIN_CHARS = 40
+_STALL_REPEAT_RATIO = 0.9
+# Only a complete request to replay an answer, never "repeat the operation" or
+# an answer request followed by more work. This exempts session history only.
+_STALL_ANSWER_REPLAY = re.compile(
+    r"(?:"
+    r"(?:(?:(?:그|이|해당)\s*(?:코드|번호|값|내용|답변|답|설명)"
+    r"|(?:이전|직전|마지막|방금)(?:의)?\s*(?:답변|답|응답|내용|설명))"
+    r"(?:을|를)?\s*)?(?:그대로\s*)?(?:다시|한\s*번\s*더)\s*"
+    r"(?:알려|말해|보여|설명해|답변해)\s*(?:줘|주세요|줄래(?:요)?)"
+    r"|(?:please\s+)?repeat\s+(?:your|the)\s+(?:last|previous)\s+(?:answer|response)"
+    r"(?:\s+(?:again|verbatim))?(?:,?\s+please)?"
+    r"|(?:please\s+)?(?:tell|show)\s+me\s+(?:that|the)\s+(?:code|answer|value)\s+again"
+    r"(?:,?\s+please)?"
+    r")[.!?。！？\s]*", re.I,
+)
+_STALL_RESUME_FEEDBACK = (
+    "[Runtime check] The previous tool call did not succeed ({failures}). Your reply above "
+    "has no tool call, so it was not delivered as the final answer. Do exactly one of: "
+    "(a) call a tool now to verify the actual state (versions, processes, exit status, "
+    "files) or to continue the remaining work; a timed-out command may already have "
+    "completed, so check before running it again; or (b) if you cannot continue, reply "
+    "with a blocked/partial report: what was verified, what failed, and the actual limit. "
+    "Do not announce further work without calling a tool."
+)
 # Backward-compatible module attribute for tests/extensions that monkeypatch
 # the former single-file tracker hook. Runtime uses prepare_file_edit_trackers.
 prepare_file_edit_tracker = _prepare_file_edit_tracker
+
+
+class _RefusedToolEvent(dict):
+    """Tool event for a call refused before execution (bad args, missing metadata, repeated lookup).
+
+    A plain-dict subclass so tool_events compare and serialize exactly as before; only the
+    stall guard checks the type, so a refusal never triggers the failed-tool resume.
+    """
 
 
 @dataclass(slots=True)
@@ -104,6 +155,15 @@ class AgentRunSpec:
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: GoalContinueMessage | None = None
     finalize_on_max_iterations: bool = True
+    selected_context: Any | None = None
+    selection_target_tokens: int = 16000
+    premature_final_guard: bool = False
+    premature_final_session_metadata: dict[str, Any] | None = None
+    task_note_enabled: bool = False
+    task_note_metadata: dict[str, Any] | None = None
+    task_state: Any | None = None
+    task_note_persist_callback: Any | None = None
+    stall_guard: bool = True
 
 
 @dataclass(slots=True)
@@ -233,7 +293,7 @@ class AgentRunner:
                 custom = None
         return build_goal_continue_message(custom)
 
-    async def _drain_injections(self, spec: AgentRunSpec) -> list[dict[str, Any]]:
+    async def _drain_injections(self, spec: AgentRunSpec, *, wait: bool = True) -> list[dict[str, Any]]:
         """Drain pending user messages via the injection callback.
 
         Returns normalized user messages (capped by
@@ -252,10 +312,10 @@ class AgentRunner:
                     for parameter in signature.parameters.values()
                 )
             )
-            if accepts_limit:
-                items = await spec.injection_callback(limit=_MAX_INJECTIONS_PER_TURN)
-            else:
-                items = await spec.injection_callback()
+            options = {"limit": _MAX_INJECTIONS_PER_TURN} if accepts_limit else {}
+            if "wait" in signature.parameters:
+                options["wait"] = wait
+            items = await spec.injection_callback(**options)
         except Exception:
             logger.exception("injection_callback failed")
             return []
@@ -281,6 +341,14 @@ class AgentRunner:
                 len(injected_messages), _MAX_INJECTIONS_PER_TURN, dropped,
             )
             injected_messages = injected_messages[:_MAX_INJECTIONS_PER_TURN]
+        if spec.selected_context and injected_messages:
+            if spec.selected_context.control:
+                spec.selected_context.control.ingest_messages(injected_messages)
+            spec.selected_context.completion_reports.clear()
+            spec.selected_context.trace.count("redesigns", "new_user_instruction_executor_reconciliation")
+        if spec.task_state is not None and injected_messages:
+            spec.task_state.revise(injected_messages)
+            injected_messages.append(spec.task_state.guidance())
         return injected_messages
 
     @staticmethod
@@ -294,6 +362,28 @@ class AgentRunner:
         return True
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        from nanobot.agent.context_control import TaskControl
+        from nanobot.agent.context_evidence import active_evidence_capture
+        from nanobot.agent.context_trace import active_context_trace
+
+        capture_token = active_evidence_capture.set(bool(spec.selected_context))
+        trace_token = active_context_trace.set(spec.selected_context.trace if spec.selected_context else active_context_trace.get())
+        if spec.selected_context:
+            spec.selected_context.trace.stage = "legacy_fallback" if spec.selected_context.legacy_fallback else "execute"
+            if spec.selected_context.control is None:
+                spec.selected_context.control = TaskControl(spec.selected_context)
+        from nanobot.agent.task_note import TaskNote, TaskTools, active_task_note, needs_note
+
+        task_token = None
+        if spec.task_note_enabled and needs_note(spec.initial_messages):
+            note = TaskNote(spec.initial_messages, spec.workspace, spec.task_note_metadata,
+                            spec.task_note_persist_callback)
+            spec = replace(spec, task_state=note, tools=TaskTools(spec.tools, note),
+                           initial_messages=[*spec.initial_messages, note.guidance()],
+                           stream_progress_deltas=False)
+            task_token = active_task_note.set(note)
+        if spec.selected_context and getattr(spec.selected_context, "allocation", None):
+            spec = replace(spec, stream_progress_deltas=False)
         hook = spec.hook or AgentHook()
         messages = list(spec.initial_messages)
         context = AgentRunHookContext(messages=deepcopy(messages))
@@ -302,12 +392,19 @@ class AgentRunner:
             await hook.before_run(context)
             result = await self._run_core(spec, hook, messages)
         except asyncio.CancelledError as exc:
+            if spec.task_state is not None:
+                spec.task_state.persist("cancelled")
+            if spec.selected_context and spec.selected_context.control:
+                spec.selected_context.control.save(lambda state: state.update(
+                    instruction_status="CANCELLED", status="CANCELLED"))
             context.messages = deepcopy(messages)
             context.stop_reason = "cancelled"
             context.error = None
             context.exception = exc
             raise
         except Exception as exc:
+            if spec.task_state is not None:
+                spec.task_state.persist("error")
             context.messages = deepcopy(messages)
             context.stop_reason = "error"
             context.error = f"Error: {type(exc).__name__}: {exc}"
@@ -315,6 +412,18 @@ class AgentRunner:
             await hook.on_error(context)
             raise
         else:
+            if spec.selected_context and not spec.selected_context.legacy_fallback:
+                result.final_content, result.stop_reason = spec.selected_context.verdict(result.final_content, result.stop_reason)
+                if result.messages and result.messages[-1].get("role") == "assistant":
+                    result.messages[-1]["content"] = result.final_content
+            if spec.task_state is not None:
+                spec.task_state.persist(result.stop_reason)
+                spec.task_state.metadata["task_note"]["metrics"] = {
+                    "usage": result.usage,
+                    "elapsed_ms": int((time.monotonic() - spec.task_state.started) * 1000),
+                    "tool_calls": len(spec.task_state.events), "cost": None,
+                    "model_calls": spec.task_state.model_calls,
+                }
             context.messages = deepcopy(result.messages)
             context.final_content = result.final_content
             context.tools_used = list(result.tools_used)
@@ -329,6 +438,12 @@ class AgentRunner:
             await hook.after_run(context)
             return result
         finally:
+            if spec.selected_context:
+                spec.selected_context.trace.persist()
+            active_context_trace.reset(trace_token)
+            active_evidence_capture.reset(capture_token)
+            if task_token is not None:
+                active_task_note.reset(task_token)
             context.messages = deepcopy(messages)
             if context.exception is None:
                 await hook.on_finally(context)
@@ -361,6 +476,139 @@ class AgentRunner:
         had_injections = False
         injection_cycles = 0
         compacted_tool_call_ids: set[str] = set()
+        premature_final_corrections = 0
+        answer_body_corrections = 0
+        answer_fix_corrections = 0
+        task_corrections = 0
+        report_corrections = 0
+        stall_resumes = 0
+        last_tool_failures: list[dict[str, str]] = []
+        stall_guard = spec.stall_guard and not (
+            spec.selected_context and not spec.selected_context.legacy_fallback
+        )
+        previous_finals = self._prior_session_final(spec.initial_messages) if stall_guard else []
+
+        async def guard_final(clean, assistant_message, iteration, *, already_appended=False):
+            nonlocal premature_final_corrections, task_corrections, report_corrections, stop_reason
+            nonlocal answer_body_corrections, answer_fix_corrections
+            if spec.task_state is not None:
+                if spec.task_state.update is not None:
+                    spec.task_state.update.final_answer = hook.finalize_content(
+                        context, spec.task_state.update.final_answer,
+                    ) or ""
+                defects, terminal = spec.task_state.final_check()
+                if terminal:
+                    stop_reason = "incomplete"
+                    clean = str(clean or "") + "\n\n미완료 상태: " + spec.task_state.update.explanation
+                    assistant_message["content"] = clean
+                    return clean, False
+                if defects:
+                    reporting_only = all(d == "answer_required" or d.startswith("answer_correction:")
+                                         for d in defects)
+                    can_correct = report_corrections == 0 if reporting_only else task_corrections == 0
+                    if can_correct and iteration + 1 < spec.max_iterations:
+                        if reporting_only:
+                            report_corrections += 1
+                            spec.task_state.reporting_only = True
+                        else:
+                            task_corrections += 1
+                        assistant_message["_hidden_history"] = True
+                        if not already_appended:
+                            messages.append(assistant_message)
+                        feedback = (
+                            "Completion defects (all): " + ", ".join(defects)
+                            + ". Resolve these in one recovery process within the remaining budget. "
+                            "Multiple reads/checks are allowed. Check unknown writes before retry; "
+                            "never repeat successful/denied writes. If blocked, record partial, "
+                            "blocked or clarification in update_task and report the actual limit. "
+                            "Do not infer intent from response wording. "
+                        )
+                        if reporting_only:
+                            feedback += (
+                                "The requested result has not been delivered. Use the already "
+                                "verified evidence to provide the actual findings/cause, evidence "
+                                "and uncertainty in update_task.final_answer, not an announcement "
+                                "that you will close/report later. Do not reread or re-execute "
+                                "successful work just to produce the report. This is report "
+                                "assembly within recovery, not a new execution stage. "
+                                "Current request_id=" + spec.task_state.request_id
+                            )
+                        else:
+                            feedback += spec.task_state.guidance()["content"]
+                        messages.append({"role": "user", "_hidden_history": True, "content": feedback})
+                        return clean, True
+                    stop_reason = "incomplete"
+                    clean = spec.task_state.incomplete(defects)
+                    assistant_message["content"] = clean
+                    return clean, False
+                clean = spec.task_state.final_report()
+                stop_reason = spec.task_state.final_status
+                assistant_message["content"] = clean
+            if spec.selected_context and not spec.selected_context.legacy_fallback:
+                checked, checked_status = spec.selected_context.verdict(clean)
+                if checked_status != "completed" and answer_fix_corrections == 0:
+                    # t47/t49: at most one in-loop fix, routed by kind (answer content / evidence link);
+                    # no fix call for an open item shown to decide the answer (t50: a target/permission
+                    # condition holds changes only), a verifier defect, or when the iteration budget is
+                    # used up. The fix is an ordinary iteration (counts in budget).
+                    from nanobot.agent.context_plan import fix_route
+                    _, fix = fix_route(spec.selected_context, clean, iteration + 1 < spec.max_iterations)
+                    if fix:
+                        answer_fix_corrections += 1
+                        assistant_message["_hidden_history"] = True
+                        if not already_appended:
+                            messages.append(assistant_message)
+                        messages.append({"role": "user", "_hidden_history": True, "content": fix})
+                        return clean, True
+                if checked_status != "completed":
+                    stop_reason = checked_status
+                    assistant_message["unverified_content"] = clean
+                    assistant_message["content"] = checked
+                    return checked, False
+            if spec.premature_final_guard and needs_answer_body(clean, messages):
+                if answer_body_corrections < 2 and iteration + 1 < spec.max_iterations:
+                    answer_body_corrections += 1
+                    if not already_appended:
+                        messages.append(assistant_message)
+                    await self._emit_checkpoint(spec, {
+                        "phase": "answer_body_recovery", "iteration": iteration, "model": spec.model,
+                        "assistant_message": assistant_message,
+                        "completed_tool_results": [], "pending_tool_calls": [],
+                    })
+                    messages.append({"role": "user", "content": ANSWER_BODY_CORRECTION,
+                                     "_hidden_history": True, "_answer_delivery_feedback": True})
+                    logger.info("Answer body recovery: attempt={} remaining_iterations={}",
+                                answer_body_corrections, spec.max_iterations - iteration - 1)
+                    if spec.progress_callback is not None:
+                        with suppress(Exception):
+                            await invoke_on_progress(spec.progress_callback, ANSWER_BODY_NOTICE,
+                                                     tool_hint=False)
+                    return clean, True
+                stop_reason = "incomplete"
+                clean = (str(clean or "") + "\n\n" + ANSWER_BODY_INCOMPLETE
+                         + f" (본문 복구 시도: {answer_body_corrections}회)")
+                assistant_message["content"] = clean
+                return clean, False
+            if not spec.premature_final_guard or not is_premature_final(
+                clean, messages, spec.tools, tool_events,
+                spec.premature_final_session_metadata,
+            ):
+                return clean, False
+            if premature_final_corrections == 0 and iteration + 1 < spec.max_iterations:
+                premature_final_corrections += 1
+                if not already_appended:
+                    messages.append(assistant_message)
+                await self._emit_checkpoint(spec, {
+                    "phase": "final_response", "iteration": iteration, "model": spec.model,
+                    "assistant_message": assistant_message,
+                    "completed_tool_results": [], "pending_tool_calls": [],
+                })
+                messages.append({"role": "user", "content": CORRECTION, "_hidden_history": True})
+                return clean, True
+            stop_reason = "incomplete"
+            assistant_message["content"] = INCOMPLETE
+            return INCOMPLETE, False
+
         governance_config = ContextGovernanceConfig(
             provider=self.provider,
             model=spec.model,
@@ -375,17 +623,49 @@ class AgentRunner:
         )
 
         for iteration in range(spec.max_iterations):
+            if spec.selected_context and not spec.selected_context.legacy_fallback:
+                spec.selected_context.control.refresh()
+                if spec.selected_context.control.cancelled:
+                    final_content, stop_reason = spec.selected_context.verdict(None, "cancelled")
+                    self._append_final_message(messages, final_content)
+                    break
+                # t54: whole-request budget / repeated refused action -> stop with a code-built report
+                _budget = getattr(spec.selected_context.trace, "budget", None)
+                _stop = getattr(spec.selected_context, "stop_requested", None) or (
+                    _budget.exhausted() if _budget is not None else None)
+                if _stop:
+                    if _budget is not None:
+                        _budget.stop(_stop)
+                    final_content, stop_reason = spec.selected_context.verdict(None, _stop)
+                    self._append_final_message(messages, final_content)
+                    break
             try:
                 # Keep the persisted conversation untouched. Context governance
                 # may repair or compact historical messages for the model, but
                 # those synthetic edits must not shift the append boundary used
                 # later when the caller saves only the new turn.
-                messages_for_model = self.context_governor.prepare_for_model(
-                    governance_config,
-                    messages,
-                    compacted_tool_call_ids,
-                )
+                if spec.selected_context:
+                    from nanobot.agent.context_selection import prepare_selected_loop
+                    messages_for_model = prepare_selected_loop(spec, messages, self.provider)
+                else:
+                    messages_for_model = self.context_governor.prepare_for_model(
+                        governance_config, messages, compacted_tool_call_ids,
+                    )
+            except ContextCapacityError:
+                if spec.selected_context:
+                    final_content = ("필수 문맥이 모델 입력 한도를 초과했습니다. 원본을 보존한 채 "
+                                     "작업 분할 또는 명시적인 입력 한도 확장이 필요합니다.")
+                    stop_reason = "incomplete"
+                    self._append_final_message(messages, final_content)
+                    break
+                raise
             except Exception:
+                if spec.selected_context:
+                    spec.selected_context.trace.count("recovery", "selection_loop_validation_failed")
+                    final_content = "문맥 선택 검증에 실패해 실행을 중단했습니다. 원본은 보존됩니다."
+                    stop_reason = "incomplete"
+                    self._append_final_message(messages, final_content)
+                    break
                 logger.exception(
                     "Context governance failed on turn {} for {}; applying minimal repair",
                     iteration,
@@ -412,7 +692,27 @@ class AgentRunner:
                 session_key=spec.session_key,
             )
             await hook.before_iteration(context)
-            response = await self._request_model(spec, messages_for_model, hook, context)
+            request_started = time.monotonic()
+            logger.info(
+                "LLM request start: session={} iteration={} model={}",
+                spec.session_key or "-", iteration, spec.model,
+            )
+            try:
+                response = await self._request_model(spec, messages_for_model, hook, context)
+            except BaseException as exc:
+                logger.warning(
+                    "LLM request end: session={} iteration={} model={} duration={:.1f}s "
+                    "finish_reason=exception error_kind={}",
+                    spec.session_key or "-", iteration, spec.model,
+                    time.monotonic() - request_started, type(exc).__name__,
+                )
+                raise
+            logger.info(
+                "LLM request end: session={} iteration={} model={} duration={:.1f}s "
+                "finish_reason={} error_kind={} tool_calls={}",
+                spec.session_key or "-", iteration, spec.model, time.monotonic() - request_started,
+                response.finish_reason, response.error_kind or "-", len(response.tool_calls or []),
+            )
             context.response = response
             context.tool_calls = list(response.tool_calls)
 
@@ -421,7 +721,7 @@ class AgentRunner:
                 response.thinking_blocks,
                 response.content,
             )
-            response.content = cleaned_content
+            response.content = RepeatedSentenceGuard().finish(cleaned_content)
             raw_usage = self._usage_or_estimate(spec, messages_for_model, response)
             context.usage = dict(raw_usage)
             self._accumulate_usage(usage, raw_usage)
@@ -432,8 +732,13 @@ class AgentRunner:
 
             if response.should_execute_tools:
                 context.tool_calls = list(response.tool_calls)
+                structured_report = spec.task_state is not None and any(
+                    call.name == "update_task" and call.arguments.get("status") in {"completed", "cancelled"}
+                    and str(call.arguments.get("final_answer") or "").strip()
+                    for call in response.tool_calls
+                )
                 observability_final = (
-                    not is_blank_text(response.content)
+                    (not is_blank_text(response.content) or structured_report)
                     and self._all_tool_calls_observability(spec, response.tool_calls)
                 )
                 if hook.wants_streaming() and not observability_final:
@@ -444,6 +749,7 @@ class AgentRunner:
                     tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
+                    provider_state=response.provider_state,
                 )
                 messages.append(assistant_message)
                 await self._emit_checkpoint(
@@ -459,14 +765,39 @@ class AgentRunner:
                 )
 
                 await hook.before_execute_tools(context)
-
-                results, new_events, fatal_error = await self._execute_tools(
-                    spec,
-                    response.tool_calls,
-                    external_lookup_counts,
-                    workspace_violation_counts,
-                )
+                pending_before_tools = []
+                if spec.task_state is not None or spec.selected_context:
+                    pending_before_tools = await self._drain_injections(spec, wait=not bool(spec.selected_context))
+                if pending_before_tools:
+                    # Complete the old tool protocol without executing a now-stale action.
+                    results = ["Superseded by a new user instruction; reinterpret before execution."
+                               for _ in response.tool_calls]
+                    new_events = [{"name": call.name, "status": "superseded"}
+                                  for call in response.tool_calls]
+                    fatal_error = None
+                    had_injections = True
+                    injection_cycles += 1
+                else:
+                    results, new_events, fatal_error = await self._execute_tools(
+                        spec, response.tool_calls, external_lookup_counts, workspace_violation_counts,
+                    )
+                    if spec.task_state is not None and spec.task_state.pending_messages:
+                        pending_before_tools = spec.task_state.pending_messages
+                        spec.task_state.pending_messages = []
+                        had_injections = True
+                        injection_cycles += 1
+                if spec.selected_context and spec.selected_context.control.pending:
+                    pending_before_tools.extend(spec.selected_context.control.pending)
+                    spec.selected_context.control.pending = []
+                    had_injections = True
                 tool_events.extend(new_events)
+                last_tool_failures = [
+                    event for call, event in zip(response.tool_calls, new_events)
+                    if event.get("status") in _STALL_FAILURE_STATUSES
+                    and not isinstance(event, _RefusedToolEvent)
+                    and not str(event.get("detail") or "").startswith(_STALL_POLICY_DETAILS)
+                    and getattr(spec.tools.get(call.name), "read_only", False) is not True
+                ]
                 tools_used.extend(
                     tool_call.name
                     for tool_call, event in zip(response.tool_calls, new_events)
@@ -474,21 +805,50 @@ class AgentRunner:
                 )
                 context.tool_results = list(results)
                 context.tool_events = list(new_events)
+                if spec.selected_context and hasattr(spec.tools, "resolver"):
+                    for call, event, observed_result in zip(response.tool_calls, new_events, results):
+                        tool = spec.tools.get(call.name)
+                        if call.name not in {"discover_context_capabilities", "resolve_context_need",
+                                              "record_context_completion", "revise_context_requirements", "skill_decision",
+                                              "skill_search", "skill_registry"}:
+                            spec.selected_context.capture(call, observed_result, event.get("status"), tool,
+                                                          executed=event.get("executed", True))
+                        elif call.name == "record_context_completion" and event.get("status") != "ok":
+                            from nanobot.agent.context_plan import note_record_error
+                            note_record_error(spec.selected_context, call, observed_result)
+                        if call.name in {"search_memory", "read_memory_events"}:
+                            spec.selected_context.trace.count("additional_searches", "executor_plan_revision")
+                        spec.tools.resolver.observed[call.id] = bool(
+                            tool and tool.read_only and event.get("status") == "ok"
+                            and str(observed_result).strip()
+                            and not str(observed_result).lower().startswith(("no scoped", "no memory", "error:"))
+                            and call.name not in {"discover_context_capabilities", "resolve_context_need",
+                                                  "record_context_completion", "revise_context_requirements", "skill_decision", "skill_search", "skill_registry"})
                 completed_tool_results: list[dict[str, Any]] = []
                 for tool_call, result in zip(response.tool_calls, results):
                     tool_message = {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "name": tool_call.name,
-                        "content": self.context_governor.normalize_tool_result(
+                        "content": result if spec.selected_context else self.context_governor.normalize_tool_result(
                             governance_config,
                             tool_call.id,
                             tool_call.name,
                             result,
                         ),
                     }
+                    if spec.selected_context:
+                        observation = spec.selected_context.observations.get(tool_call.id, {})
+                        tool_message["execution_status"] = observation.get("status", "unknown")
+                        tool_message["read_only"] = observation.get("read_only", True)
+                        if observation.get("source_event_id"):
+                            tool_message["memory_event_id"] = observation["source_event_id"]
                     messages.append(tool_message)
                     completed_tool_results.append(tool_message)
+                if pending_before_tools:
+                    self._append_injected_messages(messages, pending_before_tools)
+                    await hook.after_iteration(context)
+                    continue
                 if fatal_error is not None:
                     error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
                     final_content = error
@@ -508,19 +868,38 @@ class AgentRunner:
                     break
                 if observability_final:
                     clean = hook.finalize_content(context, response.content)
-                    if hook.wants_streaming():
-                        await hook.on_stream_end(context, resuming=False)
-                    await self._emit_checkpoint(
-                        spec,
-                        {
-                            "phase": "tools_completed",
-                            "iteration": iteration,
-                            "model": spec.model,
-                            "assistant_message": assistant_message,
-                            "completed_tool_results": completed_tool_results,
-                            "pending_tool_calls": [],
-                        },
+                    await self._emit_checkpoint(spec, {
+                        "phase": "tools_completed", "iteration": iteration, "model": spec.model,
+                        "assistant_message": assistant_message,
+                        "completed_tool_results": completed_tool_results, "pending_tool_calls": [],
+                    })
+                    clean, guard_resume = await guard_final(
+                        clean, assistant_message, iteration, already_appended=True,
                     )
+                    if guard_resume:
+                        drained, injection_cycles = await self._try_drain_injections(
+                            spec, messages, None, injection_cycles, phase="after final correction",
+                        )
+                        had_injections = had_injections or drained
+                        if hook.wants_streaming():
+                            await hook.on_stream_end(context, resuming=True)
+                        await hook.after_iteration(context)
+                        continue
+                    # Match the ordinary final path's injection/goal behavior.
+                    should_continue, injection_cycles = await self._try_drain_injections(
+                        spec, messages, None, injection_cycles, phase="after observability final",
+                    )
+                    if not should_continue and stop_reason not in {"incomplete", "cancelled"}:
+                        predicate = spec.goal_active_predicate
+                        if predicate is not None and predicate():
+                            messages.append(self._build_goal_continue_message(spec))
+                            should_continue = True
+                    if hook.wants_streaming():
+                        await hook.on_stream_end(context, resuming=should_continue)
+                    if should_continue:
+                        had_injections = True
+                        await hook.after_iteration(context)
+                        continue
                     await self._emit_checkpoint(
                         spec,
                         {
@@ -557,6 +936,25 @@ class AgentRunner:
                 )
                 if _drained:
                     had_injections = True
+                allocation = getattr(spec.selected_context, "allocation", None)
+                if (not _drained and spec.task_state is None and allocation is not None
+                        and allocation.decision == "pass"
+                        and any(event.get("name") == "submit_time_allocation" for event in new_events)
+                        and all(event.get("status") == "ok" and event.get("executed", True)
+                                for event in new_events)):
+                    # A verified structured result already contains the answer. Do not
+                    # spend another model iteration just to trigger its final verdict.
+                    # Refresh/revalidate here; the loop's save boundary still commits
+                    # the exact output and DONE atomically before publishing either.
+                    content, status = allocation.finalize(None)
+                    if status == "completed":
+                        final_content, stop_reason = content, status
+                        self._append_final_message(messages, final_content)
+                        context.final_content, context.stop_reason = final_content, stop_reason
+                        if hook.wants_streaming():
+                            await hook.on_stream_end(context, resuming=False)
+                        await hook.after_iteration(context)
+                        break
                 await hook.after_iteration(context)
                 continue
 
@@ -616,6 +1014,7 @@ class AgentRunner:
                         clean,
                         reasoning_content=response.reasoning_content,
                         thinking_blocks=response.thinking_blocks,
+                        provider_state=response.provider_state,
                     ))
                     messages.append(build_length_recovery_message())
                     await hook.after_iteration(context)
@@ -627,7 +1026,66 @@ class AgentRunner:
                     clean,
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
+                    provider_state=response.provider_state,
                 )
+
+            if assistant_message is not None and stall_guard:
+                if self._repeats_previous_final(clean, previous_finals):
+                    # Same no-tool reply again: resending it cannot make progress.
+                    logger.warning(
+                        "Stopping turn for {}: no-tool final repeats an earlier final (iteration {})",
+                        spec.session_key or "default", iteration,
+                    )
+                    stop_reason = "incomplete"
+                    final_content = self._stall_report(tool_events)
+                    assistant_message["content"] = final_content
+                    messages.append(assistant_message)
+                    await self._emit_checkpoint(spec, {
+                        "phase": "final_response", "iteration": iteration, "model": spec.model,
+                        "assistant_message": assistant_message,
+                        "completed_tool_results": [], "pending_tool_calls": [],
+                    })
+                    context.final_content = final_content
+                    context.stop_reason = stop_reason
+                    if hook.wants_streaming():
+                        await hook.on_stream_end(context, resuming=False)
+                    await hook.after_iteration(context)
+                    break
+                previous_finals.append(clean)
+                if (last_tool_failures and stall_resumes == 0 and spec.task_state is None
+                        and iteration + 1 < spec.max_iterations):
+                    # Structural check only: the last tool batch failed and this reply has
+                    # no tool call. Response wording is not interpreted.
+                    stall_resumes += 1
+                    failures = ", ".join(
+                        f"{event.get('name')}: {event.get('status')}" for event in last_tool_failures
+                    )
+                    logger.info(
+                        "No-tool final after failed tool batch for {} ({}); resuming once",
+                        spec.session_key or "default", failures,
+                    )
+                    assistant_message["_hidden_history"] = True
+                    messages.append(assistant_message)
+                    messages.append({
+                        "role": "user", "_hidden_history": True,
+                        "content": _STALL_RESUME_FEEDBACK.format(failures=failures),
+                    })
+                    if hook.wants_streaming():
+                        await hook.on_stream_end(context, resuming=True)
+                    await hook.after_iteration(context)
+                    continue
+
+            if assistant_message is not None:
+                clean, guard_resume = await guard_final(clean, assistant_message, iteration)
+                if guard_resume:
+                    drained, injection_cycles = await self._try_drain_injections(
+                        spec, messages, None, injection_cycles, phase="after final correction",
+                    )
+                    had_injections = had_injections or drained
+                    if hook.wants_streaming():
+                        await hook.on_stream_end(context, resuming=True)
+                    await hook.after_iteration(context)
+                    continue
 
             # Check for mid-turn injections BEFORE signaling stream end.
             # If injections are found we keep the stream alive (resuming=True)
@@ -636,7 +1094,7 @@ class AgentRunner:
                 spec, messages, assistant_message, injection_cycles,
                 phase="after final response",
                 iteration=iteration,
-                allow_goal_continue=True,
+                allow_goal_continue=stop_reason not in {"incomplete", "cancelled"},
             )
             if should_continue:
                 had_injections = True
@@ -648,6 +1106,14 @@ class AgentRunner:
                 await hook.after_iteration(context)
                 continue
 
+            if (response.finish_reason == "error" and response.error_kind == "budget_exhausted"
+                    and spec.selected_context and not spec.selected_context.legacy_fallback):
+                # t54: the send was refused by the request budget (nothing sent): stop, no extra call.
+                _budget = getattr(spec.selected_context.trace, "budget", None)
+                _stop = (_budget.stop_reason if _budget is not None else None) or "budget_sends"
+                final_content, stop_reason = spec.selected_context.verdict(None, _stop)
+                self._append_final_message(messages, final_content)
+                break
             if response.finish_reason == "error":
                 if LLMProvider.is_arrearage_response(response):
                     final_content = _ARREARAGE_ERROR_MESSAGE
@@ -690,6 +1156,7 @@ class AgentRunner:
                 clean,
                 reasoning_content=response.reasoning_content,
                 thinking_blocks=response.thinking_blocks,
+                provider_state=response.provider_state,
             ))
             await self._emit_checkpoint(
                 spec,
@@ -721,7 +1188,15 @@ class AgentRunner:
             if drained_after_max_iterations:
                 had_injections = True
             final_content = None
-            if spec.finalize_on_max_iterations:
+            if spec.task_state is not None and spec.task_state.update is not None:
+                spec.task_state.update.final_answer = hook.finalize_content(
+                    AgentHookContext(iteration=spec.max_iterations, messages=messages),
+                    spec.task_state.update.final_answer,
+                ) or ""
+            if (spec.task_state is not None and not spec.task_state.defects()
+                    and spec.task_state.update.status in {"completed", "cancelled"}):
+                final_content = spec.task_state.update.final_answer.strip()
+            if final_content is None and spec.finalize_on_max_iterations and not spec.selected_context:
                 final_content = await self._try_finalize_after_max_iterations(
                     spec,
                     hook,
@@ -730,6 +1205,26 @@ class AgentRunner:
                 )
             if final_content is None:
                 final_content = self._max_iterations_fallback(spec)
+            if spec.premature_final_guard and is_premature_final(
+                final_content, messages, spec.tools, tool_events,
+                spec.premature_final_session_metadata,
+            ):
+                final_content = INCOMPLETE
+            if spec.task_state is not None:
+                defects, terminal = spec.task_state.final_check()
+                if defects and not terminal:
+                    final_content = spec.task_state.incomplete(defects)
+                elif not terminal:
+                    final_content = spec.task_state.final_report()
+                    stop_reason = spec.task_state.final_status
+                elif terminal:
+                    final_content = str(final_content or "") + "\n\n미완료 상태: " + spec.task_state.update.explanation
+            if spec.premature_final_guard and needs_answer_body(final_content, messages):
+                final_content = str(final_content or "") + "\n\n" + ANSWER_BODY_INCOMPLETE
+                if stop_reason == "completed":
+                    stop_reason = "incomplete"
+            if spec.selected_context and not spec.selected_context.legacy_fallback:
+                final_content, stop_reason = spec.selected_context.verdict(final_content, "max_iterations")
             self._append_final_message(messages, final_content)
 
         return AgentRunResult(
@@ -744,6 +1239,67 @@ class AgentRunner:
         )
 
     @staticmethod
+    def _normalize_final(text: str | None) -> str:
+        return re.sub(r"[\W_]+", "", str(text or "").lower())[:2000]
+
+    @classmethod
+    def _prior_session_final(cls, messages: list[dict[str, Any]]) -> list[str]:
+        """Seed cross-turn repetition checks unless answer replay is explicitly requested."""
+        from nanobot.agent.task_note import user_text
+
+        if _STALL_ANSWER_REPLAY.fullmatch(user_text(messages).strip()):
+            # Replaying a delivered answer is the requested result. Finals produced
+            # during this run still enter previous_finals and retain the stall guard.
+            return []
+        for message in reversed(messages):
+            role = message.get("role")
+            if role == "user" and not is_hidden_history_message(message):
+                continue
+            if role != "assistant" or is_hidden_history_message(message):
+                continue
+            content = message.get("content")
+            if message.get("tool_calls") or not isinstance(content, str) or not content.strip():
+                return []
+            return [content]
+        return []
+
+    @classmethod
+    def _repeats_previous_final(cls, text: str | None, previous: list[str]) -> bool:
+        current = cls._normalize_final(text)
+        if len(current) < _STALL_REPEAT_MIN_CHARS:
+            return False
+        for earlier in previous:
+            other = cls._normalize_final(earlier)
+            if current == other or (
+                other and SequenceMatcher(None, current, other).ratio() >= _STALL_REPEAT_RATIO
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _stall_report(tool_events: list[dict[str, str]]) -> str:
+        labels = {"ok": "성공", "error": "실패", "unknown": "결과 불명", "blocked": "차단"}
+        lines = [
+            "작업을 계속 진행하지 못해 이번 응답을 중단했습니다. 도구 실행 없이 같은 답변이 "
+            "반복되어 다시 보내지 않았습니다."
+        ]
+        recent = [event for event in tool_events if event.get("status") != "superseded"][-3:]
+        if recent:
+            lines.append("마지막으로 확인된 상태:")
+            for event in recent:
+                status = str(event.get("status") or "unknown")
+                line = f"- {event.get('name')}: {labels.get(status, status)}"
+                if status != "ok" and event.get("detail"):
+                    line += " — " + " ".join(str(event["detail"]).split())[:160]
+                lines.append(line)
+        else:
+            lines.append("이번 응답에서는 실행된 도구가 없습니다.")
+        lines.append(
+            "실제 상태(버전·프로세스·종료 코드)를 먼저 확인한 뒤 다음 단계를 진행해야 합니다."
+        )
+        return "\n".join(lines)
+
+    @staticmethod
     def _all_tool_calls_observability(
         spec: AgentRunSpec,
         tool_calls: list[ToolCallRequest],
@@ -751,6 +1307,9 @@ class AgentRunner:
         if not tool_calls:
             return False
         for tool_call in tool_calls:
+            if (spec.task_state is not None and tool_call.name == "update_task"
+                    and tool_call.arguments.get("status") == "active"):
+                return False
             tool = spec.tools.get(tool_call.name)
             if tool is None or getattr(tool, "observability", False) is not True:
                 return False
@@ -787,6 +1346,8 @@ class AgentRunner:
         *,
         malformed_retry: bool = False,
     ):
+        if spec.task_state is not None:
+            spec.task_state.model_calls += 1
         timeout_s: float | None = spec.llm_timeout_s
         if timeout_s is None:
             # Default to a finite timeout to avoid per-session lock starvation when an LLM
@@ -805,9 +1366,14 @@ class AgentRunner:
             messages,
             tools=spec.tools.get_definitions(),
         )
-        wants_streaming = hook.wants_streaming()
+        # Selected execution must validate every final candidate before delivery.
+        # Content deltas could otherwise publish an unsupported success claim
+        # even when verdict() subsequently rejects the final response.
+        gate_delivery = bool(spec.selected_context and not spec.selected_context.legacy_fallback)
+        wants_streaming = hook.wants_streaming() and not gate_delivery
         wants_progress_streaming = (
             not wants_streaming
+            and not gate_delivery
             and spec.stream_progress_deltas
             and spec.progress_callback is not None
             and getattr(self.provider, "supports_progress_deltas", False) is True
@@ -835,11 +1401,13 @@ class AgentRunner:
 
         if wants_streaming:
             thinking_buf = ""
+            repetition = RepeatedSentenceGuard()
 
             async def _stream(delta: str) -> None:
-                if delta:
+                visible = repetition.feed(delta)
+                if visible:
                     context.streamed_content = True
-                await hook.on_stream(context, delta)
+                    await hook.on_stream(context, visible)
 
             async def _thinking(delta: str) -> None:
                 nonlocal thinking_buf
@@ -915,6 +1483,8 @@ class AgentRunner:
                     "Tool call did not complete.",
                 )
         except asyncio.TimeoutError:
+            if spec.selected_context:
+                spec.selected_context.trace.mark_timeout()
             if outer_timeout_s is None:
                 return LLMResponse(
                     content="Error calling LLM: stream stalled",
@@ -1076,6 +1646,8 @@ class AgentRunner:
         spec: AgentRunSpec,
         messages: list[dict[str, Any]],
     ) -> LLMResponse:
+        if spec.task_state is not None:
+            spec.task_state.model_calls += 1
         kwargs = self._build_request_kwargs(spec, messages, tools=None)
         return await self.provider.chat_with_retry(**kwargs)
 
@@ -1131,6 +1703,7 @@ class AgentRunner:
             tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
             reasoning_content=response.reasoning_content,
             thinking_blocks=response.thinking_blocks,
+            provider_state=response.provider_state,
         )
         completion_tokens = estimate_message_tokens(assistant_message)
         total_tokens = max(0, prompt_tokens) + max(0, completion_tokens)
@@ -1180,9 +1753,41 @@ class AgentRunner:
         external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
+        # t49: a plan/requirement update sent with other actions is processed first.
+        # t50: a rejected update returns only its own error; the other actions still run, each through
+        # its own pre-execution checks (repeat, permission, target, cancellation, budget). An update
+        # grants no permission, so nothing depends on its acceptance to be safe.
+        first: dict[int, tuple[Any, dict[str, str], BaseException | None]] = {}
+        if spec.selected_context:
+            for i, call in enumerate(tool_calls):
+                args = call.arguments if isinstance(call.arguments, dict) else {}
+                if call.name == "revise_context_requirements" and args.get("reason") in {
+                        "update_plan", "supplement_requirement"}:
+                    first[i] = await self._run_tool(spec, call, external_lookup_counts, workspace_violation_counts)
+        if first:
+            if any(first[i][1].get("status") != "ok" for i in first):
+                spec.selected_context.trace.count("plan_gate", "update_rejected_others_run")
+            rest = [c for i, c in enumerate(tool_calls) if i not in first]
+            rest_res, rest_ev, rest_err = await self._execute_tools(
+                spec, rest, external_lookup_counts, workspace_violation_counts) if rest else ([], [], None)
+            rest_out = (list(zip(rest_res, rest_ev, [None] * len(rest_res))), rest_err)
+            merged, it = [], iter(rest_out[0])
+            for i in range(len(tool_calls)):
+                merged.append(first[i] if i in first else next(it))
+            fatal = next((e for _, _, e in merged if e is not None), rest_out[1])
+            return [r for r, _, _ in merged], [e for _, e, _ in merged], fatal
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
         for batch in batches:
+            if spec.task_state is not None:
+                followups = await self._drain_injections(spec)
+                spec.task_state.pending_messages.extend(followups)
+                if spec.task_state.pending_messages:
+                    tool_results.extend((
+                        "Superseded by a new user instruction; reinterpret before execution.",
+                        {"name": call.name, "status": "superseded"}, None,
+                    ) for call in batch)
+                    continue
             if spec.concurrent_tools and len(batch) > 1:
                 batch_results = await asyncio.gather(*(
                     self._run_tool(
@@ -1210,13 +1815,78 @@ class AgentRunner:
                 fatal_error = error
         return results, events, fatal_error
 
-    async def _run_tool(
+    async def _run_tool(self, spec, tool_call, external_lookup_counts, workspace_violation_counts):
+        tool = spec.tools.get(tool_call.name)
+        async def operation():
+            return await self._run_tool_with_task_note(
+                spec, tool_call, external_lookup_counts, workspace_violation_counts)
+        if spec.selected_context and tool is not None and not tool.read_only:
+            return await spec.selected_context.control.run_mutation(
+                tool_call, tool, operation, lambda: self._drain_injections(spec, wait=False))
+        return await operation()
+
+    async def _run_tool_with_task_note(
         self,
         spec: AgentRunSpec,
         tool_call: ToolCallRequest,
         external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
     ) -> tuple[Any, dict[str, str], BaseException | None]:
+        if spec.task_state is None:
+            return await self._run_tool_unchecked(
+                spec, tool_call, external_lookup_counts, workspace_violation_counts,
+            )
+        from nanobot.agent.task_note import bounded_operation
+        from nanobot.agent.tools.base import ToolResult
+
+        note = spec.task_state
+        tool = spec.tools.get(tool_call.name)
+        if tool_call.name != "update_task" and not bool(getattr(tool, "read_only", False)):
+            blocked = note.mutation_error(tool_call.name, tool_call.arguments)
+            if blocked:
+                return ToolResult.error(blocked), {
+                    "name": tool_call.name, "status": "blocked", "detail": blocked,
+                }, None
+        if tool is not None and spec.progress_callback is not None:
+            notice = note.progress.operation(tool_call.name, tool_call.arguments)
+            if notice:
+                await spec.progress_callback(notice, tool_hint=False)
+        try:
+            outcome = await bounded_operation(note, tool_call.name, lambda: self._run_tool_unchecked(
+                spec, tool_call, external_lookup_counts, workspace_violation_counts,
+            ))
+        except asyncio.CancelledError:
+            if tool is not None and not tool.read_only:
+                note.observe(tool_call.name, tool_call.arguments,
+                             "Cancelled during execution; result unknown.", tool, "unknown", tool_call.id)
+            raise
+        if isinstance(outcome, tuple):
+            result, event, error = outcome
+        else:
+            result, event, error = outcome, {"name": tool_call.name, "status": "unknown",
+                                            "detail": str(outcome)}, None
+        if tool_call.name == "update_task" and event["status"] == "ok" and spec.progress_callback is not None:
+            notice = note.progress.plan(note.update)
+            if notice:
+                await spec.progress_callback(notice, tool_hint=False)
+        if tool_call.name != "update_task":
+            if (getattr(result, "read_evidence", None) and isinstance(result, str)
+                    and len(result) > spec.max_tool_result_chars):
+                # The model receives an offload/preview, not the full returned document.
+                result.read_evidence["extraction_ok"] = False
+                result.read_evidence["context_truncated"] = True
+            note.observe(tool_call.name, tool_call.arguments, result, tool, event["status"], tool_call.id)
+        return result, event, error
+
+    async def _run_tool_unchecked(
+        self,
+        spec: AgentRunSpec,
+        tool_call: ToolCallRequest,
+        external_lookup_counts: dict[str, int],
+        workspace_violation_counts: dict[str, int],
+    ) -> tuple[Any, dict[str, str], BaseException | None]:
+        from nanobot.agent.tools.base import ToolResult
+
         hint = "\n\n[Analyze the error above and try a different approach.]"
         lookup_error = repeated_external_lookup_error(
             tool_call.name,
@@ -1224,11 +1894,11 @@ class AgentRunner:
             external_lookup_counts,
         )
         if lookup_error:
-            event = {
+            event = _RefusedToolEvent({
                 "name": tool_call.name,
                 "status": "error",
                 "detail": "repeated external lookup blocked",
-            }
+            })
             if spec.fail_on_tool_error:
                 return lookup_error + hint, event, RuntimeError(lookup_error)
             return lookup_error + hint, event, None
@@ -1240,11 +1910,12 @@ class AgentRunner:
                 if isinstance(prepared, tuple) and len(prepared) == 3:
                     tool, params, prep_error = prepared
         if prep_error:
-            event = {
+            event = _RefusedToolEvent({
                 "name": tool_call.name,
                 "status": "error",
                 "detail": prep_error.split(": ", 1)[-1][:120],
-            }
+                "executed": False,   # t49: refused before execution
+            })
             handled = self._classify_violation(
                 raw_text=prep_error,
                 soft_payload=prep_error + hint,
@@ -1282,10 +1953,62 @@ class AgentRunner:
                 ) for file_edit_tracker in file_edit_trackers],
             )
         try:
+            checked_versions = spec.selected_context.watched_versions() if spec.selected_context else {}
             if tool is not None:
-                result = await tool.execute(**params)
+                if spec.selected_context and not tool.read_only:
+                    latest = await self._drain_injections(spec, wait=False)
+                    spec.selected_context.control.pending.extend(latest)
+                    error = spec.selected_context.control.authorize(
+                        tool_call.name, (tool_call.arguments or {}).get("path")
+                        if isinstance(tool_call.arguments, dict) else None)
+                    if error or latest:
+                        return ToolResult.error(error or "Prepared action superseded"), {
+                            "name": tool_call.name, "status": "blocked", "executed": False}, None
+                    spec.selected_context.control.active = tool_call.id
+                    spec.selected_context.control.execution(tool_call, "running")
+                from nanobot.agent.tools.search import FindFilesTool, GrepTool
+
+                if spec.task_state is not None and type(tool) in {FindFilesTool, GrepTool}:
+                    from nanobot.agent.tools.search_worker import isolated_search
+
+                    result = await isolated_search(tool, params)
+                else:
+                    _budget = getattr(spec.selected_context.trace, "budget", None) if spec.selected_context else None
+                    _limit = _budget.cap(None) if _budget is not None else None
+                    if _limit is not None:
+                        # t54: a tool wait never outlives the request deadline. A timeout goes through the
+                        # error path below; a change it may have made stays "unknown" (no rollback).
+                        try:
+                            async with asyncio.timeout(_limit):
+                                result = await tool.execute(**params)
+                        except TimeoutError:
+                            _budget.stop("budget_deadline")
+                            from nanobot.agent.tools.shell import termination_note
+                            info = getattr(tool, "last_termination", None)
+                            note = termination_note(info)
+                            if note and spec.selected_context is not None:
+                                spec.selected_context.unconfirmed_terminations = [
+                                    *getattr(spec.selected_context, "unconfirmed_terminations", []),
+                                    dict(info, call=tool_call.id)]
+                            raise TimeoutError("request deadline reached while waiting for " + tool_call.name
+                                               + ("; " + note if note else ""))
+                    else:
+                        result = await tool.execute(**params)
             else:
-                result = await spec.tools.execute(tool_call.name, params)
+                _budget = getattr(spec.selected_context.trace, "budget", None) if spec.selected_context else None
+                _limit = _budget.cap(None) if _budget is not None else None
+                if _limit is not None:
+                    try:
+                        async with asyncio.timeout(_limit):
+                            result = await spec.tools.execute(tool_call.name, params)
+                    except TimeoutError:
+                        _budget.stop("budget_deadline")
+                        raise TimeoutError("request deadline reached while waiting for " + tool_call.name)
+                else:
+                    result = await spec.tools.execute(tool_call.name, params)
+            execution = getattr(result, "execution_evidence", None)
+            if spec.selected_context and isinstance(execution, dict):
+                execution["checked_versions"] = checked_versions
         except asyncio.CancelledError:
             raise
         except BaseException as exc:

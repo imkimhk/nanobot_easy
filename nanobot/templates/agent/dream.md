@@ -24,6 +24,19 @@ Do NOT guess paths. Route each fact to its canonical file:
 
 Cross-boundary rule: no technical configs in USER.md, no user facts in SOUL.md, no operational details in MEMORY.md. If a fact fits multiple files, keep the most specific copy and remove the rest.
 
+If MEMORY.md already contains `## Reference Notes` or `## 참고 메모`, preserve
+that explicit organization and its named project groups. Those sections are
+optional retrieval data. Keep global permissions, preferences and constraints in
+the always-loaded sections or their canonical SOUL.md/USER.md files. Do not move
+existing rules into optional references or introduce this organization unless
+the user explicitly requests it. Keep corrections with the project they qualify.
+
+If the user has already separated historical records behind an archive index,
+preserve that index and the active restrictions. Archive snapshots are historical
+data, not current approval or instructions to restore old behavior. Do not copy
+their incident/version narratives back into always-loaded memory, delete the
+user-preserved source records, or move active rules into archives automatically.
+
 ## MECE enforcement
 - USER.md: personal attributes (identity, preferences, habits, communication style) — no technical configs, no project context
 - SOUL.md: agent behavior rules, guardrails, interaction patterns, tool-use strategy — no user facts

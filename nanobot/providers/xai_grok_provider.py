@@ -1,0 +1,645 @@
+"""xAI subscription provider with capability-gated hosted X Search.
+
+nanobot-easy change vs upstream c7393c78: the ``hosted_search`` flag. Hosted X
+Search runs on xAI servers and bypasses the local ToolRegistry, so safe mode
+turns it off (see ``providers/factory.py``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import json
+import re
+import time
+import uuid
+from collections.abc import Awaitable, Callable
+from copy import deepcopy
+from typing import Any
+
+import httpx
+from loguru import logger
+
+from nanobot import __version__
+from nanobot.providers.base import (
+    LLMProvider,
+    LLMResponse,
+    ToolCallRequest,
+    hosted_tools_enabled,
+    resolve_stream_idle_timeout_s,
+)
+from nanobot.providers.call_observation import observe, schedule_cleanup, transport_trace
+from nanobot.providers.openai_responses import (
+    consume_sse_with_reasoning,
+    convert_messages,
+    convert_tools,
+)
+from nanobot.providers.xai_oauth import (
+    XAI_CLIENT_VERSION,
+    XAIToken,
+    get_xai_oauth_token,
+)
+
+DEFAULT_XAI_GROK_URL = "https://cli-chat-proxy.grok.com/v1/responses"
+DEFAULT_XAI_GROK_MODELS_URL = "https://cli-chat-proxy.grok.com/v1/models"
+DEFAULT_XAI_GROK_MODEL = "xai-grok/grok-4.5"
+_MODEL_CAPABILITIES_TTL_S = 5 * 60
+# docs.x.ai reasoning guide (checked 2026-10-11): these models accept effort
+# low/medium/high(/xhigh), reasoning cannot be disabled, and an omitted effort
+# defaults to "high".
+_REASONING_ALWAYS_ON_MODELS = ("grok-4.5", "grok-4.6", "grok-4.7")
+_MAX_ERROR_BODY_CHARS = 1000
+_SENSITIVE_ERROR_KEYS = {
+    "accesstoken",
+    "apikey",
+    "authorization",
+    "idtoken",
+    "refreshtoken",
+}
+
+
+class XAIGrokProvider(LLMProvider):
+    """Call xAI's subscription proxy and expose supported hosted tools."""
+
+    supports_progress_deltas = True
+
+    def __init__(
+        self,
+        default_model: str = DEFAULT_XAI_GROK_MODEL,
+        proxy: str | None = None,
+        extra_body: dict[str, Any] | None = None,
+        *,
+        hosted_search: bool = True,
+    ):
+        super().__init__(api_key=None, api_base=None)
+        self._hosted_search = hosted_search
+        self.default_model = default_model
+        self.proxy = proxy or None
+        self._extra_body = dict(extra_body or {})
+        self._model_capabilities: dict[str, bool] | None = None
+        self._model_capabilities_fetched_at = 0.0
+
+    async def _supports_backend_search(self, token: XAIToken, model: str) -> bool:
+        now = time.monotonic()
+        capabilities = self._model_capabilities
+        if (
+            capabilities is None
+            or now - self._model_capabilities_fetched_at >= _MODEL_CAPABILITIES_TTL_S
+        ):
+            try:
+                capabilities = await _fetch_xai_model_capabilities(
+                    DEFAULT_XAI_GROK_MODELS_URL,
+                    _build_model_headers(token),
+                    proxy=self.proxy,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "xAI model capability lookup failed; hosted X Search disabled for model {}: "
+                    "type={} error={}",
+                    model,
+                    type(exc).__name__,
+                    str(exc).strip() or "unexpected error",
+                )
+                capabilities = {}
+                self._model_capabilities = capabilities
+                self._model_capabilities_fetched_at = now
+            else:
+                self._model_capabilities = capabilities
+                self._model_capabilities_fetched_at = now
+        return capabilities.get(model, False)
+
+    async def _call_xai(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str | None,
+        max_tokens: int,
+        temperature: float,
+        reasoning_effort: str | None,
+        tool_choice: str | dict[str, Any] | None,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        wire_model = _strip_model_prefix(model or self.default_model)
+        system_prompt, input_items = convert_messages(
+            messages, reasoning_scope=("xai_grok", wire_model),
+        )
+        reasoning_items: list[dict[str, Any]] = []
+
+        def capture_completed(response: dict[str, Any]) -> None:
+            reasoning_items[:] = [
+                deepcopy(item) for item in response.get("output") or []
+                if isinstance(item, dict) and item.get("type") == "reasoning"
+                and item.get("encrypted_content")
+            ]
+
+        stage = "oauth_token"
+        try:
+            observe("authentication_started")
+            token = await asyncio.to_thread(get_xai_oauth_token, proxy=self.proxy)
+            observe("authentication_finished")
+            supports_backend_search = False
+            if self._hosted_search and hosted_tools_enabled():
+                stage = "model_capabilities"
+                supports_backend_search = await self._supports_backend_search(token, wire_model)
+            converted_tools = convert_tools(tools or [])
+            if supports_backend_search:
+                converted_tools = [
+                    tool for tool in converted_tools if tool.get("name") != "x_search"
+                ]
+                converted_tools.append({"type": "x_search"})
+
+            body: dict[str, Any] = {
+                "model": wire_model,
+                "store": False,
+                "stream": True,
+                "instructions": system_prompt,
+                "input": input_items,
+                "max_output_tokens": max_tokens,
+                "temperature": temperature,
+            }
+            if converted_tools:
+                body.update(
+                    {
+                        "tools": converted_tools,
+                        "tool_choice": tool_choice or "auto",
+                        "parallel_tool_calls": True,
+                        "stream_tool_calls": True,
+                    }
+                )
+                # The restricted designer has exactly one valid delivery function.
+                # Select it explicitly instead of allowing message text before a later call.
+                if (tool_choice == "required" and len(converted_tools) == 1
+                        and converted_tools[0].get("type") == "function"
+                        and converted_tools[0].get("name") == "submit_context_design"):
+                    body["tool_choice"] = {"type": "function", "name": "submit_context_design"}
+                    body["parallel_tool_calls"] = False
+            # Without tools, xAI rejects tool_choice ("no tools were specified", HTTP 400).
+            reasoning = _build_reasoning_options(reasoning_effort)
+            if reasoning:
+                body["reasoning"] = reasoning
+            # Grok can reason even without an explicit effort. With store=False,
+            # encrypted state must be requested and replayed across tool rounds.
+            if self._extra_body:
+                body.update(self._extra_body)
+            include = list(body.get("include") or [])
+            if "reasoning.encrypted_content" not in include:
+                include.append("reasoning.encrypted_content")
+            body["include"] = include
+
+            observe("wire_options", model=body.get("model"), stream=body.get("stream"),
+                    reasoning_effort=(body.get("reasoning") or {}).get("effort"),
+                    max_output_tokens=body.get("max_output_tokens"),
+                    tool_choice=body.get("tool_choice"), tool_count=len(body.get("tools") or []))
+            wire_tools = body.get("tools") or []
+            if len(wire_tools) == 1 and wire_tools[0].get("name") == "submit_context_design":
+                from nanobot.agent.context_trace import estimate_component
+
+                observe("wire_schema", schema_hash=hashlib.sha256(json.dumps(
+                    wire_tools[0].get("parameters") or {}, sort_keys=True).encode()).hexdigest(),
+                    bytes=len(json.dumps(body).encode()), estimated_tokens=estimate_component(body))
+
+            headers = _build_headers(token.access, wire_model)
+            stage = "xai_request"
+            try:
+                result = await _request_xai(
+                    DEFAULT_XAI_GROK_URL,
+                    headers,
+                    body,
+                    proxy=self.proxy,
+                    on_content_delta=on_content_delta,
+                    on_thinking_delta=on_thinking_delta,
+                    on_tool_call_delta=on_tool_call_delta,
+                    on_response_completed=capture_completed,
+                )
+            except _XAIHTTPError as exc:
+                if exc.status_code != 401:
+                    raise
+                stage = "oauth_refresh"
+                observe("authentication_retry_started", http_status=401)
+                token = await asyncio.to_thread(
+                    get_xai_oauth_token,
+                    proxy=self.proxy,
+                    force_refresh=True,
+                )
+                self._model_capabilities = None
+                self._model_capabilities_fetched_at = 0.0
+                headers = _build_headers(token.access, wire_model)
+                stage = "xai_request_retry"
+                observe("authentication_retry_finished")
+                result = await _request_xai(
+                    DEFAULT_XAI_GROK_URL,
+                    headers,
+                    body,
+                    proxy=self.proxy,
+                    on_content_delta=on_content_delta,
+                    on_thinking_delta=on_thinking_delta,
+                    on_tool_call_delta=on_tool_call_delta,
+                    on_response_completed=capture_completed,
+                )
+
+            content, tool_calls, finish_reason, usage, reasoning_content = result
+            return LLMResponse(
+                content=content,
+                tool_calls=tool_calls,
+                finish_reason=finish_reason,
+                usage=usage,
+                reasoning_content=reasoning_content,
+                provider_state={
+                    "provider": "xai_grok",
+                    "model": wire_model,
+                    "reasoning_items": reasoning_items,
+                } if reasoning_items else None,
+                request_options={"reasoning": body.get("reasoning")},
+            )
+        except Exception as exc:
+            response = _xai_error_response(exc)
+            logger.warning(
+                "xAI subscription request failed: stage={} type={} retryable={} status={} "
+                "error_type={} error_code={} response_body={}",
+                stage,
+                type(exc).__name__,
+                response.error_should_retry,
+                response.error_status_code,
+                response.error_type,
+                response.error_code,
+                getattr(exc, "response_body", None),
+            )
+            return response
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        return await self._call_xai(
+            messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice
+        )
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        return await self._call_xai(
+            messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            reasoning_effort,
+            tool_choice,
+            on_content_delta,
+            on_thinking_delta,
+            on_tool_call_delta,
+        )
+
+    def get_default_model(self) -> str:
+        return self.default_model
+
+    @staticmethod
+    def reasoning_request_options(reasoning_effort: str | None) -> dict[str, str] | None:
+        """Return the ``reasoning`` body field this provider sends for an effort value."""
+        return _build_reasoning_options(reasoning_effort)
+
+    @staticmethod
+    def reasoning_disable_supported(model: str | None) -> bool | None:
+        """False when the model documents always-on reasoning; None when unknown."""
+        wire = _strip_model_prefix(model or "")
+        if any(wire == name or wire.startswith(f"{name}-") for name in _REASONING_ALWAYS_ON_MODELS):
+            return False
+        return None
+
+
+def _strip_model_prefix(model: str) -> str:
+    if model.startswith("xai-grok/") or model.startswith("xai_grok/"):
+        return model.split("/", 1)[1]
+    return model
+
+
+def _build_reasoning_options(reasoning_effort: str | None) -> dict[str, str] | None:
+    if not reasoning_effort or reasoning_effort.lower() == "none":
+        return None
+    return {"summary": "concise", "effort": reasoning_effort}
+
+
+def _build_headers(token: str, model: str) -> dict[str, str]:
+    conversation_id = str(uuid.uuid4())
+    return {
+        "Authorization": f"Bearer {token}",
+        "X-XAI-Token-Auth": "xai-grok-cli",
+        "x-authenticateresponse": "authenticate-response",
+        "x-grok-client-version": XAI_CLIENT_VERSION,
+        "x-grok-client-identifier": "nanobot",
+        "x-grok-client-mode": "headless",
+        "x-grok-conv-id": conversation_id,
+        "x-grok-req-id": str(uuid.uuid4()),
+        "x-grok-model-override": model,
+        "x-grok-session-id": conversation_id,
+        "x-grok-agent-id": str(uuid.uuid4()),
+        "User-Agent": f"nanobot/{__version__} (python)",
+        "accept": "text/event-stream",
+        "content-type": "application/json",
+    }
+
+
+def _build_model_headers(token: XAIToken) -> dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {token.access}",
+        "X-XAI-Token-Auth": "xai-grok-cli",
+        "x-grok-client-version": XAI_CLIENT_VERSION,
+        "x-grok-client-identifier": "nanobot",
+        "x-grok-client-mode": "headless",
+        "User-Agent": f"nanobot/{__version__} (python)",
+        "accept": "application/json",
+    }
+    claims = _decode_access_token_claims(token.access)
+    user_id = claims.get("sub")
+    if claims.get("principal_type") == "Team":
+        user_id = claims.get("principal_id") or user_id
+    if isinstance(user_id, str) and user_id:
+        headers["x-userid"] = user_id
+    email = claims.get("email")
+    if not isinstance(email, str) or "@" not in email:
+        email = token.account_id if token.account_id and "@" in token.account_id else None
+    if email:
+        headers["x-email"] = email
+    return headers
+
+
+def _decode_access_token_claims(token: str) -> dict[str, Any]:
+    """Read identity hints from the signed token; the server still authenticates it."""
+    parts = token.split(".")
+    if len(parts) < 2 or not parts[1]:
+        return {}
+    payload = parts[1]
+    try:
+        decoded = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+        claims = json.loads(decoded)
+    except (ValueError, TypeError):
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+class _XAIHTTPError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        retry_after: float | None = None,
+        error_type: str | None = None,
+        error_code: str | None = None,
+        should_retry: bool | None = None,
+        response_body: str | None = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.error_type = error_type
+        self.error_code = error_code
+        self.should_retry = should_retry
+        self.response_body = response_body
+
+
+async def _fetch_xai_model_capabilities(
+    url: str,
+    headers: dict[str, str],
+    *,
+    proxy: str | None = None,
+) -> dict[str, bool]:
+    client_kwargs: dict[str, Any] = {"timeout": 10.0, "follow_redirects": False}
+    if proxy:
+        client_kwargs.update(proxy=proxy, trust_env=False)
+    async with httpx.AsyncClient(**client_kwargs) as client:
+        response = await client.get(url, headers=headers)
+    if response.status_code != 200:
+        raw = response.content.decode("utf-8", "ignore")
+        raise _build_xai_http_error(response.status_code, response.headers, raw)
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("xAI model catalog returned invalid JSON.") from exc
+    return _parse_xai_model_capabilities(payload)
+
+
+def _parse_xai_model_capabilities(payload: Any) -> dict[str, bool]:
+    if isinstance(payload, dict):
+        rows = payload.get("data")
+        if not isinstance(rows, list):
+            rows = payload.get("models")
+    else:
+        rows = payload
+    if not isinstance(rows, list):
+        return {}
+
+    capabilities: dict[str, bool] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        meta = row.get("_meta") if isinstance(row.get("_meta"), dict) else {}
+        support_value = row.get("supportsBackendSearch")
+        if not isinstance(support_value, bool):
+            support_value = row.get("supports_backend_search")
+        if not isinstance(support_value, bool):
+            support_value = meta.get("supportsBackendSearch")
+        if not isinstance(support_value, bool):
+            support_value = meta.get("supports_backend_search")
+        supports_backend_search = support_value if isinstance(support_value, bool) else False
+
+        identifiers = (
+            row.get("model"),
+            row.get("modelId"),
+            row.get("id"),
+            meta.get("model"),
+            meta.get("modelId"),
+        )
+        for identifier in identifiers:
+            if isinstance(identifier, str) and identifier.strip():
+                capabilities[_strip_model_prefix(identifier.strip())] = supports_backend_search
+    return capabilities
+
+
+async def _request_xai(
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    *,
+    proxy: str | None = None,
+    on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+    on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
+    on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    on_response_completed: Callable[[dict[str, Any]], None] | None = None,
+) -> tuple[str, list[ToolCallRequest], str, dict[str, int], str | None]:
+    client_kwargs: dict[str, Any] = {"timeout": resolve_stream_idle_timeout_s()}
+    if proxy:
+        client_kwargs.update(proxy=proxy, trust_env=False)
+    client = httpx.AsyncClient(**client_kwargs)
+    stream_context = None
+    try:
+        await client.__aenter__()
+        observe("request_dispatch", timeout_seconds=client_kwargs["timeout"])
+        stream_context = client.stream("POST", url, headers=headers, json=body,
+                                       extensions={"trace": transport_trace})
+        response = await stream_context.__aenter__()
+        observe("response_headers", http_status=response.status_code)
+        if response.status_code != 200:
+            content = await response.aread()
+            raw = content.decode("utf-8", "ignore")
+            raise _build_xai_http_error(response.status_code, response.headers, raw)
+        return await consume_sse_with_reasoning(
+            response,
+            on_content_delta=on_content_delta,
+            on_tool_call_delta=on_tool_call_delta,
+            on_reasoning_delta=on_thinking_delta,
+            on_response_completed=on_response_completed,
+        )
+    finally:
+        # Async context-manager exits may themselves hang or raise. A completed
+        # terminal result must return before disposal and its independent budget.
+        closers = [lambda: client.__aexit__(None, None, None)]
+        if stream_context is not None:
+            closers.insert(0, lambda: stream_context.__aexit__(None, None, None))
+        schedule_cleanup(*closers)
+
+
+def _build_xai_http_error(
+    status_code: int,
+    headers: httpx.Headers,
+    raw: str,
+) -> _XAIHTTPError:
+    retry_after = LLMProvider._extract_retry_after_from_headers(headers)
+    error_type, error_code = LLMProvider._extract_error_type_code(raw)
+    response_body = _bounded_error_body(raw)
+    return _XAIHTTPError(
+        _friendly_error(status_code, response_body),
+        status_code=status_code,
+        retry_after=retry_after,
+        error_type=error_type,
+        error_code=error_code,
+        should_retry=_should_retry_status(status_code, error_type, error_code, raw),
+        response_body=response_body,
+    )
+
+
+def _bounded_error_body(raw: str) -> str | None:
+    text = raw.strip()
+    if not text:
+        return None
+
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        pass
+    else:
+        text = json.dumps(
+            _redact_error_payload(payload),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    text = re.sub(r"(?i)(bearer\s+)[a-z0-9._~+/=-]+", r"\1[REDACTED]", text)
+    text = " ".join(text.split())
+    if len(text) > _MAX_ERROR_BODY_CHARS:
+        return f"{text[:_MAX_ERROR_BODY_CHARS]}…"
+    return text
+
+
+def _redact_error_payload(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        return {
+            key: "[REDACTED]" if _is_sensitive_error_key(key) else _redact_error_payload(value)
+            for key, value in payload.items()
+        }
+    if isinstance(payload, list):
+        return [_redact_error_payload(value) for value in payload]
+    return payload
+
+
+def _is_sensitive_error_key(key: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", key.casefold())
+    return normalized in _SENSITIVE_ERROR_KEYS
+
+
+def _friendly_error(status_code: int, response_body: str | None = None) -> str:
+    if status_code == 401:
+        message = "xAI rejected the login. Sign in again with `nanobot provider login xai-grok`."
+    elif status_code == 403:
+        message = "This xAI account or subscription cannot access the Grok subscription endpoint."
+    elif status_code == 426:
+        message = "xAI requires a newer Grok client version. Update nanobot and try again."
+    elif status_code == 429:
+        message = "xAI usage quota or rate limit reached. Please try again later."
+    else:
+        message = f"xAI subscription endpoint returned HTTP {status_code}."
+    if response_body:
+        return f"{message} Response body: {response_body}"
+    return message
+
+
+def _xai_error_response(exc: Exception) -> LLMResponse:
+    status_code = getattr(exc, "status_code", None)
+    should_retry = getattr(exc, "should_retry", None)
+    error_kind: str | None = None
+    if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)):
+        error_kind = "timeout"
+        should_retry = True if should_retry is None else should_retry
+    elif isinstance(exc, (httpx.NetworkError, httpx.TransportError)):
+        error_kind = "connection"
+        should_retry = True if should_retry is None else should_retry
+    elif isinstance(exc, _XAIHTTPError):
+        error_kind = "http"
+    if status_code is not None and should_retry is None:
+        should_retry = _should_retry_status(
+            int(status_code),
+            getattr(exc, "error_type", None),
+            getattr(exc, "error_code", None),
+            None,
+        )
+    message = str(exc).strip() or "unexpected error"
+    retry_after = getattr(exc, "retry_after", None)
+    return LLMResponse(
+        content=f"Error calling xAI ({type(exc).__name__}): {message}",
+        finish_reason="error",
+        retry_after=retry_after,
+        error_status_code=int(status_code) if status_code is not None else None,
+        error_kind=error_kind,
+        error_type=getattr(exc, "error_type", None),
+        error_code=getattr(exc, "error_code", None),
+        error_retry_after_s=retry_after,
+        error_should_retry=should_retry,
+    )
+
+
+def _should_retry_status(
+    status_code: int,
+    error_type: str | None,
+    error_code: str | None,
+    content: str | None,
+) -> bool:
+    if status_code == 429:
+        return LLMProvider._is_retryable_429_response(
+            LLMResponse(
+                content=content or "",
+                finish_reason="error",
+                error_status_code=status_code,
+                error_type=error_type,
+                error_code=error_code,
+            )
+        )
+    return status_code in LLMProvider._RETRYABLE_STATUS_CODES or status_code >= 500

@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from typing import Any
 
 from nanobot.providers.base import tool_arguments_json_for_replay
 
 
-def convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+def convert_messages(
+    messages: list[dict[str, Any]],
+    *,
+    reasoning_scope: tuple[str, str] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
     """Convert Chat Completions messages to Responses API input items.
 
     Returns ``(system_prompt, input_items)`` where *system_prompt* is extracted
     from any ``system`` role message and *input_items* is the Responses API
-    ``input`` array.
+    ``input`` array. Opaque reasoning is replayed only for an explicitly matching
+    ``reasoning_scope`` (provider, requested model).
     """
     system_prompt = ""
     input_items: list[dict[str, Any]] = []
@@ -32,6 +38,22 @@ def convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str
             continue
 
         if role == "assistant":
+            state = msg.get("provider_state")
+            if (reasoning_scope and isinstance(state, dict)
+                    and (state.get("provider"), state.get("model")) == reasoning_scope):
+                # Encrypted reasoning is opaque: preserve the full native item and ID.
+                # Other providers/models must never receive this replay state.
+                for item in state.get("reasoning_items") or []:
+                    if not isinstance(item, dict) or item.get("type") != "reasoning":
+                        continue
+                    if not item.get("encrypted_content"):
+                        continue
+                    item_id = item.get("id")
+                    if item_id and item_id in used_item_ids:
+                        continue
+                    if item_id:
+                        used_item_ids.add(item_id)
+                    input_items.append(deepcopy(item))
             if isinstance(content, str) and content:
                 message_id = _unique_item_id(f"msg_{idx}", used_item_ids)
                 input_items.append({

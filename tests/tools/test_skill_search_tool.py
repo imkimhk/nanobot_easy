@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from nanobot.agent.context import ContextBuilder
-from nanobot.agent.tools.context import RequestContext
+from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.loader import ToolLoader
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.skill_decision import SkillDecisionTool
@@ -196,6 +196,9 @@ async def test_skill_decision_records_final_selection_trace(tmp_path: Path) -> N
         wave_no=2,
     )
     assert json.loads(raw)["ok"] is True
+    assert json.loads(raw)["phase"] == "selected"
+    assert SkillStore(tmp_path).get_skill("answer-comparison")["usage_count"] == 0
+    assert SkillStore(tmp_path).get_skill("answer-comparison")["selection_count"] == 1
 
     with sqlite3.connect(tmp_path / ".skillstore" / "skillstore.db") as conn:
         row = conn.execute(
@@ -208,6 +211,65 @@ async def test_skill_decision_records_final_selection_trace(tmp_path: Path) -> N
         "Active Skill card matched a two-option comparison request.",
         2,
     )
+
+
+@pytest.mark.asyncio
+async def test_skill_selection_correction_only_counts_actual_application(tmp_path: Path) -> None:
+    for name in ("translate", "table-sum"):
+        _write_skill(tmp_path / "skills", name, description=name)
+    store = SkillStore(tmp_path)
+    store.reindex(builtin_dir=tmp_path / "empty_builtin")
+    tool = SkillDecisionTool(str(tmp_path))
+    tool.set_context(RequestContext(channel="cli", chat_id="direct", session_key="cli:direct"))
+    first = json.loads(await tool.execute(decision="cold", skill_name="translate", rationale="wrong choice"))
+    selected = json.loads(await tool.execute(decision="cold", skill_name="table-sum", rationale="corrected choice"))
+    for _ in range(2):
+        applied = json.loads(await tool.execute(
+            decision="cold", skill_name="table-sum", rationale="used arithmetic Method",
+            trace_id=selected["trace_id"], phase="applied", application_evidence="12+18+7=37"))
+        assert applied["trace_id"] == selected["trace_id"]
+    alpha, beta = store.get_skill("translate"), store.get_skill("table-sum")
+    assert (alpha["selection_count"], alpha["usage_count"]) == (1, 0)
+    assert (beta["selection_count"], beta["usage_count"], beta["success_count"]) == (1, 1, 0)
+    assert first["trace_id"] != selected["trace_id"]
+    store.record_trace(trace_id=selected["trace_id"], session_key="cli:direct", selected_skill="table-sum",
+                       phase="applied", application_evidence="12+18+7=37", gate_result="ok")
+    await tool.execute(decision="cold", skill_name="table-sum", rationale="application replay after grading",
+                       trace_id=selected["trace_id"], phase="applied", application_evidence="12+18+7=37")
+    assert store.get_skill("table-sum")["success_count"] == 1
+    result = await tool.execute(decision="cold", skill_name="table-sum", rationale="delayed selection replay",
+                                trace_id=selected["trace_id"])
+    assert json.loads(result)["phase"] == "applied"
+    assert store.get_skill("table-sum")["usage_count"] == 1
+    # A different application remains independent, even for the same skill/session.
+    await tool.execute(decision="cold", skill_name="table-sum", rationale="second real calculation",
+                       phase="applied", application_evidence="2+3=5")
+    assert store.get_skill("table-sum")["usage_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_application_requires_evidence_and_same_selection_scope(tmp_path: Path) -> None:
+    _write_skill(tmp_path / "skills", "alpha", description="Alpha")
+    store = SkillStore(tmp_path)
+    store.reindex(builtin_dir=tmp_path / "empty_builtin")
+    tool = SkillDecisionTool(str(tmp_path))
+    tool.set_context(RequestContext(channel="cli", chat_id="one", session_key="cli:one"))
+    selected = json.loads(await tool.execute(decision="hot", skill_name="alpha", rationale="choice", wave_no=1))
+    no_evidence = await tool.execute(decision="hot", skill_name="alpha", rationale="claim", phase="applied")
+    assert no_evidence.is_error
+    wrong_wave = await tool.execute(decision="hot", skill_name="alpha", rationale="claim", phase="applied",
+                                    application_evidence="result", trace_id=selected["trace_id"], wave_no=2)
+    assert wrong_wave.is_error
+    token = bind_request_context(RequestContext(channel="cli", chat_id="two", session_key="cli:two"))
+    try:
+        wrong_session = await tool.execute(
+            decision="hot", skill_name="alpha", rationale="claim", phase="applied",
+            application_evidence="result", trace_id=selected["trace_id"], wave_no=1)
+        assert wrong_session.is_error
+    finally:
+        reset_request_context(token)
+    assert store.get_skill("alpha")["usage_count"] == 0
+    assert store.get_skill("alpha")["selection_count"] == 1
 
 
 def test_context_builder_uses_skill_search_hint_when_many_skills(tmp_path: Path) -> None:

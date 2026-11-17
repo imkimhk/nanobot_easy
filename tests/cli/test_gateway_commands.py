@@ -216,3 +216,25 @@ def test_gateway_uninstall_service_uses_service_installer(tmp_path):
     assert "Gateway service uninstall dry run" in result.stdout
     assert service.uninstalled_name == "custom-gateway"
     assert service.uninstall_manager == "systemd"
+
+
+def test_gateway_status_marks_unverified_identity(tmp_path):
+    from dataclasses import replace
+
+    app, runtime, _, _ = _test_app(tmp_path)
+    runtime.status_value = replace(runtime.status_value, running=False, reason="identity_unverified")
+    result = runner.invoke(app, ["gateway", "status"])
+    assert result.exit_code == 0
+    assert "Running: unverified" in result.stdout
+    assert "Running: yes" not in result.stdout
+
+
+def test_gateway_status_labels_startup_evidence(tmp_path):
+    from dataclasses import replace
+
+    app, runtime, _, _ = _test_app(tmp_path)
+    runtime.status_value = replace(runtime.status_value, startup={"source_root": "/test/source"})
+    result = runner.invoke(app, ["gateway", "status"])
+    assert result.exit_code == 0
+    assert "Startup evidence" in result.stdout
+    assert "/test/source" in result.stdout

@@ -6,6 +6,40 @@ DEFAULT_INSTALL_DIR="${NANOBOT_EASY_HOME:-$HOME/nanobot-easy}"
 CONFIG="${NANOBOT_CONFIG:-$SCRIPT_DIR/.local/config.json}"
 WORKSPACE="${NANOBOT_WORKSPACE:-$SCRIPT_DIR/.local/workspace}"
 NANOBOT_BIN="${NANOBOT_BIN:-$SCRIPT_DIR/.venv/bin/nanobot}"
+
+# This script launches the checkout it lives in. For the main config it also
+# starts or restarts Rees, Elle, Genie, Heart, and Testy. Set
+# NANOBOT_START_PERSONAS=0 to keep the run main-only. Learning Coach and
+# agent-b stay opt-in through NANOBOT_START_COMPANIONS.
+
+# Pinned runtime profiles are honored only when explicitly selected.
+select_runtime_profile() {
+  /usr/bin/env python3 - "$1" "$2" "$3" "${NANOBOT_RUNTIME_PROFILE:-}" <<'PY'
+import json, sys
+from pathlib import Path
+config, workspace, profiles_dir, explicit = sys.argv[1:5]
+def same(a, b):
+    return Path(a).expanduser().resolve() == Path(b).expanduser().resolve()
+candidates = [Path(explicit)] if explicit else []
+matches = []
+for path in candidates:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        continue
+    if same(data.get("config", ""), config) and same(data.get("workspace", ""), workspace):
+        matches.append(str(path.resolve()))
+if explicit and not matches:
+    sys.exit("NANOBOT_RUNTIME_PROFILE does not match NANOBOT_CONFIG/NANOBOT_WORKSPACE")
+if len(matches) > 1:
+    sys.exit("several runtime profiles match this config/workspace: " + ", ".join(matches))
+print(matches[0] if matches else "")
+PY
+}
+RUNTIME_PROFILE="$(select_runtime_profile "$CONFIG" "$WORKSPACE" "$SCRIPT_DIR/.local/runtimes")"
+if [[ -n "$RUNTIME_PROFILE" ]]; then
+  exec "$SCRIPT_DIR/scripts/runtime.sh" "$RUNTIME_PROFILE" up
+fi
 ENV_FILE="${NANOBOT_ENV_FILE:-$SCRIPT_DIR/.local/env}"
 
 # The actual launcher logic (config bootstrap, WebUI freshness rebuild,
@@ -102,6 +136,32 @@ if [[ -f "$PAGEAGENT_ENV_FILE" ]]; then
   set +a
 fi
 
+start_or_restart_persona_gateways() {
+  # Main config only. Learning Coach and agent-b call this script with another
+  # config, and the main-only scripts set NANOBOT_START_PERSONAS=0.
+  if [[ "${NANOBOT_START_PERSONAS:-1}" == "0" ]]; then
+    return 0
+  fi
+  if [[ "$CONFIG" != "$SCRIPT_DIR/.local/config.json" ]]; then
+    return 0
+  fi
+  local helper="$SCRIPT_DIR/.local/gateway-repo.sh"
+  if [[ ! -x "$helper" ]]; then
+    echo "warning: persona gateway helper not found: $helper" >&2
+    return 0
+  fi
+  local name
+  for name in rees elle genie heart testy; do
+    if "$helper" status "$name" >/dev/null 2>&1; then
+      echo "restarting persona gateway: $name"
+      "$helper" restart "$name" || echo "warning: $name did not restart" >&2
+    else
+      echo "starting persona gateway: $name"
+      "$helper" start "$name" || echo "warning: $name did not start" >&2
+    fi
+  done
+}
+
 start_companion_gateways() {
   # Off by default: this is a personal companion-agent feature left over from
   # before the fork was generalized, and its "warning: ... did not start"
@@ -125,6 +185,7 @@ start_companion_gateways() {
 "$NANOBOT_BIN" up --config "$CONFIG" --workspace "$WORKSPACE"
 status=$?
 if [[ "$status" == "0" ]]; then
+  start_or_restart_persona_gateways
   start_companion_gateways
 fi
 exit "$status"

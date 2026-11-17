@@ -187,8 +187,10 @@ class Session:
         for message in sliced:
             if message.get("_command"):
                 continue
-            content = message.get("content", "")
             role = message.get("role")
+            # A recorded correction (selective context) is the latest valid state of this answer.
+            fix = message.get("correction")
+            content = fix["answer"] if isinstance(fix, dict) and fix.get("answer") else message.get("content", "")
             if role == "assistant" and isinstance(content, str):
                 content = _sanitize_assistant_replay_text(content)
             # Synthesize an ``[image: path]`` breadcrumb from the persisted
@@ -242,10 +244,10 @@ class Session:
                     breadcrumbs = "\n".join(mcp_lines)
                     content = f"{content}\n{breadcrumbs}" if content else breadcrumbs
             if role == "assistant" and isinstance(content, str) and not content.strip():
-                if not any(key in message for key in ("tool_calls", "reasoning_content", "thinking_blocks")):
+                if not any(key in message for key in ("tool_calls", "reasoning_content", "thinking_blocks", "provider_state")):
                     continue
             entry: dict[str, Any] = {"role": message["role"], "content": content}
-            for key in ("tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks"):
+            for key in ("tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks", "provider_state"):
                 if key in message:
                     entry[key] = message[key]
             out.append(entry)

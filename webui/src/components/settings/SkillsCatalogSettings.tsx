@@ -1111,8 +1111,8 @@ function SkillCreateWizard({
 
   return (
     <Dialog open={open} onOpenChange={(next) => (!next ? close() : onOpenChange(true))}>
-      <DialogContent className="max-h-[min(90vh,58rem)] max-w-[92rem] overflow-hidden rounded-xl border-border/70 bg-popover p-0 shadow-sm">
-        <div className="border-b border-border/45 px-5 py-4">
+      <DialogContent className="relative flex max-h-[min(90vh,58rem)] max-w-[92rem] flex-col gap-0 overflow-hidden rounded-xl border-border/70 bg-popover p-0 shadow-sm sm:rounded-xl">
+        <div className="shrink-0 border-b border-border/45 px-5 py-4">
           <DialogHeader>
             <DialogTitle>New skill</DialogTitle>
             <DialogDescription>
@@ -1124,7 +1124,7 @@ function SkillCreateWizard({
             </DialogDescription>
           </DialogHeader>
         </div>
-        <div className="max-h-[calc(min(88vh,54rem)-8rem)] overflow-y-auto px-5 py-4">
+        <div className="min-h-0 overflow-y-auto px-5 py-4">
           {showPasteLanding ? (
             <div className="mx-auto flex max-w-2xl flex-col items-center gap-4 py-6 text-center">
               <div className="flex h-11 w-11 items-center justify-center rounded-full bg-primary/10 text-primary">
@@ -1526,7 +1526,7 @@ function SkillCreateWizard({
             </p>
           ) : null}
         </div>
-        <DialogFooter className="border-t border-border/45 px-5 py-4 sm:justify-between sm:space-x-0">
+        <DialogFooter className="shrink-0 border-t border-border/45 px-5 py-4 sm:justify-between sm:space-x-0">
           <div className="flex items-center gap-2">
             {showReview ? (
               <Button type="button" variant="ghost" onClick={backToPaste} disabled={busy}>
@@ -1770,12 +1770,17 @@ function ManagedSkillDetailPanel({
         </div>
       ) : (
         <div className="max-h-[min(62vh,40rem)] overflow-y-auto p-4">
-          <div className="grid gap-2 sm:grid-cols-4">
+          <div className="grid gap-2 sm:grid-cols-5">
             <MetaItem label="Risk" value={skill.risk_level} />
             <MetaItem label="Version" value={skill.version || "n/a"} />
+            <MetaItem label="Selections" value={String(skill.selection_count ?? 0)} />
             <MetaItem label="Usage" value={String(skill.usage_count)} />
             <MetaItem label="Success" value={successRateTitle(skill.success_rate)} />
           </div>
+          <p className="mt-2 text-xs text-muted-foreground">
+            Selections include unused choices. Usage records applied methods and legacy usage;
+            it does not establish success.
+          </p>
 
           <div className="mt-5 grid gap-4 xl:grid-cols-[minmax(0,3fr)_18rem]">
             <div className="space-y-5">
@@ -1805,12 +1810,17 @@ function ManagedSkillDetailPanel({
                     {detail.traces.slice(0, 5).map((trace) => (
                       <div key={trace.trace_id} className="rounded-xl bg-muted/30 px-3 py-2">
                         <div className="flex items-center justify-between gap-2 text-xs">
-                          <span className="truncate font-medium">{trace.selection_reason || "trace"}</span>
+                          <span className="truncate font-medium">
+                            {trace.phase ?? "legacy"} · {trace.selection_reason || "trace"}
+                          </span>
                           <span className="shrink-0 text-muted-foreground">{trace.gate_result ?? "none"}</span>
                         </div>
                         <p className="mt-1 truncate text-xs text-muted-foreground">
                           {trace.query_digest || trace.session_key || trace.trace_id}
                         </p>
+                        {trace.application_evidence && (
+                          <p className="mt-1 text-xs text-muted-foreground">{trace.application_evidence}</p>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -2069,7 +2079,7 @@ function MajorUpdateDialog({
 }) {
   return (
     <Dialog open={open} onOpenChange={(next) => (!next ? onCancel() : undefined)}>
-      <DialogContent className="max-w-xl rounded-xl border-border/70 bg-popover p-5 shadow-sm">
+      <DialogContent className="relative max-w-xl rounded-xl border-border/70 bg-popover p-5 shadow-sm sm:rounded-xl">
         <DialogHeader>
           <DialogTitle>Method changed</DialogTitle>
           <DialogDescription>

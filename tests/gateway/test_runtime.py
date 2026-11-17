@@ -3,6 +3,8 @@ import signal
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from nanobot.gateway import GatewayRuntime, GatewayRuntimePaths, GatewayStartOptions
 
 
@@ -49,7 +51,7 @@ def test_start_background_writes_state_and_child_command(tmp_path, monkeypatch):
         sleep=lambda _seconds: None,
     )
     monkeypatch.setattr(runtime, "_is_pid_running", lambda _pid: True)
-    monkeypatch.setattr(runtime, "_process_identity", lambda _pid: 12345)
+    monkeypatch.setattr(runtime, "_process_identity", lambda _pid: "start-12345")
 
     result = runtime.start_background(
         GatewayStartOptions(
@@ -79,7 +81,7 @@ def test_start_background_writes_state_and_child_command(tmp_path, monkeypatch):
     assert calls[0]["kwargs"]["start_new_session"] is True
     state = json.loads(runtime.paths.state_path.read_text(encoding="utf-8"))
     assert state["pid"] == 12345
-    assert state["identity"] == 12345
+    assert state["identity"] == "start-12345"
     assert state["port"] == 18790
 
 
@@ -110,7 +112,7 @@ def test_start_background_uses_windows_process_group_flags(tmp_path, monkeypatch
 def test_status_clears_stale_state(tmp_path, monkeypatch):
     runtime = GatewayRuntime(paths=_paths(tmp_path), platform_name="Linux")
     runtime.paths.run_dir.mkdir(parents=True)
-    runtime.paths.state_path.write_text('{"pid": 12345, "identity": 12345}', encoding="utf-8")
+    runtime.paths.state_path.write_text('{"pid": 12345, "identity": "start-12345"}', encoding="utf-8")
     monkeypatch.setattr(runtime, "_is_pid_running", lambda _pid: False)
 
     status = runtime.status()
@@ -123,9 +125,9 @@ def test_status_clears_stale_state(tmp_path, monkeypatch):
 def test_status_clears_state_when_pid_identity_changes(tmp_path, monkeypatch):
     runtime = GatewayRuntime(paths=_paths(tmp_path), platform_name="Linux")
     runtime.paths.run_dir.mkdir(parents=True)
-    runtime.paths.state_path.write_text('{"pid": 12345, "identity": 111}', encoding="utf-8")
+    runtime.paths.state_path.write_text('{"pid": 12345, "identity": "start-111"}', encoding="utf-8")
     monkeypatch.setattr(runtime, "_is_pid_running", lambda _pid: True)
-    monkeypatch.setattr(runtime, "_process_identity", lambda _pid: 222)
+    monkeypatch.setattr(runtime, "_process_identity", lambda _pid: "start-222")
 
     status = runtime.status()
 
@@ -137,9 +139,9 @@ def test_status_clears_state_when_pid_identity_changes(tmp_path, monkeypatch):
 def test_stop_terminates_recorded_process(tmp_path, monkeypatch):
     runtime = GatewayRuntime(paths=_paths(tmp_path), platform_name="Linux")
     runtime.paths.run_dir.mkdir(parents=True)
-    runtime.paths.state_path.write_text('{"pid": 12345, "identity": 12345}', encoding="utf-8")
+    runtime.paths.state_path.write_text('{"pid": 12345, "identity": "start-12345"}', encoding="utf-8")
     monkeypatch.setattr(runtime, "_is_pid_running", lambda _pid: True)
-    monkeypatch.setattr(runtime, "_process_identity", lambda _pid: 12345)
+    monkeypatch.setattr(runtime, "_process_identity", lambda _pid: "start-12345")
     terminated: list[int] = []
 
     def fake_terminate(pid, timeout_s):
@@ -158,9 +160,9 @@ def test_stop_terminates_recorded_process(tmp_path, monkeypatch):
 def test_stop_keeps_state_when_process_survives_timeout(tmp_path, monkeypatch):
     runtime = GatewayRuntime(paths=_paths(tmp_path), platform_name="Linux")
     runtime.paths.run_dir.mkdir(parents=True)
-    runtime.paths.state_path.write_text('{"pid": 12345, "identity": 12345}', encoding="utf-8")
+    runtime.paths.state_path.write_text('{"pid": 12345, "identity": "start-12345"}', encoding="utf-8")
     monkeypatch.setattr(runtime, "_is_pid_running", lambda _pid: True)
-    monkeypatch.setattr(runtime, "_process_identity", lambda _pid: 12345)
+    monkeypatch.setattr(runtime, "_process_identity", lambda _pid: "start-12345")
     monkeypatch.setattr(runtime, "_terminate", lambda _pid, timeout_s: False)
 
     result = runtime.stop(timeout_s=0)
@@ -212,3 +214,91 @@ def test_terminate_windows_falls_back_when_ctrl_break_is_rejected(tmp_path, monk
             },
         }
     ]
+
+
+def test_legacy_identity_is_unverified_and_cannot_stop_or_start(tmp_path, monkeypatch):
+    runtime = GatewayRuntime(paths=_paths(tmp_path))
+    for identity in [None, 12345, ""]:
+        runtime._write_state({"pid": 12345, "identity": identity})
+        monkeypatch.setattr(runtime, "_is_pid_running", lambda _pid: True)
+        monkeypatch.setattr(runtime, "_process_identity", lambda _pid: "new-start")
+        monkeypatch.setattr(runtime, "_terminate", lambda *a, **kw: pytest.fail("terminated"))
+        monkeypatch.setattr(runtime, "_popen", lambda *a, **kw: pytest.fail("spawned"))
+        assert runtime.status().reason == "identity_unverified"
+        assert not runtime.status().running
+        assert runtime.stop().message == "gateway_identity_unverified"
+        assert runtime.start_background(GatewayStartOptions(port=18790)).ok is False
+        assert runtime.restart(GatewayStartOptions(port=18790)).ok is False
+        assert runtime.paths.state_path.exists()
+
+
+def test_identity_probe_failure_preserves_evidence(tmp_path, monkeypatch):
+    runtime = GatewayRuntime(paths=_paths(tmp_path))
+    runtime._write_state({"pid": 12345, "identity": "old-start"})
+    monkeypatch.setattr(runtime, "_is_pid_running", lambda _pid: True)
+    monkeypatch.setattr(runtime, "_process_identity", lambda _pid: None)
+    assert runtime.status().reason == "identity_unverified"
+    assert runtime.paths.state_path.exists()
+
+
+def test_foreground_start_records_own_source_and_safe_settings(tmp_path, monkeypatch):
+    import hashlib
+    import os
+
+    paths = _paths(tmp_path)
+    config = tmp_path / "config.json"
+    config.write_text('{"secret": "never expose this"}')
+    monkeypatch.setattr(GatewayRuntime, "_process_identity", lambda self, pid: "current-start")
+    GatewayRuntime.refresh_state_pid(
+        paths=paths,
+        options=GatewayStartOptions(port=18790, config_path=str(config), workspace="workspace"),
+        active_settings={"model": "test-model", "api_key": "secret-test-value-94"},
+    )
+    state = json.loads(paths.state_path.read_text())
+    assert state["pid"] == os.getpid()
+    assert state["identity"] == "current-start"
+    assert state["port"] == 18790
+    evidence = state["startup"]
+    assert Path(evidence["source_root"]).name == "nanobot"
+    assert len(evidence["source_disk_sha256_at_start"]) == 64
+    assert evidence["config_disk_sha256_at_start"] == hashlib.sha256(config.read_bytes()).hexdigest()
+    assert evidence["active_settings_at_start"] == {"model": "test-model"}
+    config.write_text('{}')
+    assert json.loads(paths.state_path.read_text())["startup"] == evidence
+    assert "secret-test-value-94" not in paths.state_path.read_text()
+    assert "never expose" not in paths.state_path.read_text()
+
+
+def test_parent_preserves_child_startup_evidence(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    runtime = GatewayRuntime(paths=paths, sleep=lambda _: None)
+    def spawn(*args, **kwargs):
+        runtime._write_state({"pid": 12345, "identity": "start", "startup": {"source_root": "child-source"}})
+        return FakeProcess()
+    monkeypatch.setattr(runtime, "_popen", spawn)
+    monkeypatch.setattr(runtime, "_is_pid_running", lambda _: True)
+    monkeypatch.setattr(runtime, "_process_identity", lambda _: "start")
+    result = runtime.start_background(GatewayStartOptions(port=18790))
+    assert result.status.startup == {"source_root": "child-source"}
+
+
+def test_darwin_identity_uses_start_time_not_process_group(tmp_path):
+    def probe(args, **kwargs):
+        assert args == ["ps", "-p", "12345", "-o", "lstart="]
+        assert kwargs["timeout"] == 2
+        return subprocess.CompletedProcess(args, 0, stdout="Mon Nov 16 10:00:00 2026\n")
+    runtime = GatewayRuntime(paths=_paths(tmp_path), platform_name="Darwin", subprocess_run=probe)
+    assert runtime._process_identity(12345) == "posix:Mon Nov 16 10:00:00 2026"
+
+
+def test_linux_identity_handles_parentheses_in_process_name(tmp_path, monkeypatch):
+    fields = ['S'] + ['0'] * 18 + ['987654']
+    def read_text(path, *args, **kwargs):
+        if str(path) == '/proc/12345/stat':
+            return '12345 (worker (name)) ' + ' '.join(fields)
+        if str(path) == '/proc/sys/kernel/random/boot_id':
+            return 'boot-id\n'
+        raise FileNotFoundError(path)
+    monkeypatch.setattr(Path, 'read_text', read_text)
+    runtime = GatewayRuntime(paths=_paths(tmp_path), platform_name='Linux')
+    assert runtime._process_identity(12345) == 'linux:boot-id:987654'

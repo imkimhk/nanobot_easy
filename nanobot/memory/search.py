@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import re
 import sqlite3
@@ -384,21 +383,33 @@ class MemorySearcher:
 
 
 def format_search_result(result: SearchResult) -> str:
+    lines = [
+        "Memory Search Result",
+        "execution_status: completed",
+        f"query: {result.query}",
+        "scope: runtime-authorized conversation memory",
+        "coverage: this query and scope only; not proof that a record does not exist",
+        f"candidates: {result.total_candidates}",
+        f"returned_windows: {len(result.windows)}",
+    ]
     if not result.windows:
-        return "Memory Search Result\nNo matching scoped memory events found."
+        if result.total_candidates:
+            lines.extend(["result_status: no_evidence_returned",
+                          "Candidates existed, but no evidence was returned; absence is unverified."])
+        else:
+            lines.extend(["result_status: no_matches", "No matching scoped memory events found."])
+        return "\n".join(lines)
     rows, omitted_events = _compact_rows_for_display(result.windows, result.query)
     rows, budget_omitted = _apply_row_display_budget(rows, DISPLAY_TOKEN_BUDGET)
     omitted_events += budget_omitted
     display_tokens = sum(_token_count(row["snippet"]) + 24 for row in rows)
-    lines = [
-        "Memory Search Result",
-        f"query: {result.query}",
-        f"candidates: {result.total_candidates}",
+    lines.extend([
+        "result_status: candidates_returned",
         f"context_tokens_estimate: {display_tokens}",
         f"retrieved_context_tokens_estimate: {result.context_tokens}",
         f"display_token_budget: {DISPLAY_TOKEN_BUDGET}",
         "mode: compact_snippets",
-    ]
+    ])
     for idx, row in enumerate(rows, start=1):
         lines.append("")
         lines.append(f"Result {idx}")

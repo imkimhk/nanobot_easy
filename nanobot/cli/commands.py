@@ -1351,7 +1351,7 @@ def _run_gateway(
 
     # Self-heal the gateway state file with the current PID after any restart.
     from nanobot.config.loader import get_config_path
-    from nanobot.gateway.runtime import GatewayRuntime, GatewayRuntimePaths
+    from nanobot.gateway.runtime import GatewayRuntime, GatewayRuntimePaths, GatewayStartOptions
 
     config_path = str(get_config_path().resolve(strict=False))
     GatewayRuntime.refresh_state_pid(
@@ -1360,7 +1360,15 @@ def _run_gateway(
             if not is_default_workspace(config.workspace_path)
             else None,
             config_path=config_path,
-        )
+        ),
+        options=GatewayStartOptions(
+            port=port, workspace=str(config.workspace_path), config_path=config_path,
+        ),
+        active_settings={
+            "model": config.agents.defaults.model,
+            "provider": config.agents.defaults.provider,
+            "context_selection_enabled": config.agents.defaults.context_selection.enabled,
+        },
     )
 
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
@@ -2267,6 +2275,69 @@ def channels_login(
 plugins_app = typer.Typer(help="Manage optional nanobot features")
 app.add_typer(plugins_app, name="plugins")
 
+stepwise_app = typer.Typer(help="Apply stepwise reasoning (Genie method) to an agent explicitly")
+app.add_typer(stepwise_app, name="stepwise")
+
+
+@stepwise_app.command("apply")
+def stepwise_apply(
+    config_path: str = typer.Option(..., "--config", "-c", help="Agent config to apply it to"),
+    layout: str = typer.Option("auto", "--layout", help="auto | two_call | compact | fine"),
+):
+    """Apply the Genie method to one agent (writes a dated block, keeps a backup)."""
+    from nanobot.cli.stepwise import apply_stepwise
+
+    result = apply_stepwise(Path(config_path), layout=layout)
+    console.print(f"[green]지니 방식 적용[/green]: {result['agent']} ({result['config']})")
+    console.print(f"  적용 시각 {result['appliedAt']} · 배치 {result['layout']}")
+    console.print(f"  백업 {result['backup']}")
+    console.print("  실행 중인 에이전트(gateway)를 재시작해야 반영됩니다.")
+
+
+@stepwise_app.command("remove")
+def stepwise_remove(
+    config_path: str = typer.Option(..., "--config", "-c", help="Agent config to remove it from"),
+):
+    """Turn the Genie method off for one agent (the record of when stays)."""
+    from nanobot.cli.stepwise import remove_stepwise
+
+    result = remove_stepwise(Path(config_path))
+    console.print(f"[yellow]지니 방식 해제[/yellow]: {result['agent']} ({result['config']})")
+    console.print(f"  해제 시각 {result['removedAt']} · 백업 {result['backup']}")
+    console.print("  실행 중인 에이전트(gateway)를 재시작해야 반영됩니다.")
+
+
+@stepwise_app.command("status")
+def stepwise_status_command(
+    configs: list[str] = typer.Argument(None, help="Agent configs (default: every config*.json in --dir)"),
+    directory: str | None = typer.Option(None, "--dir", help="Directory of agent configs (default ./.local or ~/.nanobot)"),
+):
+    """List which agents have the Genie method applied, since when."""
+    from nanobot.cli.stepwise import find_agent_configs, stepwise_status
+
+    if configs:
+        paths = [Path(item).expanduser().resolve() for item in configs]
+    else:
+        base = Path(directory).expanduser() if directory else (
+            Path(".local") if Path(".local").is_dir() else Path.home() / ".nanobot"
+        )
+        paths = find_agent_configs(base.resolve())
+    if not paths:
+        console.print("에이전트 설정을 찾지 못했습니다.")
+        raise typer.Exit(1)
+    for row in stepwise_status(paths):
+        if row.get("error"):
+            console.print(f"{row['agent']:<28} 읽기 실패({row['error']})  {row['config']}")
+            continue
+        if row["enabled"]:
+            state = f"[green]적용됨[/green] {row['applied_at'] or '-'} · {row['layout']}"
+        elif row.get("removed_at"):
+            state = f"해제됨 {row['removed_at']}"
+        else:
+            state = "미적용"
+        legacy = "  (reasoningEffort=none: 예전 방식 흔적, 적용 아님)" if row["legacy_none"] else ""
+        console.print(f"{row['agent']:<28} {state}  {row['model']}{legacy}")
+
 
 @plugins_app.command("list")
 def plugins_list(
@@ -2579,6 +2650,9 @@ def skill_stats(
     by_status = store.status_counts()
     console.print(f"DB: {store.db_path}")
     console.print(f"Skills: {sum(by_status.values())}")
+    rows = store.list_skills(include_deprecated=True)
+    console.print(f"Selections: {sum(int(row['selection_count']) for row in rows)}")
+    console.print(f"Usage: {sum(int(row['usage_count']) for row in rows)}")
     for status, count in sorted(by_status.items()):
         console.print(f"- {status}: {count}")
 
@@ -3100,11 +3174,13 @@ _LOGOUT_HANDLERS: dict[str, Callable[[], None]] = {}
 
 _PROVIDER_DISPLAY: dict[str, str] = {
     "openai_codex": "OpenAI Codex",
+    "xai_grok": "xAI Grok",
     "github_copilot": "GitHub Copilot",
 }
 
 _OAUTH_PROVIDER_DEFAULT_MODELS: dict[str, str] = {
     "openai_codex": "openai-codex/gpt-5.4-mini",
+    "xai_grok": "xai-grok/grok-4.5",
     "github_copilot": "github-copilot/gpt-5.4-mini",
 }
 
@@ -3158,6 +3234,8 @@ def _set_oauth_provider_as_main(
     config.agents.defaults.model_preset = None
     config.agents.defaults.provider = provider_name
     config.agents.defaults.model = selected_model
+    if provider_name == "xai_grok" and selected_model == _OAUTH_PROVIDER_DEFAULT_MODELS["xai_grok"]:
+        config.agents.defaults.context_window_tokens = 500_000
     save_config(config, resolved_config_path)
 
     saved_path = resolved_config_path or get_config_path()
@@ -3170,7 +3248,7 @@ def _set_oauth_provider_as_main(
 
 @provider_app.command("login")
 def provider_login(
-    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
+    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'xai-grok', 'github-copilot')"),
     set_main: bool = typer.Option(
         False,
         "--set-main",
@@ -3193,6 +3271,11 @@ def provider_login(
         console.print(f"[red]Login not implemented for {spec.label}[/red]")
         raise typer.Exit(1)
 
+    if config:
+        from nanobot.config.loader import set_config_path
+
+        set_config_path(Path(config).expanduser().resolve())
+
     console.print(f"{__logo__} OAuth Login - {spec.label}\n")
     handler()
     if set_main or model:
@@ -3201,7 +3284,8 @@ def provider_login(
 
 @provider_app.command("logout")
 def provider_logout(
-    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
+    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'xai-grok', 'github-copilot')"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
 ):
     """Log out from an OAuth provider."""
     spec = _resolve_oauth_provider(provider)
@@ -3210,6 +3294,13 @@ def provider_logout(
     if not handler:
         console.print(f"[red]Logout not implemented for {spec.label}[/red]")
         raise typer.Exit(1)
+
+    if config:
+        from nanobot.config.loader import set_config_path
+
+        resolved_config_path = Path(config).expanduser().resolve()
+        set_config_path(resolved_config_path)
+        console.print(f"[dim]Using config: {resolved_config_path}[/dim]")
 
     console.print(f"{__logo__} OAuth Logout - {spec.label}\n")
     handler()
@@ -3298,6 +3389,52 @@ def _delete_oauth_files(token_path: Path, provider_label: str) -> None:
             console.print(f"[dim]Removed: {path}[/dim]")
     for path, exc in skipped:
         console.print(f"[yellow]! Could not remove {path}: {exc}[/yellow]")
+
+
+@_register_login("xai_grok")
+def _login_xai_grok() -> None:
+    """Authenticate with xAI using the Grok subscription OAuth contract."""
+    from nanobot.config.loader import load_config, resolve_config_env_vars
+    from nanobot.providers.xai_oauth import get_xai_oauth_token, login_xai_oauth
+
+    try:
+        proxy = resolve_config_env_vars(load_config()).providers.xai_grok.proxy or None
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    token = None
+    with suppress(Exception):
+        token = get_xai_oauth_token(proxy=proxy)
+    if not (token and token.access):
+        console.print(
+            "[cyan]Starting xAI browser sign-in for your X Premium / Grok subscription...[/cyan]\n"
+        )
+        try:
+            token = login_xai_oauth(
+                print_fn=lambda message: console.print(message),
+                prompt_fn=lambda prompt: typer.prompt(prompt),
+                proxy=proxy,
+            )
+        except Exception as exc:
+            console.print(f"[red]Authentication error: {exc}[/red]")
+            raise typer.Exit(1) from exc
+    account = token.account_id or "xAI account"
+    console.print(f"[green]✓ Authenticated with xAI[/green]  [dim]{account}[/dim]")
+
+
+@_register_logout("xai_grok")
+def _logout_xai_grok() -> None:
+    """Clear local xAI OAuth credentials for this nanobot instance."""
+    from nanobot.providers.xai_oauth import get_xai_oauth_storage_path, logout_xai_oauth
+
+    token_path = get_xai_oauth_storage_path()
+    provider_label = _PROVIDER_DISPLAY["xai_grok"]
+    if logout_xai_oauth():
+        console.print(f"[green]✓ Logged out from {provider_label}[/green]")
+        console.print(f"[dim]Removed: {token_path}[/dim]")
+    else:
+        console.print(f"[yellow]! No local OAuth credentials found for {provider_label}[/yellow]")
 
 
 @_register_login("github_copilot")
