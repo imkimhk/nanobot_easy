@@ -2375,7 +2375,7 @@ class _FakeReq:
     """Minimal request stub with configurable headers."""
 
     def __init__(self, headers: dict[str, str] | None = None, *, path: str = "/"):
-        self.headers = headers or {}
+        self.headers = {"Host": "127.0.0.1:29900", **(headers or {})}
         self.path = path
 
 
@@ -2467,10 +2467,12 @@ def test_bootstrap_accepts_static_token_as_secret(bus: MagicMock) -> None:
 
 
 def test_bootstrap_ws_url_uses_forwarded_https_host(bus: MagicMock) -> None:
-    channel = _ch(bus, host="127.0.0.1", port=29931)
+    channel = _ch(bus, host="127.0.0.1", port=29931, tokenIssueSecret="proxy-secret",
+                  allowedHosts=["nanobot.example"])
     resp = channel.gateway.http._handle_bootstrap(
         _LOCAL,
-        _FakeReq({"Host": "nanobot.example", "X-Forwarded-Proto": "https"}),
+        _FakeReq({"Host": "nanobot.example", "X-Forwarded-Proto": "https",
+                  "Authorization": "Bearer proxy-secret"}),
     )
     assert resp.status_code == 200
     body = json.loads(resp.body)
@@ -2554,3 +2556,27 @@ def test_bootstrap_secret_also_enforced_on_localhost(bus: MagicMock) -> None:
     channel = _ch(bus, host="0.0.0.0", tokenIssueSecret="s3cret")
     resp = channel.gateway.http._handle_bootstrap(_LOCAL, _NO_HEADERS)
     assert resp.status_code == 401
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retain", [False, True])
+async def test_delete_session_memory_choice(bus, tmp_path, retain):
+    from nanobot.memory.event_store import ConversationEventStore
+    from nanobot.memory.models import MemoryScope
+
+    manager = SessionManager(tmp_path)
+    key = "websocket:security-delete-choice"
+    manager.save(manager.get_or_create(key))
+    store = ConversationEventStore(tmp_path)
+    scope = MemoryScope.from_runtime(owner_id="actual-chat-user", workspace_id=str(tmp_path), agent_id="main")
+    event = store.append_event(scope=scope, conversation_id=key, session_id=key,
+                              actor="user", event_type="USER_MESSAGE", content="synthetic deletion fixture")
+    channel = _ch(bus, session_manager=manager, workspace_path=tmp_path, port=_free_port())
+    request = _FakeReq(path=f"/api/sessions/{key}/delete?delete_memory={'false' if retain else 'true'}")
+    channel.gateway.http.check_api_token = lambda _: True
+    response = channel.gateway.http._handle_session_delete(request, key)
+    assert response.status_code == 200
+    payload = json.loads(response.body)
+    assert payload["deleted"]
+    assert payload["memory_retained"] is retain
+    assert payload["memory_events_deleted"] == (0 if retain else 1)
+    assert bool(store.get_events(scope, [event.event_id])) is retain

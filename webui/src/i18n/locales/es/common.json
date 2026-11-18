@@ -589,6 +589,7 @@
         "none": "Sin próxima ejecución"
       },
       "message": {
+    "loadRemoteMedia": "Load external media",
         "showMore": "Mostrar mensaje completo",
         "showLess": "Mostrar menos"
       },
@@ -760,6 +761,8 @@
     }
   },
   "deleteConfirm": {
+    "deleteMemory": "Also delete this chat’s raw memory and search indexes",
+    "memoryNotice": "Curated memory summaries and backups are retained separately.",
     "title": "¿Eliminar este chat?",
     "description": "Esta acción no se puede deshacer.",
     "cancel": "Cancelar",

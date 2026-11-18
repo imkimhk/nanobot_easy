@@ -221,7 +221,8 @@ class GatewayHTTPHandler:
         )
 
     def workspace_controls_available(self, connection: Any) -> bool:
-        return self._runtime_surface == "native" or _is_localhost(connection)
+        return self.config.workspace_controls_enabled and (
+            self._runtime_surface == "native" or _is_localhost(connection))
 
     # -- Token management ---------------------------------------------------
 
@@ -232,6 +233,8 @@ class GatewayHTTPHandler:
 
     async def dispatch(self, connection: Any, request: WsRequest) -> Any | None:
         """Route an HTTP request. Returns Response or None."""
+        if not self._request_origin_allowed(request):
+            return _http_error(403, "Untrusted Host or Origin")
         got, _ = _parse_request_path(request.path)
         started = time.perf_counter()
         response: Any | None = None
@@ -311,12 +314,24 @@ class GatewayHTTPHandler:
 
     # -- Token issue --------------------------------------------------------
 
+    def _request_origin_allowed(self, request: Any) -> bool:
+        from nanobot.webui.http_utils import request_origin_allowed
+
+        return request_origin_allowed(
+            request.headers, host=self.config.host, port=self.config.port,
+            allowed_hosts=self.config.allowed_hosts, allowed_origins=self.config.allowed_origins,
+        )
+
     def _handle_token_issue(self, connection: Any, request: Any) -> Any:
         secret = self.config.token_issue_secret.strip() or self.config.token.strip()
         if secret:
             if not _issue_route_secret_matches(request.headers, secret):
                 return connection.respond(401, "Unauthorized")
         else:
+            from nanobot.webui.http_utils import is_local_browser_request
+
+            if not is_local_browser_request(connection, request.headers):
+                return _http_error(403, "token issuance requires a trusted local request")
             self._log.warning(
                 "token_issue_path is set but token_issue_secret is empty; "
                 "any client can obtain connection tokens — set token_issue_secret for production."
@@ -339,6 +354,13 @@ class GatewayHTTPHandler:
                 return _http_error(401, "Unauthorized")
         elif not _is_localhost(connection):
             return _http_error(403, "bootstrap is localhost-only")
+        if not self._request_origin_allowed(request):
+            return _http_error(403, "Untrusted Host or Origin")
+        if not secret:
+            from nanobot.webui.http_utils import is_local_browser_request
+
+            if not is_local_browser_request(connection, request.headers):
+                return _http_error(403, "bootstrap requires a trusted local request")
 
         if not self.tokens.can_issue(include_api_token=True):
             return _http_response(
@@ -552,6 +574,16 @@ class GatewayHTTPHandler:
                     "automations": serialize_automation_jobs(automation_jobs),
                 }
             )
+        delete_memory = (_query_first(query, "delete_memory") or "true").lower()
+        memory_deleted = 0
+        if delete_memory not in {"0", "false", "no"}:
+            from nanobot.memory.event_store import DEFAULT_DB_NAME, ConversationEventStore
+
+            workspace = self.skills_workspace_path
+            if (workspace / "memory" / DEFAULT_DB_NAME).is_file():
+                memory_deleted = ConversationEventStore(workspace).purge_session(decoded_key)
+        deleted = self.session_manager.delete_session(decoded_key)
+        delete_webui_thread(decoded_key)
         if automation_jobs:
             for job in automation_jobs:
                 if isinstance(job, LocalTrigger):
@@ -559,9 +591,11 @@ class GatewayHTTPHandler:
                         self.local_trigger_store.delete(job.id)
                 elif self.cron_service is not None:
                     self.cron_service.remove_job(job.id)
-        deleted = self.session_manager.delete_session(decoded_key)
-        delete_webui_thread(decoded_key)
-        return _http_json_response({"deleted": bool(deleted)})
+        return _http_json_response({
+            "deleted": bool(deleted),
+            "memory_events_deleted": memory_deleted,
+            "memory_retained": delete_memory in {"0", "false", "no"},
+        })
 
     # -- Automation routes --------------------------------------------------
 

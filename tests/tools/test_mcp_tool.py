@@ -325,7 +325,8 @@ async def test_execute_wraps_mcp_is_error_result() -> None:
 
     result = await wrapper.execute()
 
-    assert result == "Error: server-side MCP failure"
+    assert result.startswith("Error: server-side MCP failure")
+    assert result.execution_unknown is True
     assert is_tool_error_result(wrapper.name, result)
 
 
@@ -338,12 +339,13 @@ async def test_execute_contains_malformed_success_result() -> None:
 
     result = await wrapper.execute()
 
-    assert result == "(MCP tool returned malformed content: TypeError)"
+    assert result.startswith("(MCP tool returned malformed content: TypeError)")
+    assert result.execution_unknown is True
     assert is_tool_error_result(wrapper.name, result)
 
 
 @pytest.mark.asyncio
-async def test_registry_adds_retry_hint_to_malformed_mcp_result() -> None:
+async def test_registry_preserves_uncertainty_in_malformed_mcp_result() -> None:
     async def call_tool(_name: str, arguments: dict) -> object:
         return SimpleNamespace(content=None)
 
@@ -355,7 +357,9 @@ async def test_registry_adds_retry_hint_to_malformed_mcp_result() -> None:
 
     assert is_tool_error_result(wrapper.name, result)
     assert "MCP tool returned malformed content" in result
-    assert "Analyze the error above and try a different approach" in result
+    assert "inspect remote state" in result
+    assert "try a different approach" not in result
+    assert result.execution_unknown is True
 
 
 @pytest.mark.asyncio
@@ -438,7 +442,8 @@ async def test_execute_returns_timeout_message() -> None:
 
     result = await wrapper.execute()
 
-    assert result == "(MCP tool call timed out after 0.01s)"
+    assert result.startswith("(MCP tool call timed out after 0.01s)")
+    assert result.execution_unknown is True
     assert is_tool_error_result(wrapper.name, result)
 
 
@@ -451,7 +456,8 @@ async def test_execute_handles_server_cancelled_error() -> None:
 
     result = await wrapper.execute()
 
-    assert result == "(MCP tool call was cancelled)"
+    assert result.startswith("(MCP tool call was cancelled)")
+    assert result.execution_unknown is True
     assert is_tool_error_result(wrapper.name, result)
 
 
@@ -483,7 +489,8 @@ async def test_execute_handles_generic_exception() -> None:
 
     result = await wrapper.execute()
 
-    assert result == "(MCP tool call failed: RuntimeError)"
+    assert result.startswith("(MCP tool call failed: RuntimeError)")
+    assert result.execution_unknown is True
     assert is_tool_error_result(wrapper.name, result)
 
 
@@ -535,6 +542,22 @@ async def test_connect_mcp_servers_enabled_tools_defaults_to_all(
         await stack.aclose()
 
     assert registry.tool_names == ["mcp_test_demo", "mcp_test_other"]
+
+
+@pytest.mark.parametrize("retry_names, expected", [
+    ([], False), (["demo"], True), (["mcp_test_demo"], True),
+    (["*"], False), (["mcp_test_*"], False), (["missing"], False),
+])
+async def test_retry_policy_uses_only_exact_operator_names(fake_mcp_runtime, retry_names, expected):
+    fake_mcp_runtime["session"] = _make_fake_session(["demo", "other"])
+    registry = ToolRegistry()
+    cfg = MCPServerConfig.model_validate({"command": "fake", "retrySafeTools": retry_names})
+    stacks = await connect_mcp_servers({"test": cfg}, registry)
+    for stack in stacks.values():
+        await stack.aclose()
+    assert registry.get("mcp_test_demo")._retry_safe is expected
+    assert registry.get("mcp_test_other")._retry_safe is False
+    assert registry.get("mcp_test_demo").read_only is False
 
 
 @pytest.mark.asyncio
@@ -704,7 +727,7 @@ async def test_connect_mcp_servers_logs_stdio_pollution_hint(
         yield  # pragma: no cover
 
     monkeypatch.setattr(sys.modules["mcp.client.stdio"], "stdio_client", _broken_stdio_client)
-    monkeypatch.setattr("nanobot.agent.tools.mcp.logger.exception", _error)
+    monkeypatch.setattr("nanobot.agent.tools.mcp.logger.warning", _error)
 
     registry = ToolRegistry()
     stacks = await connect_mcp_servers({"gh": MCPServerConfig(command="github-mcp")}, registry)

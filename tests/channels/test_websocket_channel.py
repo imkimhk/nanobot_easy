@@ -85,7 +85,7 @@ def _ch(bus: Any, **kw: Any) -> WebSocketChannel:
 def _basic_handler(bus: Any, **kw: Any) -> GatewayServices:
     cfg = WebSocketConfig.model_validate({
         "enabled": True, "allowFrom": ["*"],
-        "host": "127.0.0.1", "port": _PORT,
+        "host": "127.0.0.1", "port": kw.get("port", _PORT),
         "path": "/ws", "websocketRequiresToken": False,
     })
     return build_gateway_services(
@@ -2099,7 +2099,7 @@ async def test_bootstrap_exposes_native_surface(bus: MagicMock) -> None:
             "websocketRequiresToken": True,
         },
         bus,
-        gateway=_basic_handler(bus, runtime_surface="native", runtime_capabilities_overrides={"can_pick_folder": True}),
+        gateway=_basic_handler(bus, port=port, runtime_surface="native", runtime_capabilities_overrides={"can_pick_folder": True}),
     )
 
     server_task = asyncio.create_task(channel.start())

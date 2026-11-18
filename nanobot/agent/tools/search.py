@@ -114,10 +114,15 @@ class _SearchTool(_FsTool):
             return
 
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = sorted(d for d in dirnames if d not in self._IGNORE_DIRS)
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if d not in self._IGNORE_DIRS and self._is_visible_entry(Path(dirpath) / d)
+            )
             current = Path(dirpath)
             for filename in sorted(filenames):
-                yield current / filename
+                candidate = current / filename
+                if self._is_visible_entry(candidate):
+                    yield candidate
 
 
 class FindFilesTool(_SearchTool):
@@ -197,12 +202,17 @@ class FindFilesTool(_SearchTool):
         if include_dirs:
             yield root
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = sorted(d for d in dirnames if d not in self._IGNORE_DIRS)
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if d not in self._IGNORE_DIRS and self._is_visible_entry(Path(dirpath) / d)
+            )
             current = Path(dirpath)
             if include_dirs and current != root:
                 yield current
             for filename in sorted(filenames):
-                yield current / filename
+                candidate = current / filename
+                if self._is_visible_entry(candidate):
+                    yield candidate
 
     async def execute(
         self,

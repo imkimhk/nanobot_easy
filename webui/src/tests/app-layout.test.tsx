@@ -660,6 +660,7 @@ describe("App layout", () => {
       when_not_to_use: "",
       required_tools: [],
       usage_count: 4,
+      selection_count: 9,
       success_count: 3,
       failure_count: 1,
       routing_failure_count: 0,
@@ -726,6 +727,8 @@ describe("App layout", () => {
           query_digest: "review this diff",
           candidates: [],
           selected_skill: "review-helper",
+          phase: "applied",
+          application_evidence: "Reviewed the diff and reported its concrete findings.",
           selection_reason: "cold",
           executed_by: "main",
           wave_no: null,
@@ -854,6 +857,10 @@ describe("App layout", () => {
     expect(screen.getByText("Ready for review and registration.")).toBeInTheDocument();
     expect(screen.getAllByText("review-helper").length).toBeGreaterThan(0);
     expect(await screen.findByText("review this diff")).toBeInTheDocument();
+    expect(screen.getByText("Selections").parentElement).toHaveTextContent("9");
+    expect(screen.getByText("Usage").parentElement).toHaveTextContent("4");
+    expect(screen.getByText("applied · cold")).toBeInTheDocument();
+    expect(screen.getByText("Reviewed the diff and reported its concrete findings.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /verified로 승격/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Run test" }));
@@ -1442,7 +1449,7 @@ describe("App layout", () => {
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
 
     await waitFor(() =>
-      expect(deleteChatSpy).toHaveBeenCalledWith("websocket:chat-a"),
+      expect(deleteChatSpy).toHaveBeenCalledWith("websocket:chat-a", { deleteAutomations: false, deleteMemory: true }),
     );
     await waitFor(() =>
       expect(
@@ -1515,6 +1522,7 @@ describe("App layout", () => {
     await waitFor(() =>
       expect(deleteChatSpy).toHaveBeenCalledWith("websocket:chat-a", {
         deleteAutomations: true,
+        deleteMemory: true,
       }),
     );
     expect(deleteChatSpy).toHaveBeenCalledTimes(1);
@@ -2179,9 +2187,9 @@ describe("App layout", () => {
 
     expect(await screen.findByRole("heading", { name: "Overview" })).toBeInTheDocument();
     expect(document.title).toBe("Settings · nanobot");
-    expect(screen.getByTestId("overview-logo-openai")).toBeInTheDocument();
-    expect(screen.getByTestId("overview-logo-brave")).toBeInTheDocument();
-    expect(screen.getByTestId("overview-logo-openrouter")).toBeInTheDocument();
+    expect(screen.queryByTestId("overview-logo-openai")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("overview-logo-brave")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("overview-logo-openrouter")).not.toBeInTheDocument();
     expect(screen.queryByTestId("overview-logo-nanobot-gateway")).not.toBeInTheDocument();
     expect(screen.queryByTestId("overview-logo-nanobot-workspace")).not.toBeInTheDocument();
     expect(screen.queryByRole("navigation", { name: "Sidebar navigation" })).not.toBeInTheDocument();
@@ -2208,7 +2216,7 @@ describe("App layout", () => {
     expect(screen.getByText("Brand logos")).toBeInTheDocument();
     expect(screen.getByRole("switch", { name: "Brand logos" })).toBeInTheDocument();
     fireEvent.click(within(settingsNav).getByRole("button", { name: "Models" }));
-    expect(screen.queryByText("AI")).not.toBeInTheDocument();
+    expect(screen.getAllByText("AI").length).toBeGreaterThan(0);
     expect(screen.getByText("Current configuration")).toBeInTheDocument();
     expect(screen.queryByText("Presets")).not.toBeInTheDocument();
     fireEvent.pointerDown(screen.getByRole("button", { name: "Current configuration" }));
@@ -2232,7 +2240,7 @@ describe("App layout", () => {
       .find((element) => !settingsNav.contains(element));
     expect(autoProviderButton).toBeTruthy();
     fireEvent.pointerDown(autoProviderButton!);
-    expect(screen.getAllByTestId("provider-picker-logo-openai").length).toBeGreaterThan(0);
+    expect(screen.queryAllByTestId("provider-picker-logo-openai")).toHaveLength(0);
     fireEvent.click(screen.getByRole("menuitem", { name: /Auto/ }));
     const openModelPicker = () => {
       const modelButtons = screen.getAllByRole("button", { name: /openai\/gpt-4o/ });
@@ -2250,7 +2258,7 @@ describe("App layout", () => {
     fireEvent.click(screen.getAllByText("openai/gpt-4o")[0]);
     expect(screen.getByText("OpenRouter")).toBeInTheDocument();
     expect(screen.getByText("Ant Ling")).toBeInTheDocument();
-    expect(screen.getByTestId("provider-logo-openai")).toBeInTheDocument();
+    expect(screen.queryByTestId("provider-logo-openai")).not.toBeInTheDocument();
     expect(screen.getByText(/Product names, logos, and brands/)).toBeInTheDocument();
     expect(screen.getAllByText("Not configured").length).toBeGreaterThan(0);
     const clickProviderRow = (label: string) => {
@@ -2287,7 +2295,7 @@ describe("App layout", () => {
     expect(screen.getByText("Search provider")).toBeInTheDocument();
     expect(screen.getByRole("switch", { name: "Jina reader" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Brave Search/ })).toBeInTheDocument();
-    expect(screen.getByTestId("provider-picker-logo-brave")).toBeInTheDocument();
+    expect(screen.queryByTestId("provider-picker-logo-brave")).not.toBeInTheDocument();
     expect(screen.getByText("BSAo••••ew20")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
     fireEvent.change(screen.getByPlaceholderText("Leave blank to keep the current key"), {

@@ -94,6 +94,9 @@ class WebSocketConfig(Base):
     token_ttl_s: int = Field(default=300, ge=30, le=86_400)
     websocket_requires_token: bool = True
     allow_from: list[str] = Field(default_factory=lambda: ["*"])
+    allowed_hosts: list[str] = Field(default_factory=list)
+    allowed_origins: list[str] = Field(default_factory=list)
+    workspace_controls_enabled: bool = True
     streaming: bool = True
     # Default 36 MB, upper 40 MB: supports up to 4 images at ~6 MB each after
     # client-side Worker normalization (see webui Composer). 4 × 6 MB × 1.37
@@ -416,6 +419,13 @@ class WebSocketChannel(BaseChannel):
     async def _dispatch_http(self, connection: Any, request: WsRequest) -> Any:
         """Route an inbound HTTP request to the HTTP handler or WS upgrade."""
         got, query = _parse_request_path(request.path)
+        from nanobot.webui.http_utils import request_origin_allowed
+
+        if not request_origin_allowed(
+            request.headers, host=self.config.host, port=self.config.port,
+            allowed_hosts=self.config.allowed_hosts, allowed_origins=self.config.allowed_origins,
+        ):
+            return connection.respond(403, "Untrusted Host or Origin")
 
         # WebSocket upgrade — channel handles this itself
         expected_ws = self._expected_path()

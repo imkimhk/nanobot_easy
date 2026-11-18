@@ -62,6 +62,37 @@ def host_for_url(host: str, port: int) -> str:
     return f"{host}:{port}"
 
 
+def request_origin_allowed(
+    headers: Any, *, host: str, port: int,
+    allowed_hosts: list[str] | tuple[str, ...] = (),
+    allowed_origins: list[str] | tuple[str, ...] = (),
+) -> bool:
+    """Reject DNS rebinding and cross-site requests before issuing/using UI tokens."""
+    authority = case_insensitive_header(headers, "Host").lower()
+    if not authority or safe_host_header(authority) != authority:
+        return False
+    hosts = {str(value).strip().lower() for value in allowed_hosts}
+    if host not in {"0.0.0.0", "::"}:
+        hosts.update({host.lower(), host_for_url(host, port).lower()})
+    if is_loopback_host(host) or host in {"0.0.0.0", "::"}:
+        hosts.update({"localhost", "127.0.0.1", "[::1]",
+                      f"localhost:{port}", f"127.0.0.1:{port}", f"[::1]:{port}"})
+    if authority not in hosts:
+        return False
+    origin = case_insensitive_header(headers, "Origin")
+    if not origin:
+        return True
+    if origin in allowed_origins:
+        return True
+    try:
+        parsed = urlparse(origin)
+    except ValueError:
+        return False
+    return (parsed.scheme in {"http", "https"} and parsed.netloc.lower() == authority
+            and not parsed.username and not parsed.password and parsed.path in {"", "/"}
+            and not parsed.query and not parsed.fragment)
+
+
 def http_json_response(data: dict[str, Any], *, status: int = 200) -> Response:
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
     headers = Headers(
@@ -70,6 +101,9 @@ def http_json_response(data: dict[str, Any], *, status: int = 200) -> Response:
             ("Connection", "close"),
             ("Content-Length", str(len(body))),
             ("Content-Type", "application/json; charset=utf-8"),
+            ("Cache-Control", "no-store"),
+            ("Referrer-Policy", "no-referrer"),
+            ("X-Content-Type-Options", "nosniff"),
         ]
     )
     reason = http.HTTPStatus(status).phrase
@@ -88,8 +122,14 @@ def http_response(
         ("Connection", "close"),
         ("Content-Length", str(len(body))),
         ("Content-Type", content_type),
+        ("Referrer-Policy", "no-referrer"),
+        ("X-Content-Type-Options", "nosniff"),
+        ("X-DNS-Prefetch-Control", "off"),
+        ("Content-Security-Policy", "object-src 'none'; base-uri 'self'; frame-ancestors 'none'"),
     ]
     if extra_headers:
+        replaced = {name.lower() for name, _ in extra_headers}
+        headers = [(name, value) for name, value in headers if name.lower() not in replaced]
         headers.extend(extra_headers)
     reason = http.HTTPStatus(status).phrase
     return Response(status, reason, Headers(headers), body)

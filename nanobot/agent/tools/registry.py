@@ -24,7 +24,7 @@ INTENT_METADATA_REQUIRED_TOOLS = frozenset((
 
 # Some tools are only state-changing for particular actions. Keep their metadata
 # fields visible in schemas, but enforce the fields only for changing actions.
-INTENT_METADATA_CONDITIONAL_TOOLS = frozenset(("cron", "my"))
+INTENT_METADATA_CONDITIONAL_TOOLS = frozenset(("cron", "exec_job", "my"))
 
 _INTENT_METADATA_SCHEMA: dict[str, dict[str, Any]] = {
     "intent_summary": {
@@ -150,6 +150,8 @@ class ToolRegistry:
             return params.get("action") in {"add", "remove"}
         if name == "my" and isinstance(params, dict):
             return params.get("action") == "set"
+        if name == "exec_job" and isinstance(params, dict):
+            return params.get("action") == "kill"
         return False
 
     @classmethod
@@ -288,6 +290,10 @@ class ToolRegistry:
             assert tool is not None  # guarded by prepare_call()
             result = await tool.execute(**params)
             if is_tool_error_result(name, result):
+                if getattr(result, "execution_unknown", False):
+                    # Preserve the uncertainty marker and the state-inspection
+                    # instruction instead of appending a generic retry hint.
+                    return result
                 return ToolResult.error(str(result) + hint)
             return result
         except Exception as e:

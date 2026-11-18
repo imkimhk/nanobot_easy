@@ -589,6 +589,7 @@
         "none": "没有下次运行"
       },
       "message": {
+    "loadRemoteMedia": "Load external media",
         "showMore": "查看完整消息",
         "showLess": "收起消息"
       },
@@ -760,6 +761,8 @@
     }
   },
   "deleteConfirm": {
+    "deleteMemory": "Also delete this chat’s raw memory and search indexes",
+    "memoryNotice": "Curated memory summaries and backups are retained separately.",
     "title": "删除这个对话？",
     "description": "此操作无法撤销。",
     "cancel": "取消",

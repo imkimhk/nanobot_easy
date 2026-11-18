@@ -156,6 +156,8 @@ class ChannelManager:
                     from nanobot.webui.gateway_services import build_gateway_services
 
                     parsed = WebSocketConfig.model_validate(section)
+                    if self.config.tools.hardened_mode:
+                        parsed.workspace_controls_enabled = False
                     static_path = _default_webui_dist() if self._webui_static_dist else None
                     workspace = Path(self.config.workspace_path)
 
@@ -188,7 +190,8 @@ class ChannelManager:
                         session_manager=self._session_manager,
                         static_dist_path=static_path,
                         workspace_path=workspace,
-                        default_restrict_to_workspace=self.config.tools.restrict_to_workspace,
+                        default_restrict_to_workspace=(self.config.tools.restrict_to_workspace
+                                                       or self.config.tools.hardened_mode),
                         disabled_skills=set(self.config.agents.defaults.disabled_skills),
                         runtime_model_name=self._webui_runtime_model_name,
                         runtime_surface=self._webui_runtime_surface,
@@ -620,6 +623,8 @@ class ChannelManager:
         max_attempts = max(self.config.channels.send_max_retries, 1)
 
         for attempt in range(max_attempts):
+            if not self._allocation_delivery(msg):
+                return  # A newer requirement superseded this checked result before publication.
             self._record_task_delivery(msg, "sending", attempt + 1)
             try:
                 await self._send_once(channel, msg)
@@ -646,8 +651,31 @@ class ChannelManager:
                 except asyncio.CancelledError:
                     raise  # Propagate cancellation during sleep
 
+    def _allocation_delivery(self, msg, delivered=None):
+        marker = (msg.metadata or {}).get("_allocation_delivery")
+        if not isinstance(marker, dict):
+            return True
+        from nanobot.agent.time_allocation import record_delivery
+        from nanobot.memory.event_store import ConversationEventStore
+        from nanobot.memory.models import MemoryScope
+        from nanobot.memory.task_context import TaskContextStore
+        scope = MemoryScope(**marker["scope"])
+        tasks = TaskContextStore(ConversationEventStore(self.config.workspace_path))
+        state = next((t for t in tasks.list(scope, marker["session_id"]) if t["task_id"] == marker["task_id"]), None)
+        bundle = next((r["allocation"] for r in (state or {}).get("work_records", [])
+                       if (r.get("allocation") or {}).get("result_id") == marker["result_id"]), None)
+        current = bool(state and state.get("instruction_status") == "ACTIVE"
+                       and state.get("instruction_version") == marker["instruction_version"]
+                       and bundle and bundle["instruction_version"] == marker["instruction_version"]
+                       and bundle["status"] in {"committed", "delivery_unknown", "delivered"}
+                       and msg.content == bundle["output"])
+        if delivered is not None:
+            record_delivery(tasks, scope, marker["session_id"], marker["task_id"], marker["result_id"], delivered)
+        return current
+
     def _record_task_delivery(self, msg, status, attempts, error=None):
         try:
+            self._allocation_delivery(msg, status == "sent")
             self._persist_task_delivery(msg, status, attempts, error)
         except Exception:
             # Recording failure must never cause a second send after a successful send.

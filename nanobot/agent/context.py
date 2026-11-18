@@ -80,11 +80,17 @@ class ContextBuilder:
         timezone: str | None = None,
         disabled_skills: list[str] | None = None,
         hot_path_skills: list[str] | None = None,
+        preload_always_skills: bool = True,
+        on_demand_skills: list[str] | None = None,
+        selective_memory: bool = False,
     ):
         self.workspace = workspace
         self.timezone = timezone
         self.memory = MemoryStore(workspace)
         self.hot_path_skills = list(dict.fromkeys(hot_path_skills or []))
+        self.selective_memory = selective_memory
+        self.preload_always_skills = preload_always_skills
+        self.on_demand_skills = list(dict.fromkeys(on_demand_skills or []))
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 
     def build_system_prompt(
@@ -96,10 +102,13 @@ class ContextBuilder:
         include_memory_recent_history: bool = False,
         session_key: str | None = None,
         unified_session: bool = False,
+        memory_query: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         root = workspace or self.workspace
         parts = [self._get_identity(channel=channel, workspace=root)]
+        if facts := self._configuration_facts(memory_query):
+            parts.append(facts)
 
         bootstrap = self._load_bootstrap_files(root)
         if bootstrap:
@@ -108,15 +117,27 @@ class ContextBuilder:
         parts.append(render_template("agent/tool_contract.md"))
         parts.append(MEMORY_TOOL_GUIDANCE)
 
-        memory = self.memory.get_memory_context()
-        if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
+        memory = self._memory_context(memory_query, root)
+        if memory:
             parts.append(f"# Memory\n\n{memory}")
 
-        active_skills = list(dict.fromkeys([*(skill_names or []), *self.hot_path_skills, *self.skills.get_always_skills()]))
+        active_skills = list(dict.fromkeys([*(skill_names or []), *self.persistent_skill_names()]))
         if active_skills:
             active_content = self.skills.load_skills_for_context(active_skills)
             if active_content:
                 parts.append(f"# Active Skills\n\n{active_content}")
+
+        lazy = set(self.on_demand_skills)
+        if not self.preload_always_skills:
+            lazy.update(self.skills.get_always_skills())
+        cards = []
+        for entry in (self.skills.list_skills() if lazy else []):
+            if entry['name'] in lazy and entry['name'] not in active_skills:
+                description = ' '.join(self.skills._get_skill_description(entry['name']).split())[:160]
+                cards.append(f"- {entry['name']}: {description} Read: {entry['path']}")
+        if cards:
+            parts.append("# On-demand Skills\nRead a relevant SKILL.md with read_file only when needed. "
+                         "Loading grants no execution permission or registry promotion.\n" + '\n'.join(cards))
 
         skill_entries = self.skills.list_skills(filter_unavailable=False)
         summary_skill_count = len([entry for entry in skill_entries if entry["name"] not in set(active_skills)])
@@ -126,7 +147,8 @@ class ContextBuilder:
                 f"{summary_skill_count} skills are indexed for this workspace. "
                 "Use the `skill_search` tool for specialized tasks not covered by preloaded skills. "
                 "Rewrite routing queries to the task intent, then choose from the returned capability cards. "
-                "Record hot, cold, or none routing decisions with `skill_decision`. "
+                "Use routing telemetry only when useful; ordinary answers and an already "
+                "active persona do not require `skill_decision`. "
                 "Do not guess a skill name from memory."
             )
         elif skills_summary := self.skills.build_skills_summary(exclude=set(active_skills)):
@@ -138,23 +160,94 @@ class ContextBuilder:
         return "\n\n---\n\n".join(parts)
 
     def build_design_system_prompt(self, channel: str | None = None,
-                                   workspace: Path | None = None) -> str:
-        """Preserve identity/permission/user rules without execution tool tutorials."""
+                                   workspace: Path | None = None, *,
+                                   persona: bool = False) -> str:
+        """Design-only identity: runtime, workspace, permission gates, untrusted-content rule.
+
+        By default the execution bootstrap files (AGENTS.md/SOUL.md/USER.md) are NOT included.
+        With ``persona`` (contextSelection.designPersona) the agent's bootstrap files and its
+        hot-path/always skills are appended, because a direct answer is delivered verbatim from
+        the design: the persona and answering method then shape that answer too. They are
+        appended after the design identity and never replace design rules or validation.
+        """
         root = workspace or self.workspace
-        return "\n\n---\n\n".join(part for part in (
-            self._get_identity(channel=channel, workspace=root, design=True), self._load_bootstrap_files(root),
-        ) if part)
+        identity = self._get_identity(channel=channel, workspace=root, design=True)
+        if not persona:
+            return identity
+        parts = [identity]
+        persona_parts = [self._load_bootstrap_files(root)]
+        skills = self.persistent_skill_names()
+        if skills:
+            persona_parts.append(self.skills.load_skills_for_context(skills))
+        persona_text = "\n\n---\n\n".join(part for part in persona_parts if part)
+        if persona_text:
+            parts.append(
+                "# Agent persona and answering method\n\n"
+                "Apply the persona and answering method below to any user-facing text you write "
+                "(for example a direct answer). They do not grant permissions and do not change "
+                "the design rules, the submit format or any check.\n\n" + persona_text)
+        return "\n\n---\n\n".join(parts)
+
+    def persistent_skill_names(self) -> list[str]:
+        """Skills every turn carries regardless of selection: configured hot-path + always."""
+        always = self.skills.get_always_skills() if self.preload_always_skills else []
+        return list(dict.fromkeys([*self.hot_path_skills, *always]))
+
+    def build_compact_system_prompt(self, channel=None, workspace=None, session_summary=None,
+                                    memory_query=None):
+        """Defer built-in execution tutorials, never user rules or conversation memory."""
+        root = workspace or self.workspace
+        parts = [render_template("agent/compact_identity.md",
+                                 workspace_path=str(root.expanduser().resolve()),
+                                 channel=channel or ""), self._load_bootstrap_files(root)]
+        if facts := self._configuration_facts(memory_query):
+            parts.append(facts)
+        memory = self._memory_context(memory_query, root)
+        if memory:
+            parts.append(f"# Memory\n\n{memory}")
+        # Custom always-on and configured hot skills may contain user policy.
+        always = set(self.skills.get_always_skills()) if self.preload_always_skills else set()
+        retained = list(dict.fromkeys([*self.hot_path_skills, *[
+            entry["name"] for entry in self.skills.list_skills()
+            if entry["name"] in always and entry["source"] != "builtin"]]))
+        if retained:
+            parts.append(self.skills.load_skills_for_context(retained))
+        if session_summary:
+            parts.append(f"[Archived Context Summary]\n\n{session_summary}")
+        return "\n\n---\n\n".join(part for part in parts if part)
+
+    @staticmethod
+    def _configuration_facts(query: str | None) -> str:
+        # The query is available only for a fresh conversation. Keep unrelated
+        # prompts and existing conversation replay unchanged.
+        text = (query or "").lower()
+        if (any(name in text for name in ("nanobot", "나노봇"))
+                and any(word in text for word in ("config", "settings", "설정"))):
+            return render_template("agent/_snippets/configuration_facts.md")
+        return ""
+
+    def _memory_context(self, query: str | None = None, workspace: Path | None = None) -> str:
+        text = self.memory.read_memory()
+        if not text or self._is_template_content(text, "memory/MEMORY.md"):
+            return ""
+        if (self.selective_memory and query is not None
+                and (workspace is None or workspace.resolve() == self.workspace.resolve())):
+            from nanobot.agent.memory_selection import select_memory
+
+            text = select_memory(text, query, source=str(self.memory.memory_file))
+        return f"## Long-term Memory\n{text}"
 
     def build_selected_system_prompt(self, skill_names: list[str] | None = None,
                                      channel: str | None = None,
                                      workspace: Path | None = None) -> str:
-        """Mandatory rules plus explicitly selected skills, without ambient memory."""
+        """Mandatory rules, hot-path/always skills and selected skills, without ambient memory."""
         root = workspace or self.workspace
         parts = [self._get_identity(channel=channel, workspace=root),
                  self._load_bootstrap_files(root), render_template("agent/tool_contract.md"),
                  MEMORY_TOOL_GUIDANCE]
-        if skill_names:
-            parts.append(self.skills.load_skills_for_context(skill_names))
+        names = list(dict.fromkeys([*(skill_names or []), *self.persistent_skill_names()]))
+        if names:
+            parts.append(self.skills.load_skills_for_context(names))
         return "\n\n---\n\n".join(part for part in parts if part)
 
     def _build_recent_memory_context(
@@ -325,6 +418,8 @@ class ContextBuilder:
                     include_memory_recent_history=False,
                     session_key=session_key,
                     unified_session=unified_session,
+                    # Prior dialogue may refer to project constraints not named again.
+                    memory_query=None if history else current_message,
                 ),
             },
             *history,

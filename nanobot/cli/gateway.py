@@ -25,6 +25,7 @@ from nanobot.gateway.service import (
     GatewayServiceResult,
     ServiceManagerKind,
 )
+from nanobot.security.secrets import RedactingStream
 
 RuntimeConfigLoader = Callable[[str | None, str | None], Config]
 GatewayRunner = Callable[..., None]
@@ -52,7 +53,7 @@ def create_gateway_app(
             return
         logger.remove(log_handler_id)
         logger.add(
-            sys.stderr,
+            RedactingStream(sys.stderr),
             format=(
                 "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
                 "<level>{level: <5}</level> | "
@@ -61,6 +62,8 @@ def create_gateway_app(
             ),
             level="DEBUG",
             colorize=None,
+            diagnose=False,
+            backtrace=False,
             filter=lambda record: record["extra"].setdefault("channel", "-") or True,
         )
 

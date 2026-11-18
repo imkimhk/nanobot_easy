@@ -18,7 +18,7 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { AttachmentTile } from "@/components/AttachmentTile";
+import { AttachmentTile, mediaTarget } from "@/components/AttachmentTile";
 import { CliAppMentionText } from "@/components/CliAppMentionText";
 import { ImageLightbox } from "@/components/ImageLightbox";
 import { MarkdownText, preloadMarkdownText } from "@/components/MarkdownText";
@@ -439,7 +439,7 @@ function UserImages({
   const originalToViewable = new Map<number, number>();
   for (let i = 0; i < images.length; i += 1) {
     const img = images[i];
-    if (typeof img.url !== "string" || img.url.length === 0) continue;
+    if (!mediaTarget(img.url)) continue;
     originalToViewable.set(i, viewableImages.length);
     viewableImages.push(img);
   }
@@ -495,7 +495,11 @@ function UserImageCell({
   openLabel: string;
   onOpen?: () => void;
 }) {
-  const hasUrl = typeof image.url === "string" && image.url.length > 0;
+  const target = mediaTarget(image.url);
+  const hasUrl = target !== null;
+  if (target?.remote) {
+    return <AttachmentTile attachment={{ ...image, kind: "image" }} />;
+  }
   const tileClasses = cn(
     "relative overflow-hidden border border-border/60 bg-muted/40",
     size === "large"

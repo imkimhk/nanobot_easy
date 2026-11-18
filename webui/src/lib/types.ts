@@ -159,6 +159,8 @@ export interface AutomationUpdatePayload {
 
 export interface SessionDeleteResult {
   deleted: boolean;
+  memory_events_deleted?: number;
+  memory_retained?: boolean;
   blocked_by_automations?: boolean;
   automations?: SessionAutomationJob[];
 }
@@ -206,6 +208,7 @@ export interface ManagedSkill {
   when_not_to_use: string;
   required_tools: string[];
   usage_count: number;
+  selection_count?: number;
   success_count: number;
   failure_count: number;
   routing_failure_count: number;
@@ -228,6 +231,8 @@ export interface ManagedSkillTrace {
   gate_result: string | null;
   user_feedback: string | null;
   notes: string | null;
+  phase?: "legacy" | "selected" | "applied";
+  application_evidence?: string | null;
 }
 
 export interface ManagedSkillDetail {

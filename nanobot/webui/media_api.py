@@ -66,7 +66,8 @@ _MEDIA_ALLOWED_MIMES: frozenset[str] = frozenset({
 _SVG_MEDIA_HEADERS: tuple[tuple[str, str], ...] = (
     (
         "Content-Security-Policy",
-        "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox",
+        "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox; "
+        "object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
     ),
 )
 

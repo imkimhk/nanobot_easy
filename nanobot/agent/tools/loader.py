@@ -20,12 +20,17 @@ _SAFE_MODE_BLOCKED_TOOLS = frozenset({
     "apply_patch",
     "edit_file",
     "exec",
+    "exec_job",
     "list_exec_sessions",
     "run_cli_app",
     "write_file",
     "write_stdin",
 })
 _SAFE_MODE_BLOCKED_PREFIXES = ("mcp_",)
+_HARDENED_BLOCKED_TOOLS = {
+    "exec", "exec_job", "write_stdin", "list_exec_sessions", "run_cli_app", "spawn", "delegate", "my",
+    "student_learning", "genie_study_review",
+}
 
 
 def is_safe_mode_blocked_tool(name: str) -> bool:
@@ -103,16 +108,28 @@ class ToolLoader:
         registered: list[str] = []
         builtin_names: set[str] = set()
         safe_mode = bool(getattr(getattr(ctx, "config", None), "safe_mode", False))
-        sources = [(self.discover(), False), (self._discover_plugins().values(), True)]
+        hardened = bool(getattr(getattr(ctx, "config", None), "hardened_mode", False))
+        sources = [(self.discover(), False)]
+        if not hardened:
+            sources.append((self._discover_plugins().values(), True))
         for source, is_plugin_source in sources:
             for tool_cls in source:
+                if hardened and is_plugin_source:
+                    continue
                 cls_label = tool_cls.__name__
                 try:
+                    if hardened and tool_cls.__module__.rsplit(".", 1)[-1] in {
+                        "student_learning", "genie_study_review",
+                    }:
+                        continue
                     if scope not in getattr(tool_cls, "_scopes", {"core"}):
                         continue
                     if not tool_cls.enabled(ctx):
                         continue
                     tool = tool_cls.create(ctx)
+                    if hardened and (tool.name in _HARDENED_BLOCKED_TOOLS
+                                     or tool.name.startswith("mcp_")):
+                        continue
                     if is_plugin_source:
                         tool = _LegacyErrorPrefixTool(tool)
                     if safe_mode and is_safe_mode_blocked_tool(tool.name):

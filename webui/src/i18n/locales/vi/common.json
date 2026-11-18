@@ -589,6 +589,7 @@
         "none": "Không có lần chạy tiếp theo"
       },
       "message": {
+    "loadRemoteMedia": "Load external media",
         "showMore": "Hiển thị toàn bộ tin nhắn",
         "showLess": "Thu gọn"
       },
@@ -760,6 +761,8 @@
     }
   },
   "deleteConfirm": {
+    "deleteMemory": "Also delete this chat’s raw memory and search indexes",
+    "memoryNotice": "Curated memory summaries and backups are retained separately.",
     "title": "Xóa cuộc trò chuyện này?",
     "description": "Không thể hoàn tác thao tác này.",
     "cancel": "Hủy",

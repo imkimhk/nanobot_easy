@@ -10,6 +10,11 @@ _CURRENT_REQUEST_CONTEXT: ContextVar["RequestContext | None"] = ContextVar(
     default=None,
 )
 
+# Bound to a runner operation, never stored on a tool shared by concurrent sessions.
+current_tool_output_limit: ContextVar[int | None] = ContextVar(
+    "nanobot_tool_output_limit", default=None,
+)
+
 
 @dataclass(frozen=True)
 class RequestContext:

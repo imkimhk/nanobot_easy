@@ -589,6 +589,7 @@
         "none": "Aucune prochaine exécution"
       },
       "message": {
+    "loadRemoteMedia": "Load external media",
         "showMore": "Afficher le message complet",
         "showLess": "Afficher moins"
       },
@@ -760,6 +761,8 @@
     }
   },
   "deleteConfirm": {
+    "deleteMemory": "Also delete this chat’s raw memory and search indexes",
+    "memoryNotice": "Curated memory summaries and backups are retained separately.",
     "title": "Supprimer cette discussion ?",
     "description": "Cette action est irréversible.",
     "cancel": "Annuler",

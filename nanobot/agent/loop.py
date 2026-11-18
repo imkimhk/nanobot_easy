@@ -264,6 +264,8 @@ class AgentLoop:
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
         hot_path_skills: list[str] | None = None,
+        preload_always_skills: bool = True,
+        on_demand_skills: list[str] | None = None,
         proactive_skill_cards: bool | None = None,
         proactive_card_min_score: int | None = None,
         proactive_method_inline: bool | None = None,
@@ -281,6 +283,9 @@ class AgentLoop:
         restart_mode: str = "auto",
         local_trigger_store: Any | None = None,
         context_selection: Any | None = None,
+        compact_context: bool = False,
+        selective_memory: bool = False,
+        history_context_tokens: int | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -309,6 +314,11 @@ class AgentLoop:
             else defaults.context_window_tokens
         )
         self.context_selection_config = context_selection or defaults.context_selection
+        self.history_context_tokens = (
+            defaults.history_context_tokens
+            if history_context_tokens is None else history_context_tokens
+        )
+        self.compact_context = compact_context
         self.context_block_limit = context_block_limit
         self.reasoning_effort = reasoning_effort
         # Stepwise reasoning ("Genie method") is on only when applied explicitly.
@@ -357,6 +367,7 @@ class AgentLoop:
         self.workspace_scopes = WorkspaceScopeResolver(
             default_workspace=workspace,
             default_restrict_to_workspace=restrict_to_workspace,
+            locked=_tc.hardened_mode,
         )
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
@@ -401,6 +412,9 @@ class AgentLoop:
             timezone=timezone,
             disabled_skills=disabled_skills,
             hot_path_skills=self.hot_path_skills,
+            preload_always_skills=preload_always_skills,
+            on_demand_skills=on_demand_skills,
+            selective_memory=selective_memory and self.tools_config.file.enable,
         )
         self.conversation_memory = ConversationEventStore(workspace)
         self._memory_workspace_id = str(Path(workspace).expanduser().resolve())
@@ -430,7 +444,7 @@ class AgentLoop:
         self._unified_session = unified_session
         self._max_messages = replay_max_messages_for_context(self.context_window_tokens)
         self._running = False
-        self._mcp_servers = mcp_servers or {}
+        self._mcp_servers = {} if _tc.hardened_mode else (mcp_servers or {})
         self._mcp_stacks: dict[str, AsyncExitStack] = {}
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
@@ -526,8 +540,11 @@ class AgentLoop:
             subagent_profiles=defaults.subagent_profiles,
             max_subagent_depth=defaults.max_subagent_depth,
             context_window_tokens=context_window_tokens,
+            history_context_tokens=extra.pop("history_context_tokens", defaults.history_context_tokens),
             context_block_limit=defaults.context_block_limit,
             context_selection=defaults.context_selection,
+            compact_context=defaults.compact_context,
+            selective_memory=defaults.selective_memory,
             reasoning_effort=getattr(resolved, "reasoning_effort", None) or defaults.reasoning_effort,
             stepwise_enabled=defaults.stepwise.enabled,
             stepwise_applied_at=defaults.stepwise.applied_at,
@@ -546,6 +563,8 @@ class AgentLoop:
             unified_session=defaults.unified_session,
             disabled_skills=defaults.disabled_skills,
             hot_path_skills=defaults.skills,
+            preload_always_skills=defaults.preload_always_skills,
+            on_demand_skills=defaults.on_demand_skills,
             proactive_skill_cards=defaults.proactive_skill_cards,
             proactive_card_min_score=defaults.proactive_card_min_score,
             proactive_method_inline=defaults.proactive_method_inline,
@@ -672,14 +691,15 @@ class AgentLoop:
         registered = loader.load(ctx, self.tools)
 
         # MyTool needs runtime state reference — manual registration
-        if self.tools_config.my.enable and not self.tools_config.safe_mode:
+        if (self.tools_config.my.enable and not self.tools_config.safe_mode
+                and not self.tools_config.hardened_mode):
             self.tools.register(
                 MyTool(runtime_state=self, modify_allowed=self.tools_config.my.allow_set)
             )
             registered.append("my")
 
         testy_root = Path(self.workspace)
-        if testy_root.name == "workspace-testy":
+        if testy_root.name == "workspace-testy" and not self.tools_config.hardened_mode:
             import sys
 
             if str(testy_root) not in sys.path:
@@ -989,9 +1009,9 @@ class AgentLoop:
         return msg.session_key
 
     def _replay_token_budget(self) -> int:
-        """Derive a token budget for session history replay from the context window."""
+        """Bound old history independently of the active model context window."""
         if self.context_window_tokens <= 0:
-            return 0
+            return self.history_context_tokens
         max_output = getattr(getattr(self.provider, "generation", None), "max_tokens", 4096)
         try:
             reserved_output = int(max_output)
@@ -1002,7 +1022,8 @@ class AgentLoop:
             - max(1, reserved_output)
             - input_token_safety_buffer(self.context_window_tokens)
         )
-        return budget if budget > 0 else max(128, self.context_window_tokens // 2)
+        available = budget if budget > 0 else max(128, self.context_window_tokens // 2)
+        return min(available, self.history_context_tokens) if self.history_context_tokens > 0 else available
 
     async def _run_agent_loop(
         self,
@@ -1367,12 +1388,15 @@ class AgentLoop:
         session_key = self._effective_session_key(msg)
         if session_key != msg.session_key:
             msg = dataclasses.replace(msg, session_key_override=session_key)
+        dispatch_session = self.sessions.get_or_create(session_key)
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
 
         pending: asyncio.Queue | None = None
         try:
             async with lock, gate:
+                if not self.sessions.is_current(dispatch_session):
+                    return
                 # Only the task that owns the session lock may publish the
                 # active mid-turn injection queue for this session.
                 pending = asyncio.Queue(maxsize=20)
@@ -1453,8 +1477,8 @@ class AgentLoop:
                     # next conversation turn.
                     try:
                         key = self._effective_session_key(msg)
-                        session = self.sessions.get_or_create(key)
-                        if self._restore_runtime_checkpoint(session):
+                        session = dispatch_session
+                        if self.sessions.is_current(session) and self._restore_runtime_checkpoint(session):
                             self._clear_pending_user_turn(session)
                             self.sessions.save(session)
                             logger.info(
@@ -1501,8 +1525,9 @@ class AgentLoop:
                                 item = queue.get_nowait()
                             except asyncio.QueueEmpty:
                                 break
-                            await self.bus.publish_inbound(item)
-                            leftover += 1
+                            if self.sessions.is_current(dispatch_session):
+                                await self.bus.publish_inbound(item)
+                                leftover += 1
                         if leftover:
                             logger.info(
                                 "Re-published {} leftover message(s) to bus for session {}",
@@ -1563,6 +1588,17 @@ class AgentLoop:
         logger.info("Processing system message from {}", msg.sender_id)
         key = msg.session_key_override or f"{channel}:{chat_id}"
         session = self.sessions.get_or_create(key)
+        with self.sessions.session_scope(session):
+            return await self._process_system_turn(
+                msg, session, key, channel=channel, chat_id=chat_id,
+                on_progress=on_progress, on_stream=on_stream,
+                on_stream_end=on_stream_end, pending_queue=pending_queue,
+            )
+
+    async def _process_system_turn(
+        self, msg: InboundMessage, session: Session, key: str, *, channel: str, chat_id: str,
+        on_progress=None, on_stream=None, on_stream_end=None, pending_queue=None,
+    ) -> OutboundMessage | None:
         if self._restore_runtime_checkpoint(session):
             self.sessions.save(session)
         if self._restore_pending_user_turn(session):
@@ -1710,7 +1746,7 @@ class AgentLoop:
         t0 = time.time()
         ctx = TurnContext(
             msg=msg,
-            session=None,
+            session=self.sessions.get_or_create(key),
             session_key=key,
             state=TurnState.RESTORE,
             turn_id=f"{key}:{time.time_ns()}",
@@ -1728,7 +1764,13 @@ class AgentLoop:
             tools=tools,
         )
 
+        with self.sessions.session_scope(ctx.session):
+            return await self._run_turn_states(ctx)
+
+    async def _run_turn_states(self, ctx: TurnContext) -> OutboundMessage | None:
         while ctx.state is not TurnState.DONE:
+            if not self.sessions.is_current(ctx.session):
+                return None
             handler_name = f"_state_{ctx.state.name.lower()}"
             handler = getattr(self, handler_name, None)
             if handler is None:
@@ -1980,7 +2022,8 @@ class AgentLoop:
             ctx.user_persisted_early = self._persist_user_message_early(ctx.msg, ctx.session)
             scope = self.workspace_scopes.for_message(ctx.msg, ctx.session.metadata)
             rules = self.context.build_design_system_prompt(
-                channel=ctx.msg.channel, workspace=scope.project_path)
+                channel=ctx.msg.channel, workspace=scope.project_path,
+                persona=bool(getattr(self.context_selection_config, "design_persona", False)))
             selected = await selector.select(
                 provider=self.provider, model=self.model, request=ctx.msg.content,
                 scope=self._memory_scope_for_message(ctx.msg), session_id=ctx.session_key,
@@ -1989,7 +2032,18 @@ class AgentLoop:
                 continuation=(turn_continuation.internal_continuation_inbound(ctx.msg.metadata)
                               or ctx.msg.metadata.get("_context_selection_continuation", False)))
             ctx.selected_context = selected
-            if selected.blocked and self.context_selection_config.failure_mode == "legacy":
+            selected.timezone = self.context.timezone
+            if getattr(selected.trace, "budget", None) is not None and selected.trace.budget.max_sends is None:
+                # t54 default from the existing loop cap: executor iterations + first design + repair
+                # + finalization retry + malformed-call retry (internal provider retries count too).
+                selected.trace.budget.set_default_sends(self.max_iterations + 4, "max_tool_iterations+4")
+            if getattr(selected.trace, "budget", None) is not None:
+                selected.trace.mark("run_budget_start", **selected.trace.budget.start_record())
+            # Corrections recorded by reconcile_verdicts reach session replay and summaries too.
+            from nanobot.agent.context_corrections import annotate_session
+            if annotate_session(self.conversation_memory, self._memory_scope_for_message(ctx.msg), ctx.session):
+                selected.trace.count("corrections_applied", "session_messages")
+            if selected.blocked and not selected.allocation and self.context_selection_config.failure_mode == "legacy":
                 selected.trace.count("legacy_fallback", selected.blocked)
                 selected.trace.persist(self.conversation_memory)
                 selected.legacy_fallback = True
@@ -2064,6 +2118,17 @@ class AgentLoop:
             ctx.pending_summary,
             include_memory_recent_history=not ctx.ephemeral,
         )
+        if (self.compact_context and not ctx.ephemeral and not self._stepwise_enabled()
+                and ctx.msg.sender_id != "subagent"):
+            from nanobot.agent.compact_context import CompactTools
+            scope = self.workspace_scopes.for_message(ctx.msg, ctx.session.metadata)
+            full_guidance = ctx.initial_messages[0]["content"]
+            ctx.initial_messages[0] = {"role": "system", "content":
+                self.context.build_compact_system_prompt(
+                    channel=ctx.msg.channel, workspace=scope.project_path,
+                    session_summary=ctx.pending_summary,
+                    memory_query=None if ctx.history else ctx.msg.content)}
+            ctx.tools = CompactTools(ctx.tools or self.tools, full_guidance, ctx.initial_messages[0])
         ctx.user_persisted_early = self._persist_user_message_early(
             ctx.msg, ctx.session
         )
@@ -2291,6 +2356,8 @@ class AgentLoop:
         if ctx.selected_context and not ctx.selected_context.legacy_fallback:
             selected = ctx.selected_context
             design = selected.design
+            if selected.allocation:
+                ctx.on_stream = ctx.on_stream_end = None
             if selected.blocked or (design and design.route in {"direct", "clarify"}):
                 if selected.blocked:
                     ctx.final_content = (
@@ -2366,6 +2433,9 @@ class AgentLoop:
         return "ok"
 
     async def _state_save(self, ctx: TurnContext) -> str:
+        if not self.sessions.is_current(ctx.session):
+            ctx.suppress_response = True
+            return "ok"
         turn_continuation.prepare_save_boundary(ctx)
 
         if (
@@ -2381,6 +2451,13 @@ class AgentLoop:
             else ctx.turn_wall_started_at
         )
         ctx.turn_latency_ms = max(0, int((time.time() - latency_started_at) * 1000))
+        if ctx.selected_context and ctx.selected_context.allocation:
+            content, status, response_id = ctx.selected_context.allocation.persist(ctx.final_content, ctx.stop_reason)
+            ctx.final_content, ctx.stop_reason = content, status
+            if ctx.all_messages and ctx.all_messages[-1].get("role") == "assistant":
+                ctx.all_messages[-1].update(content=content)
+                if response_id:
+                    ctx.all_messages[-1]["memory_event_id"] = response_id
         self._save_turn(
             ctx.session, ctx.all_messages, ctx.save_skip,
             turn_latency_ms=ctx.turn_latency_ms,
@@ -2414,6 +2491,17 @@ class AgentLoop:
         if ctx.suppress_response:
             ctx.outbound = None
             return "ok"
+        allocation = getattr(ctx.selected_context, "allocation", None)
+        if allocation and allocation.bundle and allocation.bundle["status"] == "committed":
+            from nanobot.agent.time_allocation import record_delivery
+            selected = ctx.selected_context
+            selected.control.refresh()
+            if (selected.state.get("instruction_status") != "ACTIVE"
+                    or selected.instruction_version != allocation.bundle["instruction_version"]):
+                ctx.final_content, ctx.stop_reason = allocation.finalize(None, "incomplete")
+            else:
+                record_delivery(selected.control.tasks, selected.scope, selected.state["session_id"],
+                                selected.state["task_id"], allocation.bundle["result_id"], False)
         ctx.outbound = self._assemble_outbound(
             ctx.msg,
             ctx.final_content,
@@ -2423,6 +2511,12 @@ class AgentLoop:
             ctx.on_stream,
             turn_latency_ms=ctx.turn_latency_ms,
         )
+        if allocation and allocation.bundle and ctx.outbound is not None and ctx.stop_reason == "completed":
+            from dataclasses import asdict
+            ctx.outbound.metadata["_allocation_delivery"] = {
+                "scope": asdict(ctx.selected_context.scope), "session_id": ctx.selected_context.state["session_id"],
+                "task_id": ctx.selected_context.state["task_id"], "result_id": allocation.bundle["result_id"],
+                "instruction_version": allocation.bundle["instruction_version"]}
         if ctx.ephemeral and ctx.outbound is not None:
             ctx.outbound.metadata["_stop_reason"] = ctx.stop_reason
         if (getattr(self, "stepwise_lightweight", False) and not ctx.ephemeral
@@ -2628,6 +2722,7 @@ class AgentLoop:
             message.get("tool_calls"),
             message.get("reasoning_content"),
             message.get("thinking_blocks"),
+            message.get("provider_state"),
         )
 
     def _restore_runtime_checkpoint(self, session: Session) -> bool:
@@ -2731,9 +2826,12 @@ class AgentLoop:
             content=content, media=media or [], metadata=metadata,
         )
         # Share the dispatch lock so direct calls serialize with bus turns.
+        direct_session = self.sessions.get_or_create(session_key)
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         try:
             async with lock:
+                if not self.sessions.is_current(direct_session):
+                    return None
                 kwargs: dict[str, Any] = {
                     "session_key": session_key,
                     "on_progress": on_progress,

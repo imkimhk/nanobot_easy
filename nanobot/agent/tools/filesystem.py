@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
+from nanobot.agent.tools.context import current_tool_output_limit
 from nanobot.agent.tools.file_state import FileStates, _hash_file, current_file_states
 from nanobot.agent.tools.path_utils import resolve_workspace_path
 from nanobot.agent.tools.schema import (
@@ -52,8 +53,10 @@ class _FsTool(Tool):
         file_states: FileStates | None = None,
         restrict_to_workspace: bool | None = None,
         sandbox_restricts_workspace: bool = False,
+        lock_workspace: bool = False,
     ):
         self._workspace = workspace
+        self._lock_workspace = lock_workspace
         self._allowed_dir = allowed_dir
         # Legacy alias: extra_allowed_dirs is read-only. Write-capable tools
         # must opt in via extra_write_allowed_dirs.
@@ -81,6 +84,7 @@ class _FsTool(Tool):
 
         restrict = (
             ctx.config.restrict_to_workspace
+            or ctx.config.hardened_mode
             or ctx.config.exec.sandbox
         )
         sandbox_restricts = bool(ctx.config.exec.sandbox)
@@ -93,6 +97,7 @@ class _FsTool(Tool):
             file_states=ctx.file_state_store,
             restrict_to_workspace=ctx.config.restrict_to_workspace,
             sandbox_restricts_workspace=sandbox_restricts,
+            lock_workspace=ctx.config.hardened_mode,
         )
 
     @property
@@ -102,6 +107,8 @@ class _FsTool(Tool):
         return current_file_states(self._fallback_file_states)
 
     def _effective_allowed_root(self, access_allowed_root: Path | None) -> Path | None:
+        if self._lock_workspace:
+            return self._workspace
         if self._allowed_dir is None or self._workspace is None:
             return access_allowed_root
         try:
@@ -126,7 +133,7 @@ class _FsTool(Tool):
             restrict_to_workspace=self._restrict_to_workspace,
             sandbox_restricts_workspace=self._sandbox_restricts_workspace,
         )
-        return resolve_workspace_path(
+        resolved = resolve_workspace_path(
             path,
             access.project_path,
             self._effective_allowed_root(access.allowed_root),
@@ -134,6 +141,14 @@ class _FsTool(Tool):
             extra_allowed_files,
             include_media_dir=include_media_dir,
         )
+        if self._lock_workspace and self._workspace:
+            from contextlib import suppress
+
+            with suppress(ValueError):
+                relative = resolved.relative_to(self._workspace.resolve())
+                if relative.parts and relative.parts[0] in {"sessions", ".skillstore", "cron"}:
+                    raise PermissionError("Internal runtime state is unavailable through file tools.")
+        return resolved
 
     def _resolve_read(self, path: str) -> Path:
         return self._resolve_with_extra(
@@ -153,6 +168,13 @@ class _FsTool(Tool):
 
     def _resolve(self, path: str) -> Path:
         return self._resolve_read(path)
+
+    def _is_visible_entry(self, path: Path) -> bool:
+        try:
+            self._resolve_read(str(path))
+            return True
+        except (OSError, ValueError, RuntimeError):
+            return False
 
     def _display_workspace(self) -> Path | None:
         return current_tool_workspace(self._workspace).project_path
@@ -268,7 +290,8 @@ class ReadFileTool(_FsTool):
             "are based on current content. "
             "Use offset and limit for large text files. "
             "Use force=true to re-read content even if unchanged. "
-            "Reads exceeding ~128K chars are truncated."
+            "Large reads are paginated to fit the current output budget (up to ~128K chars). "
+            "Follow the returned offset to continue; use one bounded range for live logs."
         )
 
     @property
@@ -385,15 +408,27 @@ class ReadFileTool(_FsTool):
             numbered = [f"{start + i + 1}| {line}" for i, line in enumerate(all_lines[start:end])]
             result = "\n".join(numbered)
 
-            if len(result) > self._MAX_CHARS:
+            output_limit = min(self._MAX_CHARS, current_tool_output_limit.get() or self._MAX_CHARS)
+            # Leave room for the continuation footer; only complete returned lines count.
+            content_limit = max(0, output_limit - 128)
+            if len(result) > content_limit:
                 trimmed, chars = [], 0
                 for line in numbered:
                     chars += len(line) + 1
-                    if chars > self._MAX_CHARS:
+                    if chars > content_limit:
                         break
                     trimmed.append(line)
                 end = start + len(trimmed)
                 result = "\n".join(trimmed)
+                if not trimmed:
+                    state = self._file_states.get(fp)
+                    if state is not None:
+                        state.can_dedup = False
+                    return ToolResult.error(
+                        f"Error: Line {offset} exceeds the current {output_limit}-character "
+                        "output budget. Use a text-processing tool to inspect smaller parts; "
+                        "this line has not been acquired in full."
+                    )
 
             if end < total:
                 result += f"\n\n(Showing lines {offset}-{end} of {total}. Use offset={end + 1} to continue.)"
@@ -401,7 +436,10 @@ class ReadFileTool(_FsTool):
                 result += f"\n\n(End of file — {total} lines total)"
             self._file_states.record_read(fp, offset=offset, limit=limit)
             return self._with_read_evidence(result, fp, "lines", offset, end, total,
-                                            expected_hash=hashlib.sha256(raw).hexdigest())
+                                            expected_hash=hashlib.sha256(raw).hexdigest(),
+                                            range_sha256=hashlib.sha256(
+                                                "\n".join(all_lines[start:end]).encode("utf-8")
+                                            ).hexdigest())
         except PermissionError as e:
             return ToolResult.error(f"Error: {e}")
         except Exception as e:
@@ -460,7 +498,8 @@ class ReadFileTool(_FsTool):
         )
 
     @staticmethod
-    def _with_read_evidence(result, fp, unit, start, end, total, extraction_ok=True, expected_hash=None):
+    def _with_read_evidence(result, fp, unit, start, end, total, extraction_ok=True,
+                            expected_hash=None, range_sha256=None):
         from nanobot.agent.context_evidence import active_evidence_capture, fingerprint
         from nanobot.agent.task_note import active_task_note, file_version
 
@@ -469,11 +508,16 @@ class ReadFileTool(_FsTool):
         version = fingerprint(fp) if active_evidence_capture.get() else file_version(str(fp))
         if active_evidence_capture.get() and expected_hash is not None and (version or {}).get("sha256") != expected_hash:
             extraction_ok = False
+        elif not active_evidence_capture.get() and expected_hash is not None:
+            # The returned bytes define this read's snapshot, even if a log was appended meanwhile.
+            version = {**(version or {}), "sha256": expected_hash}
         output = ToolResult(result)
         output.read_evidence = {
             "target": str(fp.resolve()), "unit": unit, "start": start, "end": end,
             "total": total, "extraction_ok": extraction_ok, "version": version,
         }
+        if range_sha256 is not None:
+            output.read_evidence["range_sha256"] = range_sha256
         return output
 
     def _read_office_doc(self, fp: Path) -> str:
@@ -533,7 +577,17 @@ class WriteFileTool(_FsTool):
                 raise ValueError("Unknown content")
             fp = self._resolve_write(path)
             fp.parent.mkdir(parents=True, exist_ok=True)
-            fp.write_text(content, encoding="utf-8")
+            from nanobot.agent.context_evidence import exclusive_create_paths
+            if str(fp.resolve()) in exclusive_create_paths.get():
+                # A requested new file: create exclusively, never replace one that appeared meanwhile.
+                try:
+                    with fp.open("x", encoding="utf-8") as stream:
+                        stream.write(content)
+                except FileExistsError:
+                    return ToolResult.error(f"Error: {fp} already exists; it was expected to be new and was "
+                                            "not overwritten. Confirm with the user before replacing it.")
+            else:
+                fp.write_text(content, encoding="utf-8")
             self._file_states.record_write(fp)
             return f"Successfully wrote {len(content)} characters to {fp}"
         except PermissionError as e:
@@ -1106,7 +1160,8 @@ class ListDirTool(_FsTool):
 
             if recursive:
                 for item in sorted(dp.rglob("*")):
-                    if any(p in self._IGNORE_DIRS for p in item.parts):
+                    if (any(p in self._IGNORE_DIRS for p in item.parts)
+                            or not self._is_visible_entry(item)):
                         continue
                     total += 1
                     if len(items) < cap:
@@ -1114,7 +1169,7 @@ class ListDirTool(_FsTool):
                         items.append(f"{rel}/" if item.is_dir() else str(rel))
             else:
                 for item in sorted(dp.iterdir()):
-                    if item.name in self._IGNORE_DIRS:
+                    if item.name in self._IGNORE_DIRS or not self._is_visible_entry(item):
                         continue
                     total += 1
                     if len(items) < cap:

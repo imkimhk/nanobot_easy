@@ -23,10 +23,15 @@ if sys.platform == "win32":
 import typer  # noqa: E402
 from loguru import logger  # noqa: E402
 
+from nanobot.security.secrets import RedactingStream  # noqa: E402
+
+# Also cover standard-library/dependency logging and uncaught tracebacks.
+sys.stderr = RedactingStream(sys.stderr)
+
 # Remove default handler and re-add with unified nanobot format
 logger.remove()
 _log_handler_id = logger.add(
-    sys.stderr,
+    RedactingStream(sys.stderr),
     format=(
         "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
         "<level>{level: <5}</level> | "
@@ -35,6 +40,8 @@ _log_handler_id = logger.add(
     ),
     level="INFO",
     colorize=None,
+    diagnose=False,
+    backtrace=False,
     filter=lambda record: record["extra"].setdefault("channel", "-") or True,
 )
 
@@ -71,6 +78,7 @@ from nanobot.bus.outbound_events import (  # noqa: E402
     outbound_event_from_message,
 )
 from nanobot.cli.gateway import create_gateway_app  # noqa: E402
+from nanobot.cli.mcp import create_mcp_app  # noqa: E402
 from nanobot.cli.stream import StreamRenderer, ThinkingSpinner  # noqa: E402
 from nanobot.config.paths import get_workspace_path, is_default_workspace  # noqa: E402
 from nanobot.config.schema import Config  # noqa: E402
@@ -2207,6 +2215,7 @@ def agent(
 
 channels_app = typer.Typer(help="Manage channels")
 app.add_typer(channels_app, name="channels")
+app.add_typer(create_mcp_app(console), name="mcp")
 
 
 @channels_app.command("status")
@@ -2650,6 +2659,9 @@ def skill_stats(
     by_status = store.status_counts()
     console.print(f"DB: {store.db_path}")
     console.print(f"Skills: {sum(by_status.values())}")
+    rows = store.list_skills(include_deprecated=True)
+    console.print(f"Selections: {sum(int(row['selection_count']) for row in rows)}")
+    console.print(f"Usage: {sum(int(row['usage_count']) for row in rows)}")
     for status, count in sorted(by_status.items()):
         console.print(f"- {status}: {count}")
 

@@ -178,7 +178,7 @@ describe("MarkdownTextRenderer", () => {
     ).toHaveAttribute("href", "https://polymarket.com/event/when-will-gpt-5pt6-be-released");
   });
 
-  it("falls back through favicon sources before showing a globe for compact link rows", () => {
+  it("shows a globe without contacting favicon services for compact link rows", () => {
     const { container } = render(
       <MarkdownTextRenderer>
         {
@@ -191,24 +191,6 @@ describe("MarkdownTextRenderer", () => {
     });
     const favicon = () => link.querySelector("img");
 
-    expect(favicon()).toHaveAttribute(
-      "src",
-      "https://www.savills.com.hk/favicon.ico",
-    );
-
-    fireEvent.error(favicon()!);
-    expect(favicon()).toHaveAttribute(
-      "src",
-      "https://icons.duckduckgo.com/ip3/www.savills.com.hk.ico",
-    );
-
-    fireEvent.error(favicon()!);
-    expect(favicon()).toHaveAttribute(
-      "src",
-      "https://www.google.com/s2/favicons?domain=www.savills.com.hk&sz=64",
-    );
-
-    fireEvent.error(favicon()!);
     expect(favicon()).not.toBeInTheDocument();
     expect(link.querySelector("svg")).toBeInTheDocument();
     expect(container).not.toHaveTextContent("SC");

@@ -113,6 +113,7 @@ class WorkspaceScopeResolver:
     default_workspace: str | Path
     default_restrict_to_workspace: bool
     scoped_channel: str = "websocket"
+    locked: bool = False
 
     @property
     def sandbox_status(self) -> WorkspaceSandboxStatus:
@@ -121,7 +122,7 @@ class WorkspaceScopeResolver:
     def default(self) -> WorkspaceScope:
         return default_workspace_scope(
             self.default_workspace,
-            self.default_restrict_to_workspace,
+            self.default_restrict_to_workspace or self.locked,
         )
 
     def for_message(
@@ -142,7 +143,7 @@ class WorkspaceScopeResolver:
         message_metadata: Any,
         session_metadata: Any,
     ) -> WorkspaceScope:
-        if channel != self.scoped_channel:
+        if self.locked or channel != self.scoped_channel:
             return self.default()
         return resolve_effective_workspace_scope(
             message_metadata=message_metadata,
@@ -153,6 +154,8 @@ class WorkspaceScopeResolver:
         )
 
     def persist_message_scope(self, session: Any, msg: Any) -> None:
+        if self.locked:
+            return
         if getattr(msg, "channel", None) != self.scoped_channel:
             return
         metadata = getattr(msg, "metadata", None)

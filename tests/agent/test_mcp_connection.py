@@ -359,7 +359,9 @@ async def test_mcp_tool_reconnects_after_session_terminated(
                 description="quote tool",
                 inputSchema={"type": "object", "properties": {}},
             )
-            registry.register(MCPToolWrapper(session, name, tool_def, tool_timeout=5))
+            # This quote query was explicitly verified as safe to replay.
+            registry.register(MCPToolWrapper(session, name, tool_def, tool_timeout=5,
+                                             retry_safe=True))
             stack = AsyncExitStack()
             await stack.__aenter__()
             stack.push_async_callback(_mark_closed, name)
@@ -413,7 +415,8 @@ async def test_mcp_reconnect_handler_uses_sanitized_server_prefix(
                 description="quote tool",
                 inputSchema={"type": "object", "properties": {}},
             )
-            registry.register(MCPToolWrapper(_FakeSession(connect_count), name, tool_def))
+            registry.register(MCPToolWrapper(_FakeSession(connect_count), name, tool_def,
+                                             retry_safe=True))
             stack = AsyncExitStack()
             await stack.__aenter__()
             stacks[name] = stack

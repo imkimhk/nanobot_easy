@@ -11,10 +11,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-MEMORY_TOOL_NAMES = frozenset({"search_memory", "read_memory_events"})
-
 from nanobot.memory.entity_extract import extract_entities
 from nanobot.memory.models import MemoryScope, RawEvent
+from nanobot.session.lifecycle import ensure_session_writable
+
+MEMORY_TOOL_NAMES = frozenset({"search_memory", "read_memory_events"})
 
 DEFAULT_DB_NAME = "conversation_memory.db"
 EVENT_TYPES = frozenset({
@@ -46,6 +47,7 @@ class ConversationEventStore:
         self._init_db()
 
     def connect(self) -> sqlite3.Connection:
+        ensure_session_writable(self.workspace)
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
@@ -224,9 +226,11 @@ class ConversationEventStore:
         self.insert_events([event])
         return event
 
-    def insert_events(self, events: Iterable[RawEvent]) -> None:
-        with self.connect() as conn:
-            with conn:
+    def insert_events(self, events: Iterable[RawEvent], *, connection=None) -> None:
+        from contextlib import nullcontext
+
+        with (nullcontext(connection) if connection is not None else self.connect()) as conn:
+            with (nullcontext() if connection is not None else conn):
                 for event in events:
                     cur = conn.execute(
                         """
@@ -329,8 +333,7 @@ class ConversationEventStore:
         return [chunk[:4000] for chunk in chunks if chunk.strip()]
 
     def _index_event_chunks_conn(self, conn: sqlite3.Connection, event: RawEvent) -> None:
-        conn.execute("DELETE FROM event_chunks_fts WHERE rowid IN (SELECT chunk_rowid FROM event_chunks WHERE event_id = ?)", (event.event_id,))
-        conn.execute("DELETE FROM event_chunks WHERE event_id = ?", (event.event_id,))
+        self._delete_event_chunks_conn(conn, event.event_id)
         for ordinal, text in enumerate(self._chunks_for_event(event), start=1):
             chunk_id = f"{event.event_id}#chunk-{ordinal}"
             cur = conn.execute(
@@ -338,6 +341,27 @@ class ConversationEventStore:
                 (chunk_id, event.event_id, ordinal, text),
             )
             conn.execute("INSERT INTO event_chunks_fts(rowid, text) VALUES (?, ?)", (cur.lastrowid, text))
+
+    @staticmethod
+    def _delete_event_chunks_conn(conn: sqlite3.Connection, event_id: str) -> None:
+        conn.execute(
+            "DELETE FROM event_chunks_fts WHERE rowid IN "
+            "(SELECT c.chunk_rowid FROM event_chunks c "
+            "JOIN event_chunks_fts_docsize d ON d.id = c.chunk_rowid WHERE c.event_id = ?)",
+            (event_id,),
+        )
+        conn.execute("DELETE FROM event_chunks WHERE event_id = ?", (event_id,))
+
+    def _delete_event_indexes_conn(
+        self, conn: sqlite3.Connection, event_rowid: int, event_id: str
+    ) -> None:
+        # External-content FTS also exposes unindexed source rows. Its docsize
+        # table records actual membership, including indexes from older policies.
+        if conn.execute(
+            "SELECT 1 FROM events_fts_docsize WHERE id = ?", (event_rowid,)
+        ).fetchone():
+            conn.execute("DELETE FROM events_fts WHERE rowid = ?", (event_rowid,))
+        self._delete_event_chunks_conn(conn, event_id)
 
     def rebuild_derived_indexes(self) -> None:
         """Rebuild FTS/entities from stored events, honoring current index policy."""
@@ -420,17 +444,24 @@ class ConversationEventStore:
             return 0
         placeholders = ",".join("?" for _ in ids)
         now = self.now_ts()
+        agent_sql, agent_params = self._agent_scope_sql(scope)
         with self.connect() as conn:
+            if purge:
+                conn.execute("PRAGMA secure_delete = ON")
             with conn:
                 rows = conn.execute(
-                    f"SELECT event_rowid, event_id FROM events WHERE event_id IN ({placeholders}) AND owner_id = ?",
-                    [*ids, scope.owner_id],
+                    f"""SELECT event_rowid, event_id FROM events
+                        WHERE event_id IN ({placeholders}) AND owner_id = ?
+                        AND workspace_id IN ({','.join('?' for _ in scope.workspace_ids)})
+                        {agent_sql}
+                        AND (redacted_at IS NULL OR
+                            (? AND (content IS NOT NULL OR metadata_json IS NOT NULL
+                                    OR content_hash IS NOT NULL)))""",
+                    [*ids, scope.owner_id, *scope.workspace_ids, *agent_params, purge],
                 ).fetchall()
                 count = 0
                 for row in rows:
-                    conn.execute("DELETE FROM events_fts WHERE rowid = ?", (row["event_rowid"],))
-                    conn.execute("DELETE FROM event_chunks_fts WHERE rowid IN (SELECT chunk_rowid FROM event_chunks WHERE event_id = ?)", (row["event_id"],))
-                    conn.execute("DELETE FROM event_chunks WHERE event_id = ?", (row["event_id"],))
+                    self._delete_event_indexes_conn(conn, row["event_rowid"], row["event_id"])
                     conn.execute("DELETE FROM entities WHERE event_id = ?", (row["event_id"],))
                     if purge:
                         conn.execute(
@@ -441,6 +472,32 @@ class ConversationEventStore:
                         conn.execute("UPDATE events SET redacted_at = ? WHERE event_id = ?", (now, row["event_id"]))
                     count += 1
                 return count
+
+    def purge_session(self, session_id: str) -> int:
+        """Remove a chat's raw events, indexes and derived tasks in one transaction.
+
+        Curated Markdown summaries and external backups have separate lifecycles.
+        This API is for the authenticated owner of this workspace database.
+        """
+        with self.connect() as conn:
+            conn.execute("PRAGMA secure_delete = ON")
+            rows = conn.execute(
+                "SELECT event_rowid, event_id, content FROM events WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+            # Task projections reference tasks without an ON DELETE CASCADE.
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_context_versions'"
+            ).fetchone():
+                conn.execute(
+                    "DELETE FROM task_context_versions WHERE session_id = ?",
+                    (session_id,),
+                )
+            for row in rows:
+                self._delete_event_indexes_conn(conn, row["event_rowid"], row["event_id"])
+                conn.execute("DELETE FROM tasks WHERE source_event_id = ?", (row["event_id"],))
+            conn.execute("DELETE FROM events WHERE session_id = ?", (session_id,))
+            return len(rows)
 
     @staticmethod
     def _agent_scope_sql(scope: MemoryScope) -> tuple[str, list[Any]]:

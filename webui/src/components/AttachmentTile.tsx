@@ -15,8 +15,22 @@ interface AttachmentTileProps {
 export function AttachmentTile({ attachment, className, inline = false, variant = "default" }: AttachmentTileProps) {
   const { t } = useTranslation();
   const [failed, setFailed] = useState(false);
-  const hasUrl = typeof attachment.url === "string" && attachment.url.length > 0;
+  const [approvedUrl, setApprovedUrl] = useState<string | null>(null);
+  const target = mediaTarget(attachment.url);
+  const hasUrl = target !== null;
   const label = attachmentLabel(attachment, t);
+
+  if (target?.remote && approvedUrl !== attachment.url
+      && (attachment.kind === "image" || attachment.kind === "video")) {
+    return (
+      <button type="button"
+        onClick={() => { setFailed(false); setApprovedUrl(attachment.url ?? null); }}
+        className={cn("my-2 rounded-xl border px-3 py-2 text-left text-sm", className)}>
+        {t("message.loadRemoteMedia", { defaultValue: "Load external media" })}
+        <span className="ml-2 break-all text-xs text-muted-foreground">{target.host}</span>
+      </button>
+    );
+  }
 
   if (attachment.kind === "image" && hasUrl && !failed) {
     return (
@@ -38,6 +52,7 @@ export function AttachmentTile({ attachment, className, inline = false, variant 
             alt={attachment.name ?? ""}
             loading="lazy"
             decoding="async"
+            referrerPolicy="no-referrer"
             draggable={false}
             onError={() => setFailed(true)}
             className={cn(
@@ -61,7 +76,7 @@ export function AttachmentTile({ attachment, className, inline = false, variant 
         <video
           src={attachment.url}
           controls
-          preload="auto"
+          preload="none"
           className={cn(
             "block w-full bg-black",
             variant === "compact" ? "max-h-40" : "max-h-[26rem]",
@@ -89,6 +104,8 @@ export function AttachmentTile({ attachment, className, inline = false, variant 
       <a
         href={attachment.url}
         download={attachment.name ?? label}
+        rel="noreferrer noopener"
+        referrerPolicy="no-referrer"
         title={attachment.name ?? undefined}
         aria-label={label}
         className={cn(
@@ -121,6 +138,26 @@ export function AttachmentTile({ attachment, className, inline = false, variant 
       </span>
     </div>
   );
+}
+
+/** Classify URLs before assigning them to active browser elements. */
+export function mediaTarget(value: string | undefined): { remote: boolean; host: string } | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value, window.location.href);
+    if (url.username || url.password) return null;
+    if (url.protocol === "data:") {
+      return /^data:image\/(?:png|jpeg|gif|webp|avif);base64,/i.test(value)
+        ? { remote: false, host: "" } : null;
+    }
+    if (url.protocol === "blob:" && url.origin === window.location.origin) {
+      return { remote: false, host: "" };
+    }
+    if (!/^https?:$/.test(url.protocol)) return null;
+    return { remote: url.origin !== window.location.origin, host: url.host };
+  } catch {
+    return null;
+  }
 }
 
 function AttachmentFrame({

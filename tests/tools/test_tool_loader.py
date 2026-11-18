@@ -143,6 +143,8 @@ def test_loader_registers_exec_with_real_tools_config(tmp_path):
 def test_fs_tool_create_builds_from_context():
     from nanobot.agent.tools.filesystem import ReadFileTool
     mock_config = MagicMock()
+    mock_config.safe_mode = False
+    mock_config.hardened_mode = False
     mock_config.restrict_to_workspace = False
     mock_config.exec.sandbox = ""
     ctx = ToolContext(config=mock_config, workspace="/tmp/test")
@@ -361,6 +363,8 @@ def test_loader_registers_same_tools_as_old_hardcoded():
     from nanobot.agent.tools.registry import ToolRegistry
 
     mock_config = MagicMock()
+    mock_config.safe_mode = False
+    mock_config.hardened_mode = False
     mock_config.exec.enable = True
     mock_config.exec.timeout = 60
     mock_config.exec.sandbox = ""

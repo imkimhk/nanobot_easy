@@ -1353,7 +1353,7 @@ function Shell({
 
   const onTurnEnd = useDeferredTitleRefresh(activeSession, refresh);
 
-  const onConfirmDelete = useCallback(async () => {
+  const onConfirmDelete = useCallback(async (deleteMemory = true) => {
     if (!pendingDelete) return;
     const key = pendingDelete.key;
     const hasAutomations = (pendingDelete.automations?.length ?? 0) > 0;
@@ -1365,7 +1365,7 @@ function Shell({
     try {
       const result = await deleteChat(
         key,
-        hasAutomations ? { deleteAutomations: true } : undefined,
+        { deleteAutomations: hasAutomations, deleteMemory },
       );
       if (result.blocked_by_automations) {
         setPendingDelete({

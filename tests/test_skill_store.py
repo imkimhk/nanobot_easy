@@ -992,6 +992,106 @@ def test_replayed_skill_trace_does_not_inflate_success_counters(tmp_path: Path) 
     assert len(store.recent_traces_for_skill("alpha")) == 1
 
 
+def test_selection_and_application_are_separate_idempotent_counts(tmp_path: Path) -> None:
+    for name in ("alpha", "beta"):
+        _write_skill(tmp_path / "skills", name, description=f"{name} helper")
+    store = SkillStore(tmp_path)
+    store.reindex(builtin_dir=tmp_path / "empty_builtin")
+    for _ in range(2):
+        store.record_trace(trace_id="choice-a", selected_skill="alpha", phase="selected")
+    store.record_trace(trace_id="choice-b", selected_skill="beta", phase="selected")
+    assert store.get_skill("alpha")["selection_count"] == 1
+    assert store.get_skill("alpha")["usage_count"] == 0
+    assert store.get_skill("beta")["selection_count"] == 1
+    for _ in range(2):
+        store.record_trace(trace_id="choice-b", selected_skill="beta", phase="applied",
+                           application_evidence="Applied Method to 12+18+7=37")
+    row = store.get_skill("beta")
+    assert (row["selection_count"], row["usage_count"], row["success_count"]) == (1, 1, 0)
+    store.record_trace(trace_id="choice-b", selected_skill="beta", phase="applied",
+                       application_evidence="Applied Method to 12+18+7=37", gate_result="ok")
+    assert store.get_skill("beta")["success_count"] == 1
+    store.reindex(builtin_dir=tmp_path / "empty_builtin")
+    assert store.get_skill("alpha")["selection_count"] == 1
+    assert store.get_skill("beta")["usage_count"] == 1
+    detail = store.managed_detail("beta")
+    assert detail["skill"]["selection_count"] == 1
+    assert detail["traces"][0]["phase"] == "applied"
+    assert detail["traces"][0]["application_evidence"].endswith("37")
+
+
+def test_trace_phase_validation_preserves_existing_counters(tmp_path: Path) -> None:
+    _write_skill(tmp_path / "skills", "alpha", description="Alpha helper")
+    store = SkillStore(tmp_path)
+    store.reindex(builtin_dir=tmp_path / "empty_builtin")
+    store.record_trace(trace_id="choice", selected_skill="alpha", phase="selected")
+    with pytest.raises(ValueError, match="application_evidence"):
+        store.record_trace(trace_id="choice", selected_skill="alpha", phase="applied")
+    with pytest.raises(ValueError, match="gate result"):
+        store.record_trace(trace_id="choice", selected_skill="alpha", phase="selected", gate_result="ok")
+    assert store.get_skill("alpha")["selection_count"] == 1
+    assert store.get_skill("alpha")["usage_count"] == 0
+
+
+def test_legacy_routing_migration_is_once_only_and_preserves_unknown_outcomes(tmp_path: Path) -> None:
+    _write_skill(tmp_path / "skills", "alpha", description="Alpha helper")
+    store = SkillStore(tmp_path)
+    store.reindex(builtin_dir=tmp_path / "empty_builtin")
+    store.record_trace(trace_id="skill_decision:old-choice", selected_skill="alpha")
+    store.record_trace(trace_id="old-work", selected_skill="alpha", gate_result="ok")
+    with store._connect() as conn:
+        # Simulate the previous released schema, including its mixed usage counter.
+        conn.execute("ALTER TABLE traces DROP COLUMN phase")
+        conn.execute("ALTER TABLE traces DROP COLUMN application_evidence")
+        conn.execute("ALTER TABLE skills DROP COLUMN selection_count")
+    for _ in range(2):
+        migrated = SkillStore(tmp_path)
+        row = migrated.get_skill("alpha")
+        assert (row["selection_count"], row["usage_count"], row["success_count"]) == (1, 1, 1)
+    traces = {t.trace_id: t for t in migrated.recent_traces_for_skill("alpha")}
+    assert traces["skill_decision:old-choice"].phase == "selected"
+    assert traces["old-work"].phase == "legacy"
+    assert len(traces) == 2
+
+
+def test_trace_phase_and_counters_roll_back_together(tmp_path: Path) -> None:
+    _write_skill(tmp_path / "skills", "alpha", description="Alpha helper")
+    store = SkillStore(tmp_path)
+    store.reindex(builtin_dir=tmp_path / "empty_builtin")
+    store.record_trace(trace_id="choice", selected_skill="alpha", phase="selected")
+    with store._connect() as conn:
+        conn.execute("""CREATE TRIGGER reject_phase_count BEFORE UPDATE OF selection_count ON skills
+                        BEGIN SELECT RAISE(ABORT, 'phase count failed'); END""")
+    with pytest.raises(sqlite3.IntegrityError, match="phase count failed"):
+        store.record_trace(trace_id="choice", selected_skill="alpha", phase="applied",
+                           application_evidence="actual output")
+    row = store.get_skill("alpha")
+    assert (row["selection_count"], row["usage_count"]) == (1, 0)
+    assert store.recent_traces_for_skill("alpha")[0].phase == "selected"
+
+
+def test_failed_legacy_migration_rolls_back_schema_and_counts(tmp_path: Path) -> None:
+    _write_skill(tmp_path / "skills", "alpha", description="Alpha helper")
+    store = SkillStore(tmp_path)
+    store.reindex(builtin_dir=tmp_path / "empty_builtin")
+    store.record_trace(trace_id="skill_decision:old-choice", selected_skill="alpha")
+    with store._connect() as conn:
+        conn.execute("ALTER TABLE traces DROP COLUMN phase")
+        conn.execute("ALTER TABLE traces DROP COLUMN application_evidence")
+        conn.execute("ALTER TABLE skills DROP COLUMN selection_count")
+        conn.execute("""CREATE TRIGGER reject_migration BEFORE UPDATE OF usage_count ON skills
+                        BEGIN SELECT RAISE(ABORT, 'migration failed'); END""")
+    with pytest.raises(sqlite3.IntegrityError, match="migration failed"):
+        SkillStore(tmp_path)
+    with store._connect() as conn:
+        assert "phase" not in {r["name"] for r in conn.execute("PRAGMA table_info(traces)")}
+        assert conn.execute("SELECT usage_count FROM skills WHERE name='alpha'").fetchone()[0] == 1
+        conn.execute("DROP TRIGGER reject_migration")
+    migrated = SkillStore(tmp_path)
+    assert migrated.get_skill("alpha")["selection_count"] == 1
+    assert migrated.get_skill("alpha")["usage_count"] == 0
+
+
 def test_skill_trace_outcome_correction_replaces_previous_counts(tmp_path: Path) -> None:
     _write_skill(tmp_path / "skills", "alpha", description="Alpha helper")
     store = SkillStore(tmp_path)

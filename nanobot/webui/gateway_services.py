@@ -62,6 +62,7 @@ def build_gateway_services(
         session_manager=session_manager,
         default_workspace=workspace_path,
         default_restrict_to_workspace=default_restrict_to_workspace,
+        controls_enabled=config.workspace_controls_enabled,
     )
     http = GatewayHTTPHandler(
         config=config,

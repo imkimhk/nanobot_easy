@@ -168,19 +168,24 @@ class WebUIWorkspaceController:
         session_manager: Any | None,
         default_workspace: Path,
         default_restrict_to_workspace: bool,
+        controls_enabled: bool = True,
     ) -> None:
         self._sessions = session_manager
         self._default_workspace = default_workspace
         self._default_restrict_to_workspace = default_restrict_to_workspace
+        self._controls_enabled = controls_enabled
 
     def default_scope(self) -> WorkspaceScope:
+        if not self._controls_enabled:
+            return default_workspace_scope(self._default_workspace, True,
+                                           source_channel=_WEBUI_SCOPE_CHANNEL)
         return default_scope_for_webui(
             self._default_workspace,
             self._default_restrict_to_workspace,
         )
 
     def scope_for_session_key(self, session_key: str) -> WorkspaceScope:
-        if self._sessions is None:
+        if not self._controls_enabled or self._sessions is None:
             return self.default_scope()
         metadata_reader = getattr(self._sessions, "read_session_metadata", None)
         if callable(metadata_reader):
@@ -201,11 +206,15 @@ class WebUIWorkspaceController:
             return self.default_scope()
 
     def payload(self, *, controls_available: bool) -> dict[str, Any]:
-        return workspaces_payload(
+        payload = workspaces_payload(
             default_workspace=self._default_workspace,
             default_restrict_to_workspace=self._default_restrict_to_workspace,
-            controls_available=controls_available,
+            controls_available=controls_available and self._controls_enabled,
         )
+        if not self._controls_enabled:
+            payload["default_scope"] = self.default_scope().payload()
+            payload["default_access_mode"] = "default"
+        return payload
 
     def scope_from_envelope(
         self,
@@ -215,6 +224,11 @@ class WebUIWorkspaceController:
         controls_available: bool,
     ) -> WorkspaceScope:
         raw = envelope.get(WORKSPACE_SCOPE_METADATA_KEY)
+        if not self._controls_enabled:
+            scope = self.default_scope()
+            if raw is not None and raw != scope.metadata():
+                raise WorkspaceScopeError("workspace is locked by security policy", status=403)
+            return scope
         if raw is None and session_key:
             scope = self.scope_for_session_key(session_key)
         elif raw is None:

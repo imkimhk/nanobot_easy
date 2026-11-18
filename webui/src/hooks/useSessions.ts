@@ -52,7 +52,7 @@ export function useSessions(): {
   forkChat: (sourceChatId: string, beforeUserIndex: number, title?: string) => Promise<string>;
   deleteChat: (
     key: string,
-    options?: { deleteAutomations?: boolean },
+    options?: { deleteAutomations?: boolean; deleteMemory?: boolean },
   ) => Promise<SessionDeleteResult>;
   getSessionAutomations: (key: string) => Promise<SessionAutomationJob[]>;
 } {
@@ -152,7 +152,7 @@ export function useSessions(): {
   }, [client]);
 
   const deleteChat = useCallback(
-    async (key: string, options?: { deleteAutomations?: boolean }) => {
+    async (key: string, options?: { deleteAutomations?: boolean; deleteMemory?: boolean }) => {
       const result = await apiDeleteSession(tokenRef.current, key, options);
       if (!result.deleted) return result;
       optimisticKeysRef.current.delete(key);

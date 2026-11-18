@@ -172,6 +172,7 @@ These variables are process-level switches. Set them in the same terminal, servi
 | `NANOBOT_MAX_CONCURRENT_REQUESTS` | `3` | Maximum concurrently running inbound agent requests. Must be an integer; set `0` or a negative value for unlimited. |
 | `NANOBOT_LLM_TIMEOUT_S` | `300` | Wall-clock timeout, in seconds, around ordinary LLM requests. Set `0` to disable. Sustained-goal turns bypass this wall-clock cap. |
 | `NANOBOT_STREAM_IDLE_TIMEOUT_S` | `90` | Streaming idle timeout, in seconds, used by streaming providers. Invalid or non-positive values are ignored; values above `3600` are clamped. |
+| `NANOBOT_LLM_CALL_TIMEOUT_S` | `900` | Wall-clock limit, in seconds, for one provider attempt, streaming or not (also applies to sustained-goal turns). A hit ends as a `timeout` error handled by the normal retry policy. Set `0` to disable; values above `7200` are clamped. |
 | `NANOBOT_OPENAI_COMPAT_TIMEOUT_S` | `120` | HTTP request timeout, in seconds, for OpenAI-compatible providers. Invalid or non-positive values are ignored. |
 | `NANOBOT_WORKSPACE_SANDBOX_ENFORCED` | unset | Marks that an external workspace sandbox is already enforced. Truthy values (`1`, `true`, `yes`, `on`, `enabled`) use `NANOBOT_WORKSPACE_SANDBOX_PROVIDER` as the label; any other non-false value is treated as the provider name. |
 | `NANOBOT_WORKSPACE_SANDBOX_PROVIDER` | `unknown` | Display label for the external workspace sandbox when `NANOBOT_WORKSPACE_SANDBOX_ENFORCED` is truthy, for example `macos_app_sandbox` or `bwrap`. |
@@ -1298,6 +1299,15 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct --port 8000
 
 Contributor notes for adding new providers live in [`development.md`](./development.md#adding-an-llm-provider).
 
+## Selective Long-term Memory
+
+`agents.defaults.selectiveMemory` defaults to `false`. When enabled, only notes
+explicitly placed under `## Reference Notes` (or `## 참고 메모`) in MEMORY.md are
+selected for the current request. Existing mixed memory and all other sections
+stay fully included. This does not automatically classify or migrate old memory.
+Read [the format, safeguards and limitations](./design/selective-memory.md) before
+enabling it. The operating gateway must restart to load the setting.
+
 ## Model Presets
 
 Model presets let you name a complete model configuration and switch it at runtime with `/model <preset>`. They are the recommended way to configure models because the same names can be reused for startup selection, chat-command switching, and fallback chains.
@@ -1365,6 +1375,45 @@ Existing configs do not need to change. Direct `agents.defaults.model`, `provide
 `default` is reserved and always means the implicit preset built from direct `agents.defaults.*` fields; do not define `modelPresets.default`. Use `/model default` to switch back to those direct fields in an existing config.
 
 Set `agents.defaults.modelPreset` to choose the startup preset. When `modelPreset` is `null` or omitted, startup uses the implicit `default` preset from direct `agents.defaults.*` fields. Runtime changes made with `/model <preset>` are not written back to `config.json`; they affect future turns until the process restarts or another model/config change replaces them.
+
+### Session history replay budget
+
+`agents.defaults.historyContextTokens` limits replay of previous conversation turns
+to an estimated 16,000 tokens by default. Set it to `0` to use the available model
+window as before, or set an explicit positive budget. `contextWindowTokens` still
+controls the model window and active execution; this setting does not limit tool
+permissions, command duration, or the number of tool iterations.
+
+Raw session history and acquisition proofs remain stored. Old per-request task
+control messages stay in the audit history but are not sent back to the model;
+current guidance is regenerated from current evidence. When a previous tool turn
+exceeds the replay budget, the user request and a legal recent tail are retained
+without restoring its entire tool transcript. A necessary user request can itself
+exceed the budget.
+
+### Task evidence and completion checks
+
+`agents.defaults.stepwise.lightweight` enables optional task evidence checks independently
+of `stepwise.enabled`; it defaults to `false`. Keep selected read targets limited to the
+requested files or line/page ranges. Runtime diagnostics should select the relevant log
+range rather than require the entire growing log.
+
+Text file reads paginate within `agents.defaults.maxToolResultChars` (default 16,000
+characters), returning a continuation offset. Only complete returned lines count as
+acquired evidence. Ranges from changing files can be joined only after their content
+hashes are checked against a stable current snapshot; unread appended lines do not count.
+An individual line exceeding the output budget requires another text-processing approach.
+
+Acquisition proofs for the active request and previously read targets selected by the
+current request are retained, including files read in more than 40 pages. Only unrelated
+proofs from older requests are trimmed to the latest 40 records. These records contain
+coverage and content hashes, not copies of source text. Model guidance and `update_task`
+responses still show at most 20 recent proofs, so a large task does not expand that view.
+
+The task evidence wrapper does not shorten native exec/session or MCP tool timeouts.
+Their own configured limits still apply, and user cancellation remains effective.
+Partial, blocked and clarification reports are delivered with their actual answer body
+and incomplete status, without another model call solely to repeat that report.
 
 ### Model Fallbacks
 
@@ -1873,6 +1922,67 @@ Add MCP servers to your `config.json`:
 }
 ```
 
+### OAuth login and automatic refresh
+
+HTTP/SSE servers can opt into OAuth instead of a fixed `Authorization` header:
+
+```json
+{
+  "tools": {
+    "mcpServers": {
+      "playmcp": {
+        "url": "https://playmcp.kakao.com/mcp",
+        "oauth": { "enabled": true }
+      }
+    }
+  }
+}
+```
+
+Run browser authorization for a configured server (OAuth can initially be disabled):
+
+```bash
+nanobot mcp login playmcp --config /path/to/config.json
+nanobot mcp status playmcp --config /path/to/config.json
+nanobot mcp logout playmcp --config /path/to/config.json
+```
+
+`login` uses the MCP SDK's discovery, client registration and authorization-code
+flow with PKCE S256 and state validation. It listens only on `127.0.0.1:8768`
+at `/callback` while login is pending. Set `oauth.callbackPort` to change the
+port, or use `--no-browser` to print the authorization link. Approve access in
+your browser; do not paste credentials into chat. On successful authorization,
+the selected config enables OAuth and removes its obsolete `Authorization`
+header, while retaining other settings and environment-variable references.
+Reload MCP or restart the gateway to activate it. Login failure preserves the
+previous config and stored credentials.
+
+Credentials, client registration, the discovered issuer/token endpoint and
+absolute expiry are stored outside the workspace under the active config
+directory's `.secrets/mcp-oauth/<hash>/auth.json` (directories 0700, files 0600).
+File tools and previews deny this credential filename. `status` shows only
+login/refresh availability and expiry, never token values. `logout` removes
+local credentials; provider-side revocation remains a separate account action.
+
+Matching server names and URLs in the same config directory share credentials.
+Set `oauth.profile` to a common value to share credentials across differently
+named servers, or distinct values to keep accounts separate. Logout affects all
+configs using that same profile. A process lock serializes refresh-token rotation
+across gateways; each request reloads the current stored token. Refresh occurs
+on use shortly before expiry or once after a 401; there is no polling timer.
+
+Refresh requires a server-issued refresh token. If one is absent or revoked,
+the gateway reports that login is required instead of launching a browser or
+registering another client in the background. Network/server errors retain
+credentials for a later retry. `oauth.clientId` and `oauth.issuer` support a
+pre-registered client; `oauth.clientSecret` is optional. The SDK also supports
+`oauth.clientMetadataUrl` when the authorization server advertises it.
+
+All discovery, registration and token requests retain SSRF/DNS validation and
+require HTTPS. Token requests do not forward MCP custom headers, and OAuth
+clients do not follow redirects. Stdio servers and HTTP servers without
+`oauth.enabled` keep their existing behavior.
+
 Two transport modes are supported:
 
 | Mode | Config | Example |
@@ -1922,6 +2032,20 @@ Use `enabledTools` to register only a subset of tools from an MCP server:
 
 MCP tools are automatically discovered and registered on startup. The LLM can use them alongside built-in tools — no extra configuration needed.
 
+Tool calls are not automatically repeated after an uncertain failure by default. A lost
+reply, timeout, server cancellation, malformed reply, or tool error does not prove that a
+remote change failed. The result instructs the agent to inspect remote state before
+repeating the operation. A terminated connection can still be refreshed for subsequent
+work without replaying the failed call. User cancellation continues to stop execution.
+
+For tools whose implementation you have verified is read-only or idempotent, set
+`tools.mcpServers.<name>.retrySafeTools` to exact raw or wrapped tool names, for example
+`["get_status", "mcp_filesystem_read_file"]`. Such tools may retry once after a transient
+connection failure, with at most two calls total including a reconnect attempt. The
+default is `[]`; wildcard entries do not enable retries. This list grants no execution
+permission and does not change mutation classification. Server-supplied annotations do
+not enable retries. Resource and prompt reads retain their existing recovery behavior.
+
 
 
 
@@ -1940,6 +2064,7 @@ For API keys, tokens, and other secrets, see [Environment Variables for Secrets]
 | `tools.exec.timeout` | `60` | Default hard timeout in seconds for shell commands. Config values may exceed the per-call tool cap; set `0` to disable the hard timeout for trusted long-running commands. |
 | `tools.exec.pathPrepend` | `""` | Extra directories to prepend to `PATH` when running shell commands. Use this when configured tools should win executable lookup precedence, such as a Python virtual environment's `bin` or `Scripts` directory. |
 | `tools.exec.pathAppend` | `""` | Extra directories to append to `PATH` when running shell commands (e.g. `/usr/sbin` for `ufw`). |
+| `tools.exec.backgroundTimeout` | `1800` | Hard limit (seconds) for `exec` jobs started with `background=true` when the call gives no `timeout`; `0` = no limit. Job logs are written under `<workspace>/.nanobot/exec-jobs/`. |
 | `tools.webuiAllowRemotePackageInstall` | `false` | When `false`, the WebUI can install missing optional packages only from a browser opened on the same machine as nanobot. Set to `true` only when a trusted remote admin is allowed to install Python packages into this nanobot environment. |
 | `tools.ssrfWhitelist` | `[]` | CIDR ranges exempted from the shared SSRF guard used by web fetches and HTTP/SSE MCP connections. Prefer exact host CIDRs such as `192.168.1.50/32`; broad ranges increase SSRF exposure. |
 | `channels.*.allowFrom` | omitted | Access control per channel. Omit to use pairing-only mode; set `["*"]` to allow everyone; or list specific user IDs. See [Pairing](#pairing) for details. |

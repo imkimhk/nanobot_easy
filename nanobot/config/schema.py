@@ -151,12 +151,32 @@ class ContextSelectionConfig(Base):
 
     enabled: bool = False
     failure_mode: Literal["block", "legacy"] = "block"
+    time_allocation_contract_enabled: bool = False
     recent_messages: int = Field(default=8, ge=2, le=40)
     search_tokens: int = Field(default=4000, ge=500, le=20000)
     design_max_tokens: int = Field(default=3000, ge=512, le=12000)
-    design_timeout_seconds: int = Field(default=20, ge=1, le=300)  # Entire design, including repair.
+    # Budget for the FIRST design call only: auth (incl. one 401 refresh+resend),
+    # request, stream, extraction and bounded transient retries. Not shared with repair.
+    design_timeout_seconds: int = Field(default=90, ge=1, le=300)
+    # Separate, shorter budget for the single repair call made only after a received
+    # proposal failed schema/semantic validation.
+    design_repair_timeout_seconds: int = Field(default=12, ge=1, le=120)
+    # Transient-error re-sends per design call (each waits at most 2s), inside that call's budget.
+    design_transient_retries: int = Field(default=1, ge=0, le=3)
     design_reasoning_effort: Literal["low", "medium", "high"] | None = "low"
+    # Opt-in: the designer also sees the agent's persona (bootstrap files) and hot-path skills,
+    # because a direct answer is delivered verbatim from the design. Rules/validation unchanged.
+    design_persona: bool = False
+    # t28: the design has one delivery format, the submit_context_design function call,
+    # validated only from the provider's completed result (no text early-accept path).
     execution_target_tokens: int = Field(default=16000, ge=2000)
+    # t54 whole-request budget (shared by design, repair, executor, internal retries, returns, fixes).
+    # None = not set here: generation sends then default to the existing loop cap (max_tool_iterations)
+    # plus the design/repair/finalization sends; no whole-request deadline (per-call timeouts apply).
+    # Production values per task size are left to measurement.
+    task_generation_attempts: int | None = Field(default=None, ge=1)
+    task_deadline_seconds: float | None = Field(default=None, gt=0)
+    task_token_budget: int | None = Field(default=None, ge=1)   # enforced only while usage is reported
 
 
 class AgentDefaults(Base):
@@ -170,13 +190,18 @@ class AgentDefaults(Base):
     )
     max_tokens: int = 8192
     context_window_tokens: int = 200_000
+    history_context_tokens: int = Field(default=16_000, ge=0, le=1_000_000)
     context_block_limit: int | None = None
     context_selection: ContextSelectionConfig = Field(default_factory=ContextSelectionConfig)
+    compact_context: bool = False  # Opt-in: defer execution tutorials/schemas until needed.
+    selective_memory: bool = False  # Opt-in: select explicitly marked reference notes only.
     temperature: float = 0.1
     fallback_models: list[FallbackCandidate] = Field(default_factory=list)
     max_tool_iterations: int = 200
     max_concurrent_subagents: int = Field(default=1, ge=1)
     skills: list[str] = Field(default_factory=list)  # Main-agent Hot Path skills preloaded into the prompt.
+    preload_always_skills: bool = True  # False keeps skill bodies on demand; discovery is unchanged.
+    on_demand_skills: list[str] = Field(default_factory=list)  # Compact discovery cards, never full bodies.
     proactive_skill_cards: bool = Field(
         default=False,
         validation_alias=AliasChoices("proactiveSkillCards", "proactive_skill_cards"),
@@ -443,6 +468,19 @@ class SkillsConfig(Base):
     embedding: SkillEmbeddingConfig = Field(default_factory=SkillEmbeddingConfig)
 
 
+class MCPOAuthConfig(Base):
+    """Opt-in OAuth for HTTP MCP; credentials are stored separately from config."""
+
+    enabled: bool = False
+    profile: str = ""  # Same profile/server + URL in one data directory shares credentials.
+    scope: str | None = None
+    client_id: str | None = None
+    issuer: str | None = None  # Required for pre-registered client IDs.
+    client_secret: str | None = Field(default=None, repr=False)
+    client_metadata_url: str | None = None
+    callback_port: int = Field(default=8768, ge=1024, le=65535)
+
+
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
 
@@ -453,7 +491,9 @@ class MCPServerConfig(Base):
     cwd: str = ""  # Stdio: working directory for MCP server runtime artifacts
     url: str = ""  # HTTP/SSE: endpoint URL
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
+    oauth: MCPOAuthConfig = Field(default_factory=MCPOAuthConfig)
     tool_timeout: int = 30  # seconds before a tool call is cancelled
+    retry_safe_tools: list[str] = Field(default_factory=list)  # Exact raw/wrapped names verified by the operator as read-only or idempotent; no wildcard matching
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all capabilities (tools, resources, prompts); any restriction = only listed tools, no resources/prompts
 
 
@@ -535,6 +575,7 @@ class ToolsConfig(Base):
         validation_alias=AliasChoices("safeMode", "safe_mode"),
     )  # server-side policy intent for beginner/student surfaces; CLI keeps existing defaults
     restrict_to_workspace: bool = False  # policy intent: keep tool access inside workspace when possible
+    hardened_mode: bool = False  # lock workspace; disable native code, plugins and MCP execution
     webui_allow_local_service_access: bool = Field(
         default=True,
         validation_alias=AliasChoices(
