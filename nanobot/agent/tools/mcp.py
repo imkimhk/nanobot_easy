@@ -843,8 +843,9 @@ async def connect_mcp_servers(
     """Connect to configured MCP servers and register their tools, resources, prompts.
 
     Returns a dict mapping server name -> its dedicated AsyncExitStack.
-    Each server gets its own stack to prevent cancel scope conflicts
-    when multiple MCP servers are configured.
+    Each server's transport contexts live in one dedicated owner task. The
+    returned stacks only signal that task to close: callers never enter/exit
+    SDK cancel scopes, including during hot reload and reconnection.
     """
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.sse import sse_client
@@ -1108,20 +1109,66 @@ async def connect_mcp_servers(
 
     server_stacks: dict[str, AsyncExitStack] = {}
 
-    for name, cfg in mcp_servers.items():
-        try:
-            result = await connect_single_server(name, cfg)
-        except BaseException as e:
-            logger.warning(
-                "MCP server '{}' connection failed before isolation: {}",
-                name,
-                type(e).__name__,
-            )
-            continue
-        if result is not None and result[1] is not None:
-            server_stacks[result[0]] = result[1]
+    try:
+        for name, cfg in mcp_servers.items():
+            stack = await _connect_owned(name, cfg, connect_single_server)
+            if stack is not None:
+                server_stacks[name] = stack
+    except BaseException:
+        # Cancellation partway through startup must not orphan earlier owners.
+        for stack in server_stacks.values():
+            await stack.aclose()
+        raise
 
     return server_stacks
+
+
+async def _connect_owned(name: str, cfg: Any, connect: Callable) -> AsyncExitStack | None:
+    """Keep SDK task groups out of the agent/request task's cancellation scope."""
+    ready = asyncio.get_running_loop().create_future()
+    closing = asyncio.Event()
+
+    async def own_connection() -> None:
+        stack = None
+        try:
+            _, stack = await connect(name, cfg)
+            ready.set_result(stack is not None)
+            if stack is not None:
+                await closing.wait()
+        except BaseException as exc:
+            # AnyIO may cancel the transport's host task when a receive task
+            # fails. It is this owner, never the agent loop or a user request.
+            logger.warning("MCP server '{}': connection ended ({})", name, type(exc).__name__)
+        finally:
+            if not ready.done():
+                ready.set_result(False)
+            if stack is not None:
+                with suppress(BaseException):
+                    await stack.aclose()
+
+    owner = asyncio.create_task(own_connection(), name=f"nanobot-mcp-{name}")
+
+    async def close() -> None:
+        closing.set()
+        # A cancelled request must not cancel a second task while its SDK
+        # scopes are unwinding. Shutdown still awaits a normal owner exit.
+        await asyncio.shield(owner)
+
+    try:
+        connected = await asyncio.shield(ready)
+    except asyncio.CancelledError:
+        closing.set()
+        # Stop an in-progress initialize/probe too. The same owner unwinds it.
+        owner.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.shield(owner)
+        raise
+    if not connected:
+        await asyncio.shield(owner)
+        return None
+    handle = AsyncExitStack()
+    handle.push_async_callback(close)
+    return handle
 
 
 def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
