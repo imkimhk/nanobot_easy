@@ -144,6 +144,9 @@ class StepwiseConfig(Base):
     review_required: list[str] = Field(default_factory=list)  # procedure ids whose S6 model review always runs
     z3_check: bool = False  # Z3 entailment in rule judgments; off until rules are formalized
     lightweight: bool = False  # Explicit per-gateway opt-in; independent of stepwise.enabled.
+    # Experimental, off until a same-condition model comparison justifies it: show the model
+    # which earlier reads still match the current file content (lightweight task evidence).
+    verified_read_summary: bool = False
 
 
 class ContextSelectionConfig(Base):
@@ -191,6 +194,9 @@ class AgentDefaults(Base):
     max_tokens: int = 8192
     context_window_tokens: int = 200_000
     history_context_tokens: int = Field(default=16_000, ge=0, le=1_000_000)
+    # Opt-in, unverified with real models: quote earlier user messages that state limits,
+    # permissions or changes when replay history no longer contains them.
+    preserve_user_scope_messages: bool = False
     context_block_limit: int | None = None
     context_selection: ContextSelectionConfig = Field(default_factory=ContextSelectionConfig)
     compact_context: bool = False  # Opt-in: defer execution tutorials/schemas until needed.

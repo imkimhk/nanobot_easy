@@ -15,6 +15,7 @@ from nanobot.apps.cli import utils as cli_app_utils
 from nanobot.bus.events import InboundMessage
 from nanobot.session.conversation_focus import focus_runtime_lines
 from nanobot.session.goal_state import goal_state_runtime_lines
+from nanobot.session.user_scope_messages import quote_message
 from nanobot.utils.helpers import (
     current_time_str,
     detect_image_mime,
@@ -365,6 +366,8 @@ class ContextBuilder:
         include_memory_recent_history: bool = True,
         session_key: str | None = None,
         unified_session: bool = False,
+        earlier_user_messages: str | None = None,
+        earlier_user_visibility: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         root = workspace or self.workspace
@@ -427,8 +430,16 @@ class ContextBuilder:
         if messages[-1].get("role") == current_role:
             last = dict(messages[-1])
             last["content"] = self._merge_message_content(last.get("content"), merged)
+            if earlier_user_messages:
+                # Merged into the history tail: the quotes go before it, so the current request
+                # stays last; the save boundary counts them (prepare_save_boundary).
+                messages.insert(len(messages) - 1, quote_message(earlier_user_messages, earlier_user_visibility))
             messages[-1] = last
             return messages
+        if earlier_user_messages:
+            # Opt-in quotes are their own hidden message, so request classifiers, task notes
+            # and persistence never read them as the current user request.
+            messages.append(quote_message(earlier_user_messages, earlier_user_visibility))
         messages.append({"role": current_role, "content": merged})
         return messages
 

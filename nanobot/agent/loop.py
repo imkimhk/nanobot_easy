@@ -248,6 +248,7 @@ class AgentLoop:
         stepwise_layout: str = "auto",
         stepwise_review_required: list[str] | None = None,
         stepwise_lightweight: bool = False,
+        task_note_verified_reads: bool = False,
         max_tool_result_chars: int | None = None,
         fail_on_tool_error: bool | None = None,
         provider_retry_mode: str = "standard",
@@ -286,6 +287,7 @@ class AgentLoop:
         compact_context: bool = False,
         selective_memory: bool = False,
         history_context_tokens: int | None = None,
+        preserve_user_scope_messages: bool = False,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -318,6 +320,8 @@ class AgentLoop:
             defaults.history_context_tokens
             if history_context_tokens is None else history_context_tokens
         )
+        # Opt-in: quote earlier user scope messages that replay no longer contains.
+        self.preserve_user_scope_messages = preserve_user_scope_messages
         self.compact_context = compact_context
         self.context_block_limit = context_block_limit
         self.reasoning_effort = reasoning_effort
@@ -328,6 +332,7 @@ class AgentLoop:
         self.stepwise_layout = stepwise_layout
         self.stepwise_review_required = list(stepwise_review_required or [])
         self.stepwise_lightweight = stepwise_lightweight
+        self.task_note_verified_reads = task_note_verified_reads
         if stepwise_lightweight:
             logger.info("Lightweight task evidence enabled for workspace {}", workspace)
         if stepwise_enabled:
@@ -541,6 +546,8 @@ class AgentLoop:
             max_subagent_depth=defaults.max_subagent_depth,
             context_window_tokens=context_window_tokens,
             history_context_tokens=extra.pop("history_context_tokens", defaults.history_context_tokens),
+            preserve_user_scope_messages=extra.pop(
+                "preserve_user_scope_messages", defaults.preserve_user_scope_messages),
             context_block_limit=defaults.context_block_limit,
             context_selection=defaults.context_selection,
             compact_context=defaults.compact_context,
@@ -552,6 +559,7 @@ class AgentLoop:
             stepwise_layout=defaults.stepwise.layout,
             stepwise_review_required=defaults.stepwise.review_required,
             stepwise_lightweight=defaults.stepwise.lightweight,
+            task_note_verified_reads=defaults.stepwise.verified_read_summary,
             max_tool_result_chars=defaults.max_tool_result_chars,
             fail_on_tool_error=defaults.fail_on_tool_error,
             provider_retry_mode=defaults.provider_retry_mode,
@@ -932,6 +940,8 @@ class AgentLoop:
                 extra.setdefault("memory_event_id", "E" + uuid.uuid4().hex)
             before_count = len(session.messages)
             session.add_message("user", text, **extra)
+            if text_override is None and not automation_extra and not kwargs.get("_command"):
+                self._record_user_scope_message(msg, session, text, session.messages[-1].get("timestamp"))
             self.conversation_memory.insert_events(
                 self._memory_events_from_session_messages(
                     msg=msg,
@@ -956,6 +966,14 @@ class AgentLoop:
         """Build the initial message list for the LLM turn."""
         scope = self.workspace_scopes.for_message(msg, session.metadata)
         current_runtime_lines = self._proactive_skill_card_lines(msg, session)
+        earlier_user_messages = None
+        earlier_user_visibility = {}
+        if getattr(self, "preserve_user_scope_messages", False):
+            from nanobot.session.user_scope_messages import build_block
+            earlier_user_messages = build_block(
+                session.metadata, session_key=session.key, workspace=str(scope.project_path),
+                history=history, current_text=msg.content if isinstance(msg.content, str) else "",
+                session_messages=session.messages, visibility=earlier_user_visibility)
         return self.context.build_messages(
             history=history,
             current_message=image_generation_prompt(msg.content, msg.metadata),
@@ -972,7 +990,26 @@ class AgentLoop:
             include_memory_recent_history=include_memory_recent_history,
             session_key=session.key,
             unified_session=self._unified_session,
+            **({"earlier_user_messages": earlier_user_messages,
+                "earlier_user_visibility": earlier_user_visibility} if earlier_user_messages else {}),
         )
+
+    def _record_user_scope_message(
+        self, msg: InboundMessage, session: Session, text: str, timestamp: str | None = None,
+    ) -> None:
+        """Opt-in: keep a verbatim copy of a genuine channel user message that states scope."""
+        if not getattr(self, "preserve_user_scope_messages", False):
+            return
+        if msg.sender_id == "subagent" or msg.channel == "system":
+            return
+        from datetime import datetime
+
+        from nanobot.session.user_scope_messages import record
+        metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
+        scope = self.workspace_scopes.for_message(msg, session.metadata)
+        record(session.metadata, session_key=session.key, workspace=str(scope.project_path),
+               text=text, timestamp=timestamp or datetime.now().isoformat(),
+               message_id=metadata.get("message_id"), channel=msg.channel)
 
     async def _dispatch_command_inline(
         self,
@@ -1204,6 +1241,7 @@ class AgentLoop:
                 task_note_enabled=bool(getattr(self, "stepwise_lightweight", False)) and user_facing,
                 task_note_metadata=session_metadata,
                 task_note_persist_callback=(lambda: self.sessions.save(session)) if session else None,
+                task_note_verified_reads=bool(getattr(self, "task_note_verified_reads", False)),
                 premature_final_session_metadata=session_metadata if user_facing else None,
                 tools=tools or self.tools,
                 model=self.model,
@@ -2595,6 +2633,8 @@ class AgentLoop:
         for m in messages[skip:]:
             if m.get("_answer_delivery_feedback"):
                 continue  # Runtime feedback is not a new human instruction or durable memory.
+            if m.get("_user_scope_quotes"):
+                continue  # Opt-in quotes of earlier messages are rebuilt each turn, never stored.
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):

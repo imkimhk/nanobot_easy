@@ -300,6 +300,8 @@ class Session:
 
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
+        # Quotes of this conversation's user messages (opt-in) end with the conversation.
+        self.metadata.pop("user_scope_messages", None)
         self.messages = []
         self.last_consolidated = 0
         self.updated_at = datetime.now()

@@ -163,6 +163,7 @@ class AgentRunSpec:
     task_note_metadata: dict[str, Any] | None = None
     task_state: Any | None = None
     task_note_persist_callback: Any | None = None
+    task_note_verified_reads: bool = False
     stall_guard: bool = True
 
 
@@ -372,12 +373,21 @@ class AgentRunner:
             spec.selected_context.trace.stage = "legacy_fallback" if spec.selected_context.legacy_fallback else "execute"
             if spec.selected_context.control is None:
                 spec.selected_context.control = TaskControl(spec.selected_context)
-        from nanobot.agent.task_note import TaskNote, TaskTools, active_task_note, needs_note
+        from nanobot.agent.task_note import (
+            TaskNote,
+            TaskTools,
+            active_task_note,
+            needs_note,
+            read_permission,
+        )
 
         task_token = None
         if spec.task_note_enabled and needs_note(spec.initial_messages):
             note = TaskNote(spec.initial_messages, spec.workspace, spec.task_note_metadata,
-                            spec.task_note_persist_callback)
+                            spec.task_note_persist_callback,
+                            verified_reads=spec.task_note_verified_reads,
+                            read_allowed=(read_permission(spec.tools)
+                                          if spec.task_note_verified_reads else None))
             spec = replace(spec, task_state=note, tools=TaskTools(spec.tools, note),
                            initial_messages=[*spec.initial_messages, note.guidance()],
                            stream_progress_deltas=False)
@@ -688,12 +698,18 @@ class AgentRunner:
                     )
                 except Exception:
                     messages_for_model = messages
+            # Optional hints describe the model copy *after* every governance/repair path.
+            from nanobot.session.user_scope_messages import finalize_quotes
+
+            messages_for_model = finalize_quotes(messages_for_model)
             context = AgentHookContext(
                 iteration=iteration,
                 messages=messages,
                 session_key=spec.session_key,
             )
             await hook.before_iteration(context)
+            if getattr(spec.task_state, "verified_reads", False):
+                messages_for_model = spec.task_state.refresh_visible_reads(messages_for_model)
             request_started = time.monotonic()
             logger.info(
                 "LLM request start: session={} iteration={} model={}",
