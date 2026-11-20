@@ -830,6 +830,78 @@ async def test_send_delta_new_stream_id_replaces_stale_buffer() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_delta_drops_repeated_stream_answer() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.edit_message_text = AsyncMock()
+    channel._app.bot.delete_message = AsyncMock()
+
+    await channel.send_delta("123", "알아두었습니다", stream_id="turn:0")
+    await channel.send_delta("123", "", stream_id="turn:0", stream_end=True, resuming=True)
+    await channel.send_delta("123", "알아두었습니다", stream_id="turn:1")
+    await channel.send_delta("123", "", stream_id="turn:1", stream_end=True, resuming=True)
+
+    assert len(channel._app.bot.sent_messages) == 1
+    channel._app.bot.delete_message.assert_not_called()
+    assert "123" not in channel._stream_bufs
+
+    await channel.send_delta("123", "다른 답", stream_id="turn:2")
+    await channel.send_delta("123", "", stream_id="turn:2", stream_end=True, resuming=False)
+
+    assert len(channel._app.bot.sent_messages) == 2
+    assert channel._app.bot.sent_messages[1]["text"] == "다른 답"
+
+
+@pytest.mark.asyncio
+async def test_send_delta_deletes_visible_duplicate_stream() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.delete_message = AsyncMock()
+    channel._stream_answers[("123", "turn")] = "같은 답"
+    channel._stream_bufs["123"] = _StreamBuf(
+        text="같은  답\n",
+        message_id=9,
+        last_edit=0.0,
+        stream_id="turn:1",
+    )
+
+    await channel.send_delta("123", "", stream_id="turn:1", stream_end=True, resuming=True)
+
+    channel._app.bot.delete_message.assert_awaited_once()
+    assert channel._app.bot.delete_message.await_args.kwargs["message_id"] == 9
+    assert "123" not in channel._stream_bufs
+    assert channel._stream_answers[("123", "turn")] == "같은 답"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tail", ["", " 다른 결론"])
+async def test_send_delta_releases_withheld_nonduplicate_answer(tail: str) -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.edit_message_text = AsyncMock()
+    channel._stream_answers[("123", "turn")] = "같은 시작과 이전 결론"
+
+    await channel.send_delta("123", "같은 시작", stream_id="turn:1")
+    assert not channel._app.bot.sent_messages
+    if tail:
+        await channel.send_delta("123", tail, stream_id="turn:1")
+    await channel.send_delta("123", "", stream_id="turn:1", stream_end=True)
+
+    assert len(channel._app.bot.sent_messages) == 1
+    assert channel._app.bot.sent_messages[0]["text"] == "같은 시작" + tail
+    assert not channel._stream_answers
+
+
+@pytest.mark.asyncio
 async def test_send_delta_incremental_edit_treats_not_modified_as_success() -> None:
     from telegram.error import BadRequest
 

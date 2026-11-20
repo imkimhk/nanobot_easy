@@ -597,7 +597,7 @@ class TaskNote:
             "attempts": self.attempts[-40:], "delivery": "pending",
             "runtime_linked_result_refs": self.runtime_linked_result_refs[-40:],
             "metrics": {"usage": None, "cost": None, "model_calls": self.model_calls,
-                        "tool_calls": len(self.events),
+                        "tool_calls": len({e["id"] for e in self.events}),
                         "elapsed_ms": int((time.monotonic() - self.started) * 1000)},
         }
         runs = self.metadata.get("task_runs")
@@ -621,7 +621,7 @@ class TaskNote:
             targets = {self.canonical(t.path) for t in value.targets if t.action == "write"}
             results = [e for e in self.write_results()
                        if e["status"] == "ok" and e["target"] in targets]
-            refs = [e["id"] for e in results]
+            refs = list(dict.fromkeys(e["id"] for e in results))
             if ({e["target"] for e in results} == targets
                     and set(value.result_refs).issubset(refs)):
                 # Link real execution identities only. No new success, permission,
@@ -653,6 +653,14 @@ class TaskNote:
             return "The current task was withdrawn; do not mutate."
         if self.update.status in {"blocked", "clarification"}:
             return "Current request is blocked or needs clarification; do not mutate."
+        if name == "apply_patch" and not params.get("dry_run"):
+            signature = action_signature(name, params)
+            prior = [e for e in self.events if e.get("name") == name
+                     and e.get("mutating") and e.get("signature") == signature]
+            if prior and prior[-1]["status"] in {"unknown", "denied"}:
+                return "Do not repeat an uncertain or denied write. Inspect state first."
+            if prior and prior[-1]["status"] == "ok":
+                return "Do not repeat the same successful write to repair reporting or delivery."
         target = params.get("path")
         if target and name in {"write_file", "edit_file"}:
             canonical = self.canonical(target)
@@ -669,6 +677,7 @@ class TaskNote:
 
     def observe(self, name: str, params: dict, result: Any, tool: Any, status: str,
                 call_id: str = "") -> None:
+        from nanobot.agent.tools.apply_patch import ApplyPatchTool
         from nanobot.agent.tools.exec_job import ExecJobTool
         from nanobot.agent.tools.filesystem import ReadFileTool
         from nanobot.agent.tools.shell import ExecTool
@@ -678,7 +687,8 @@ class TaskNote:
         if isinstance(tool, (ExecTool, ExecJobTool)):
             target = getattr(result, "execution_target", None) or target
         read_only = bool(getattr(tool, "read_only", True)) or (
-            isinstance(tool, ExecJobTool) and params.get("action") in {"status", "list"})
+            isinstance(tool, ExecJobTool) and params.get("action") in {"status", "list"}) or (
+            isinstance(tool, ApplyPatchTool) and bool(params.get("dry_run")))
         event = {"name": name, "status": status, "target": target,
                  "mutating": not read_only,
                  "request_id": self.request_id, "id": call_id or uuid.uuid4().hex[:12],
@@ -696,7 +706,19 @@ class TaskNote:
                 event["status"] = "denied"
             elif re.search(r"timeout|timed out|unknown", detail, re.I):
                 event["status"] = "unknown"
-        self.events.append(event)
+        receipts = (getattr(result, "write_evidence", None)
+                    if status == "ok" and isinstance(tool, ApplyPatchTool) and not read_only
+                    else None)
+        if isinstance(receipts, list) and receipts and all(
+            isinstance(receipt, dict) and isinstance(receipt.get("target"), str)
+            and receipt["target"] and isinstance(receipt.get("sha256"), str)
+            and re.fullmatch(r"[a-f0-9]{64}", receipt["sha256"])
+            for receipt in receipts
+        ):
+            self.events.extend({**event, "target": self.canonical(receipt["target"]),
+                                "expected_sha256": receipt["sha256"]} for receipt in receipts)
+        else:
+            self.events.append(event)
         if status == "ok" and isinstance(job, dict) and params.get("action") == "status":
             self.evidence.append({**job, "id": event["id"], "request_id": self.request_id})
         if self.update is not None and not getattr(tool, "observability", False):

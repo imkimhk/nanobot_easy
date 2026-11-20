@@ -435,7 +435,7 @@ class AgentRunner:
                 spec.task_state.metadata["task_note"]["metrics"] = {
                     "usage": result.usage,
                     "elapsed_ms": int((time.monotonic() - spec.task_state.started) * 1000),
-                    "tool_calls": len(spec.task_state.events), "cost": None,
+                    "tool_calls": len({e["id"] for e in spec.task_state.events}), "cost": None,
                     "model_calls": spec.task_state.model_calls,
                 }
             context.messages = deepcopy(result.messages)

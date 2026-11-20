@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -285,9 +286,16 @@ class ApplyPatchTool(_FsTool):
 
             for path in writes:
                 self._file_states.record_write(path)
-            return "Patch applied:\n" + "\n".join(
+            result = ToolResult("Patch applied:\n" + "\n".join(
                 _format_summary(summary) for summary in summaries
-            )
+            ))
+            # Execution receipts belong to the tool result, never model-authored prose.
+            # Coalesced writes describe the final bytes once per resolved file.
+            result.write_evidence = [
+                {"target": str(path), "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()}
+                for path, content in writes.items()
+            ]
+            return result
         except PermissionError as exc:
             return ToolResult.error(f"Error: {exc}")
         except _PatchError as exc:

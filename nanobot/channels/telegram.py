@@ -315,6 +315,7 @@ def _split_telegram_markdown_html(content: str, max_html_len: int) -> list[str]:
 _SEND_MAX_RETRIES = 3
 _SEND_RETRY_BASE_DELAY = 0.5  # seconds, doubled each retry
 _STREAM_EDIT_INTERVAL_DEFAULT = 0.6  # min seconds between edit_message_text calls
+_STREAM_ANSWER_LIMIT = 32
 
 
 @dataclass
@@ -324,6 +325,7 @@ class _StreamBuf:
     message_id: int | None = None
     last_edit: float = 0.0
     stream_id: str | None = None
+    withheld: bool = False
 
 
 @dataclass
@@ -446,6 +448,8 @@ class TelegramChannel(BaseChannel):
         self._bot_user_id: int | None = None
         self._bot_username: str | None = None
         self._stream_bufs: dict[str, _StreamBuf] = {}  # chat_id -> streaming state
+        # (chat_id, stream base) -> answer already finalized earlier in this turn
+        self._stream_answers: dict[tuple[str, str], str] = {}
         self._inbound_buffers: dict[str, list[_QueuedTelegramUpdate]] = {}
         self._inbound_workers: dict[str, asyncio.Task] = {}
         self._rich_send_disabled: bool = False  # Latch off if Bot API < 10.1
@@ -900,6 +904,77 @@ class TelegramChannel(BaseChannel):
     def _is_not_modified_error(exc: Exception) -> bool:
         return isinstance(exc, BadRequest) and "message is not modified" in str(exc).lower()
 
+    @staticmethod
+    def _normalize_stream_text(text: str) -> str:
+        return " ".join(text.split())
+
+    @staticmethod
+    def _stream_answer_key(chat_id: str, stream_id: str | None) -> tuple[str, str] | None:
+        """Group segments of one answer. The loop appends :0, :1, ... to one base."""
+        if not stream_id or ":" not in stream_id:
+            return None
+        base, segment = stream_id.rsplit(":", 1)
+        if not base or not segment.isdigit():
+            return None
+        return (chat_id, base)
+
+    def _remember_stream_answer(
+        self,
+        chat_id: str,
+        stream_id: str | None,
+        text: str,
+        *,
+        resuming: bool,
+    ) -> None:
+        key = self._stream_answer_key(chat_id, stream_id)
+        if key is None:
+            return
+        if not resuming:
+            self._stream_answers.pop(key, None)
+            return
+        normalized = self._normalize_stream_text(text)
+        if not normalized:
+            return
+        self._stream_answers[key] = normalized
+        while len(self._stream_answers) > _STREAM_ANSWER_LIMIT:
+            self._stream_answers.pop(next(iter(self._stream_answers)))
+
+    def _duplicate_stream_answer(self, chat_id: str, stream_id: str | None, text: str) -> bool:
+        key = self._stream_answer_key(chat_id, stream_id)
+        if key is None:
+            return False
+        previous = self._stream_answers.get(key)
+        current = self._normalize_stream_text(text)
+        return bool(previous) and current == previous
+
+    def _withhold_stream_preview(self, chat_id: str, stream_id: str | None, text: str) -> bool:
+        key = self._stream_answer_key(chat_id, stream_id)
+        if key is None:
+            return False
+        previous = self._stream_answers.get(key)
+        current = self._normalize_stream_text(text)
+        return bool(previous) and bool(current) and previous.startswith(current)
+
+    async def _discard_duplicate_stream(
+        self,
+        chat_id: str,
+        int_chat_id: int,
+        buf: _StreamBuf,
+    ) -> None:
+        """Drop a repeated segment of an answer already sent for this turn."""
+        message_id = buf.message_id
+        self._stream_bufs.pop(chat_id, None)
+        if message_id is None or self._app is None:
+            return
+        try:
+            await self._call_with_retry(
+                self._app.bot.delete_message,
+                chat_id=int_chat_id,
+                message_id=message_id,
+            )
+        except Exception as exc:
+            self.logger.warning("Failed to delete duplicate stream message: {}", exc)
+
     async def send_delta(
         self,
         chat_id: str,
@@ -918,7 +993,7 @@ class TelegramChannel(BaseChannel):
 
         if stream_end:
             buf = self._stream_bufs.get(chat_id)
-            if not buf or not buf.message_id or not buf.text:
+            if not buf or not buf.text:
                 return
             if stream_id is not None and buf.stream_id is not None and buf.stream_id != stream_id:
                 return
@@ -930,6 +1005,24 @@ class TelegramChannel(BaseChannel):
             if message_thread_id := meta.get("message_thread_id"):
                 thread_kwargs["message_thread_id"] = message_thread_id
             raw_text = buf.text
+            if self._duplicate_stream_answer(chat_id, stream_id, raw_text):
+                await self._discard_duplicate_stream(chat_id, int_chat_id, buf)
+                self._remember_stream_answer(
+                    chat_id, stream_id, raw_text, resuming=resuming,
+                )
+                return
+            if buf.message_id is None:
+                if not buf.withheld:
+                    return
+                preview = _strip_md_block(raw_text)
+                sent = await self._call_with_retry(
+                    self._app.bot.send_message,
+                    chat_id=int_chat_id,
+                    text=preview,
+                    **thread_kwargs,
+                )
+                buf.message_id = sent.message_id
+                buf.withheld = False
 
             # Try sendRichMessage for final output (Bot API 10.1).
             # Skip when a streaming preview already exists to avoid the
@@ -970,6 +1063,9 @@ class TelegramChannel(BaseChannel):
                 # to avoid doubling connection demand during pool exhaustion.
                 if self._is_not_modified_error(e):
                     self.logger.debug("Final stream edit already applied for {}", chat_id)
+                    self._remember_stream_answer(
+                        chat_id, stream_id, raw_text, resuming=resuming,
+                    )
                     self._stream_bufs.pop(chat_id, None)
                     return
                 self.logger.debug("Final stream edit failed (HTML), trying plain: {}", e)
@@ -998,6 +1094,9 @@ class TelegramChannel(BaseChannel):
                 except Exception:
                     # Fall back to _send_text which handles HTML→plain gracefully.
                     await self._send_text(int_chat_id, extra_html_chunk)
+            self._remember_stream_answer(
+                chat_id, stream_id, raw_text, resuming=resuming,
+            )
             self._stream_bufs.pop(chat_id, None)
             return
 
@@ -1010,6 +1109,10 @@ class TelegramChannel(BaseChannel):
         buf.text += delta
 
         if not buf.text.strip():
+            return
+
+        if buf.message_id is None and self._withhold_stream_preview(chat_id, stream_id, buf.text):
+            buf.withheld = True
             return
 
         now = time.monotonic()
