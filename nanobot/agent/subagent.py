@@ -107,6 +107,9 @@ class SubagentManager:
         self.bus = bus
         self.model = model or provider.get_default_model()
         self.tools_config = tools_config or ToolsConfig()
+        from nanobot.security.action_audit import ActionAuditStore
+
+        self.action_audit = ActionAuditStore.from_config(workspace, self.tools_config.action_audit)
         self.max_tool_result_chars = max_tool_result_chars
         self.restrict_to_workspace = restrict_to_workspace
         self.disabled_skills = set(disabled_skills or [])
@@ -394,6 +397,14 @@ class SubagentManager:
             )
             token = bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
             try:
+                run_hook = _SubagentHook(task_id, status)
+                if self.action_audit.enabled:
+                    from nanobot.agent.audit_hook import ActionAuditHook
+                    from nanobot.agent.hook import CompositeHook
+
+                    run_hook = CompositeHook([run_hook, ActionAuditHook(
+                        self.action_audit, tools, sess_key, source='subagent',
+                    )])
                 result = await self.runner.run(AgentRunSpec(
                     initial_messages=messages,
                     tools=tools,
@@ -409,7 +420,7 @@ class SubagentManager:
                         else self.max_iterations
                     ),
                     max_tool_result_chars=self.max_tool_result_chars,
-                    hook=_SubagentHook(task_id, status),
+                    hook=run_hook,
                     max_iterations_message="Task completed but no final response was generated.",
                     finalize_on_max_iterations=False,
                     error_message=None,

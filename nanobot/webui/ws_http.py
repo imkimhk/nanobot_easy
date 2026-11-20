@@ -177,6 +177,7 @@ class GatewayHTTPHandler:
         skills_workspace_path: Path,
         skill_management_enabled: bool = False,
         skill_management_red_flags: Any | None = None,
+        action_audit: Any | None = None,
         skill_draft_composer: Callable[[dict[str, Any]], Awaitable[Any]] | None = None,
         disabled_skills: set[str] | None = None,
         cron_service: CronService | None = None,
@@ -194,6 +195,9 @@ class GatewayHTTPHandler:
         self.media = media
         self.workspaces = workspaces
         self.skills_workspace_path = skills_workspace_path
+        from nanobot.security.action_audit import ActionAuditStore
+
+        self.action_audit = ActionAuditStore.from_config(skills_workspace_path, action_audit)
         self.skill_management_enabled = skill_management_enabled
         self.skill_management_red_flags = skill_management_red_flags
         self.skill_draft_composer = skill_draft_composer
@@ -1010,6 +1014,11 @@ class GatewayHTTPHandler:
             if "cannot transition" in message:
                 return _http_error(409, message)
             return _http_error(400, message)
+        if action.lower() in {'approve', 'register', 'candidate', 'reject', 'rejected'}:
+            self.action_audit.record(
+                kind='approval', status='rejected' if action.lower() in {'reject', 'rejected'} else 'approved',
+                source='webui', tool='skill_registration', subject=name,
+            )
         return _http_json_response(payload)
 
     async def _handle_skill_manage_draft_compose(self, request: WsRequest) -> Response:
@@ -1135,6 +1144,8 @@ class GatewayHTTPHandler:
             return _http_error(403, str(e))
         except ValueError as e:
             return _http_error(409, str(e))
+        self.action_audit.record(kind='approval', status='approved', source='webui',
+                                 tool='skill_registration', subject=draft_id)
         return _http_json_response(payload)
 
     def _handle_skill_manage_draft_discard(self, request: WsRequest, raw_id: str) -> Response:

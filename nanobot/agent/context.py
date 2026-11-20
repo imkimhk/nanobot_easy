@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.memory_context import MEMORY_TOOL_GUIDANCE
+from nanobot.agent.memory_prompt import BoundedMemoryPrompt
 from nanobot.agent.skills import SkillsLoader
 from nanobot.agent.tools import mcp as mcp_tools
 from nanobot.agent.tools.registry import ToolRegistry
@@ -84,10 +85,12 @@ class ContextBuilder:
         preload_always_skills: bool = True,
         on_demand_skills: list[str] | None = None,
         selective_memory: bool = False,
+        memory_prompt_tokens: int = 0,
     ):
         self.workspace = workspace
         self.timezone = timezone
         self.memory = MemoryStore(workspace)
+        self.memory_prompt = BoundedMemoryPrompt(self.memory.memory_file, memory_prompt_tokens)
         self.hot_path_skills = list(dict.fromkeys(hot_path_skills or []))
         self.selective_memory = selective_memory
         self.preload_always_skills = preload_always_skills
@@ -231,8 +234,13 @@ class ContextBuilder:
         text = self.memory.read_memory()
         if not text or self._is_template_content(text, "memory/MEMORY.md"):
             return ""
+        same_workspace = workspace is None or workspace.resolve() == self.workspace.resolve()
+        if same_workspace:
+            projection = self.memory_prompt.build(text)
+            if projection is not None:
+                return f"## Long-term Memory\n{projection}"
         if (self.selective_memory and query is not None
-                and (workspace is None or workspace.resolve() == self.workspace.resolve())):
+                and same_workspace):
             from nanobot.agent.memory_selection import select_memory
 
             text = select_memory(text, query, source=str(self.memory.memory_file))

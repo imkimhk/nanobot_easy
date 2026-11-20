@@ -198,6 +198,7 @@ class ChannelManager:
                         runtime_capabilities_overrides=self._webui_runtime_capabilities,
                         skill_management_enabled=self.config.tools.webui_skill_management.enabled,
                         skill_management_red_flags=self.config.tools.webui_skill_management.red_flags,
+                        action_audit=self.config.tools.action_audit,
                         skill_draft_composer=_compose_skill_draft,
                         cron_service=self._cron_service,
                         local_trigger_store=self._local_trigger_store,

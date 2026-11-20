@@ -286,6 +286,7 @@ class AgentLoop:
         context_selection: Any | None = None,
         compact_context: bool = False,
         selective_memory: bool = False,
+        memory_prompt_tokens: int = 0,
         history_context_tokens: int | None = None,
         preserve_user_scope_messages: bool = False,
     ):
@@ -306,6 +307,9 @@ class AgentLoop:
         self._provider_signature = provider_signature
         self._default_selection_signature = preset_helpers.default_selection_signature(provider_signature)
         self.workspace = workspace
+        from nanobot.security.action_audit import ActionAuditStore
+
+        self.action_audit = ActionAuditStore.from_config(workspace, _tc.action_audit)
         self.model = model or provider.get_default_model()
         self.max_iterations = (
             max_iterations if max_iterations is not None else defaults.max_tool_iterations
@@ -420,6 +424,7 @@ class AgentLoop:
             preload_always_skills=preload_always_skills,
             on_demand_skills=on_demand_skills,
             selective_memory=selective_memory and self.tools_config.file.enable,
+            memory_prompt_tokens=memory_prompt_tokens if self.tools_config.file.enable else 0,
         )
         self.conversation_memory = ConversationEventStore(workspace)
         self._memory_workspace_id = str(Path(workspace).expanduser().resolve())
@@ -552,6 +557,7 @@ class AgentLoop:
             context_selection=defaults.context_selection,
             compact_context=defaults.compact_context,
             selective_memory=defaults.selective_memory,
+            memory_prompt_tokens=defaults.memory_prompt_tokens,
             reasoning_effort=getattr(resolved, "reasoning_effort", None) or defaults.reasoning_effort,
             stepwise_enabled=defaults.stepwise.enabled,
             stepwise_applied_at=defaults.stepwise.applied_at,
@@ -1112,6 +1118,14 @@ class AgentLoop:
         hook: AgentHook = loop_hook
         if run_hooks and (not ephemeral or run_extra_hooks_for_ephemeral):
             hook = CompositeHook([loop_hook, *run_hooks])
+        if self.action_audit.enabled:
+            from nanobot.agent.audit_hook import ActionAuditHook
+
+            active_hooks = run_hooks if not ephemeral or run_extra_hooks_for_ephemeral else []
+            hook = CompositeHook([loop_hook, *active_hooks, ActionAuditHook(
+                self.action_audit, tools or self.tools, session_key,
+                source='ephemeral' if ephemeral else 'agent',
+            )])
 
         async def _checkpoint(payload: dict[str, Any]) -> None:
             if session is None:
@@ -1967,6 +1981,7 @@ class AgentLoop:
         name = str(pending.get("name") or "")
         clear_pending_skill_approval(session.metadata)
         self.sessions.save(session)
+        audit_status = 'rejected' if reply == 'no' else 'approval_failed'
         if reply == "no":
             content = f"Cancelled — `{name}` was not approved."
         else:
@@ -1985,9 +2000,12 @@ class AgentLoop:
             except ValueError as exc:
                 content = f"Could not approve `{name}`: {exc}"
             else:
+                audit_status = 'approved'
                 skill = result.get("skill")
                 status = skill.get("status") if isinstance(skill, dict) else None
                 content = f"Approved `{name}`" + (f" — status is now `{status}`." if status else ".")
+        self.action_audit.record(kind='approval', status=audit_status, source='chat_confirmation',
+                                 tool='skill_registration', subject=name, session_key=session.key)
         return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
 
     async def _state_command(self, ctx: TurnContext) -> str:

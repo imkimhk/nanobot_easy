@@ -77,6 +77,7 @@ from nanobot.bus.outbound_events import (  # noqa: E402
     StreamEndEvent,
     outbound_event_from_message,
 )
+from nanobot.cli.audit import create_audit_app  # noqa: E402
 from nanobot.cli.gateway import create_gateway_app  # noqa: E402
 from nanobot.cli.mcp import create_mcp_app  # noqa: E402
 from nanobot.cli.stream import StreamRenderer, ThinkingSpinner  # noqa: E402
@@ -206,6 +207,7 @@ app = typer.Typer(
     help=f"{__logo__} nanobot - Personal AI Assistant",
     no_args_is_help=True,
 )
+app.add_typer(create_audit_app(), name='audit')
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
@@ -2801,12 +2803,16 @@ def skill_approve(
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
 ):
     """Register a human-approved draft as candidate."""
-    store = _skill_store_for_cli(config, workspace)
+    store, loaded = _skill_store_and_config_for_cli(config, workspace)
     try:
         store.approve_draft(name)
     except (KeyError, ValueError) as exc:
         console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(1) from exc
+    from nanobot.security.action_audit import approval_receipt
+
+    approval_receipt(loaded.workspace_path, loaded.tools.action_audit,
+                     status='approved', source='cli', subject=name)
     console.print(f"[green]Approved skill '{escape(name)}'[/green]")
 
 

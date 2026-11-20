@@ -201,6 +201,8 @@ class AgentDefaults(Base):
     context_selection: ContextSelectionConfig = Field(default_factory=ContextSelectionConfig)
     compact_context: bool = False  # Opt-in: defer execution tutorials/schemas until needed.
     selective_memory: bool = False  # Opt-in: select explicitly marked reference notes only.
+    memory_prompt_tokens: int = Field(default=0, ge=0, le=20_000)
+    # Opt-in reviewed memory/prompt_snapshot.json; invalid/stale snapshots retain legacy memory.
     temperature: float = 0.1
     fallback_models: list[FallbackCandidate] = Field(default_factory=list)
     max_tool_iterations: int = 200
@@ -552,6 +554,11 @@ def _lazy_default(module_path: str, class_name: str) -> Any:
     return getattr(module, class_name)()
 
 
+class ActionAuditConfig(Base):
+    enabled: bool = False
+    max_records: int = Field(default=10_000, ge=100, le=1_000_000)
+
+
 class ToolsConfig(Base):
     """Tools configuration.
 
@@ -607,6 +614,7 @@ class ToolsConfig(Base):
         validation_alias=AliasChoices("externalToolSkills", "external_tool_skills"),
     )
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+    action_audit: ActionAuditConfig = Field(default_factory=ActionAuditConfig)
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
