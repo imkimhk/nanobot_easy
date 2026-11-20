@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from nanobot.agent.loop import AgentLoop
 from nanobot.reasoning.bridge import is_method_evaluation_request, select_procedure
+from nanobot.session.manager import Session
 
 
 class _FakeRuntime:
@@ -73,6 +74,7 @@ def test_disabled_reasoning_routes_method_evaluation(monkeypatch) -> None:
     loop.model = "xai-grok/grok-4.7"
     loop._runtime_events = lambda: _FakeRuntime()
     ctx = SimpleNamespace(
+        selected_context=None,
         msg=SimpleNamespace(content="이 방법이 적합한가요?"),
         session_key="telegram:test",
         visible_run_started_at=None,
@@ -102,6 +104,7 @@ def test_enabled_reasoning_keeps_normal_loop(monkeypatch) -> None:
     loop.reasoning_effort = None
     loop._runtime_events = lambda: _FakeRuntime()
     ctx = SimpleNamespace(
+        selected_context=None,
         msg=SimpleNamespace(content="이 방법이 적합한가요?", channel="telegram", chat_id="1", metadata={}),
         session_key="telegram:test",
         visible_run_started_at=1,
@@ -110,7 +113,7 @@ def test_enabled_reasoning_keeps_normal_loop(monkeypatch) -> None:
         on_stream=None,
         on_stream_end=None,
         on_retry_wait=None,
-        session=None,
+        session=Session(key="telegram:test"),
         pending_queue=None,
         ephemeral=False,
         run_extra_hooks_for_ephemeral=False,
