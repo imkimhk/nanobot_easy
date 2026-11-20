@@ -91,8 +91,19 @@ reads but increased mean input tokens by 70.3% in production-setting overview
 runs: all 18 runs loaded research-brief, adding discovery/read round trips.
 Version 1.1.2 removes automatic replacement-skill loading and repeated discovery;
 source verification, completion criteria, document deduplication, and evidence
-classification remain intact. Cost reduction for 1.1.2 is not yet measured.
-A follow-up should compare 1.1.1 with 1.1.2 using the same questions and sources,
+classification remain intact.
+
+A later 8-run smoke check (one run per variant per item, synthetic 72-document
+collection, the existing BM25 search, `evidence=false`) compared the 1.1.1 bundle
+with the 1.1.2 bundle. On the two comparable overview items, mean input tokens
+fell by 44.8%; the 1.1.2 runs made no skill discovery or skill read. The O3 item
+failed in both variants and is excluded. Quality was checked only by an informal,
+not fully blind review by the executing agent. This is a signal for the whole
+change bundle (skill text, guidance, discovery metadata), not a statistically
+significant result, a live-web result, or a billing saving: cache accounting and
+unit prices were not applied.
+
+A fuller follow-up should compare 1.1.1 with 1.1.2 using the same questions and sources,
 including C3/C5 and the unsuccessful O3 item. Evaluate `evidence=false` and
 `evidence=true` separately, keeping the setting equal within each comparison.
 Freeze question-specific rubrics before runs, independently check semantic grading,

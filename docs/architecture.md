@@ -156,7 +156,13 @@ The workspace skill registry lives in `nanobot/skill_store.py`. It stores skill
 metadata, search rows, routing traces, outcome counters, and lifecycle status.
 The CLI commands under `nanobot skill ...` rebuild and inspect that registry.
 `skill_search` uses the registry at runtime to find focused instructions without
-injecting every skill into each prompt.
+injecting every skill into each prompt. Ranking uses SQLite FTS5 (BM25) by
+default; semantic embeddings are used only when `skills.embedding` is configured.
+Only `candidate` and `verified` skills are searchable; drafts are excluded.
+The model records its final choice with `skill_decision`. Search rank, routing
+tests, and a recorded decision are hints, not proof that the skill was applied
+or that the task finished. Routing tests run only when `nanobot skill test-routing`
+is invoked.
 
 Skill management writes are centralized in the same skill store service. The CLI
 and WebUI management API (`nanobot/webui/skill_manage_api.py`) both call that
@@ -200,6 +206,31 @@ Session history is the near-term conversation replay. Memory is the longer-term 
 | Bootstrap identity files | `<workspace>/SOUL.md`, `<workspace>/USER.md`, templates under `nanobot/templates/` |
 
 Dream is implemented in `nanobot/agent/memory.py` and scheduled by the runtime when enabled.
+
+The conversation event store and memory search live in `nanobot/memory/`
+(`event_store.py`, `search.py`, `task_context.py`). `privacy.py` provides
+explicit forget/purge operations; no automatic redaction of sensitive content at
+write time is implemented there.
+
+## Opt-in Execution Paths
+
+These paths have similar names but are separate features. Each is off in the
+schema defaults, and a local instance's settings are not product defaults.
+
+| Path | Files | Default and activation |
+|---|---|---|
+| Ordinary agent loop | `agent/loop.py`, `agent/runner.py`, `agent/premature_final.py` | Always the default response path |
+| Intent-first context selection | `agent/context_selection.py` | `agents.defaults.contextSelection.enabled=false`; asks for confirmation when a mutation target is ambiguous |
+| Time-allocation contract | `agent/time_allocation.py` | `contextSelection.timeAllocationContractEnabled=false`; takes effect only on the context-selection path |
+| Stepwise reasoning | `nanobot/reasoning/` | `stepwise.enabled=false`; applied per agent with `nanobot stepwise apply`; per-run defaults 120 s and 8 model calls |
+| Retrieval evidence packets | `nanobot/evidence/`, `agent/tools/web.py` | `tools.web.evidence.enabled=false`; packets rank candidates and never verify claims |
+| Durable workflow | `nanobot/workflow/`, `agent/tools/workflow.py` | `tools.workflow.enabled=false` |
+
+## Pinned Runtime
+
+`scripts/runtime.sh` with `scripts/runtime_launcher.py` runs one instance from a
+clean checkout of a verified commit, using one profile per instance. See
+[`../deploy/README.md`](../deploy/README.md).
 
 ## Security Boundaries
 
