@@ -909,6 +909,24 @@ class TaskNote:
         terminal = bool(self.update and self.update.status in {"partial", "blocked", "clarification"})
         return defects, terminal
 
+    def completion_result(
+        self, candidate: str | None, *, check: tuple[list[str], bool], exhausted: bool = False,
+    ) -> tuple[str, str]:
+        """Return the report and stop reason from an existing check; never retry or mutate.
+
+        Budget exhaustion retains its existing failure status and terminal-answer whitespace.
+        The runner owns recovery decisions and supplies the existing final_check result.
+        """
+        defects, terminal = check
+        failure_status = "max_iterations" if exhausted else "incomplete"
+        if terminal:
+            answer = self.update.final_answer or candidate or ""
+            answer = str(answer) if exhausted else answer.strip()
+            return answer + "\n\n미완료 상태: " + self.update.explanation, failure_status
+        if defects:
+            return self.incomplete(defects), failure_status
+        return self.final_report(), self.final_status
+
     @property
     def final_status(self) -> str:
         return "cancelled" if self.update and self.update.intent == "withdraw" else "completed"
