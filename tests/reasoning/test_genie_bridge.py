@@ -38,7 +38,7 @@ def test_stage_prompt_keeps_intermediate_judgments_short() -> None:
     prompt = provider.messages[0]["content"]
 
     assert "짧은 판단" in prompt
-    assert "2~4문장" in prompt
+    assert "사용자가 요구한 길이와 형식" in prompt
     assert "그 외 단계의 answer는 비운다" in prompt
 
 
