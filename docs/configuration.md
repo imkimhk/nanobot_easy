@@ -1382,6 +1382,45 @@ Existing configs do not need to change. Direct `agents.defaults.model`, `provide
 
 Set `agents.defaults.modelPreset` to choose the startup preset. When `modelPreset` is `null` or omitted, startup uses the implicit `default` preset from direct `agents.defaults.*` fields. Runtime changes made with `/model <preset>` are not written back to `config.json`; they affect future turns until the process restarts or another model/config change replaces them.
 
+### Session history replay budget
+
+`agents.defaults.historyContextTokens` limits replay of previous conversation turns
+to an estimated 16,000 tokens by default. Set it to `0` to use the available model
+window as before, or set an explicit positive budget. `contextWindowTokens` still
+controls the model window and active execution; this setting does not limit tool
+permissions, command duration, or the number of tool iterations.
+
+Raw session history and acquisition proofs remain stored. Old per-request task
+control messages stay in the audit history but are not sent back to the model;
+current guidance is regenerated from current evidence. When a previous tool turn
+exceeds the replay budget, the user request and a legal recent tail are retained
+without restoring its entire tool transcript. A necessary user request can itself
+exceed the budget.
+
+### Task evidence and completion checks
+
+`agents.defaults.stepwise.lightweight` enables optional task evidence checks independently
+of `stepwise.enabled`; it defaults to `false`. Keep selected read targets limited to the
+requested files or line/page ranges. Runtime diagnostics should select the relevant log
+range rather than require the entire growing log.
+
+Text file reads paginate within `agents.defaults.maxToolResultChars` (default 16,000
+characters), returning a continuation offset. Only complete returned lines count as
+acquired evidence. Ranges from changing files can be joined only after their content
+hashes are checked against a stable current snapshot; unread appended lines do not count.
+An individual line exceeding the output budget requires another text-processing approach.
+
+Acquisition proofs for the active request and previously read targets selected by the
+current request are retained, including files read in more than 40 pages. Only unrelated
+proofs from older requests are trimmed to the latest 40 records. These records contain
+coverage and content hashes, not copies of source text. Model guidance and `update_task`
+responses still show at most 20 recent proofs, so a large task does not expand that view.
+
+The task evidence wrapper does not shorten native exec/session or MCP tool timeouts.
+Their own configured limits still apply, and user cancellation remains effective.
+Partial, blocked and clarification reports are delivered with their actual answer body
+and incomplete status, without another model call solely to repeat that report.
+
 ### Model Fallbacks
 
 `agents.defaults.fallbackModels` defines an ordered failover chain for the active model configuration. The primary model is still selected by `agents.defaults.modelPreset` or, in older configs, by the implicit `default` preset from direct `agents.defaults.*` fields.
@@ -1889,6 +1928,67 @@ Add MCP servers to your `config.json`:
 }
 ```
 
+### OAuth login and automatic refresh
+
+HTTP/SSE servers can opt into OAuth instead of a fixed `Authorization` header:
+
+```json
+{
+  "tools": {
+    "mcpServers": {
+      "playmcp": {
+        "url": "https://playmcp.kakao.com/mcp",
+        "oauth": { "enabled": true }
+      }
+    }
+  }
+}
+```
+
+Run browser authorization for a configured server (OAuth can initially be disabled):
+
+```bash
+nanobot mcp login playmcp --config /path/to/config.json
+nanobot mcp status playmcp --config /path/to/config.json
+nanobot mcp logout playmcp --config /path/to/config.json
+```
+
+`login` uses the MCP SDK's discovery, client registration and authorization-code
+flow with PKCE S256 and state validation. It listens only on `127.0.0.1:8768`
+at `/callback` while login is pending. Set `oauth.callbackPort` to change the
+port, or use `--no-browser` to print the authorization link. Approve access in
+your browser; do not paste credentials into chat. On successful authorization,
+the selected config enables OAuth and removes its obsolete `Authorization`
+header, while retaining other settings and environment-variable references.
+Reload MCP or restart the gateway to activate it. Login failure preserves the
+previous config and stored credentials.
+
+Credentials, client registration, the discovered issuer/token endpoint and
+absolute expiry are stored outside the workspace under the active config
+directory's `.secrets/mcp-oauth/<hash>/auth.json` (directories 0700, files 0600).
+File tools and previews deny this credential filename. `status` shows only
+login/refresh availability and expiry, never token values. `logout` removes
+local credentials; provider-side revocation remains a separate account action.
+
+Matching server names and URLs in the same config directory share credentials.
+Set `oauth.profile` to a common value to share credentials across differently
+named servers, or distinct values to keep accounts separate. Logout affects all
+configs using that same profile. A process lock serializes refresh-token rotation
+across gateways; each request reloads the current stored token. Refresh occurs
+on use shortly before expiry or once after a 401; there is no polling timer.
+
+Refresh requires a server-issued refresh token. If one is absent or revoked,
+the gateway reports that login is required instead of launching a browser or
+registering another client in the background. Network/server errors retain
+credentials for a later retry. `oauth.clientId` and `oauth.issuer` support a
+pre-registered client; `oauth.clientSecret` is optional. The SDK also supports
+`oauth.clientMetadataUrl` when the authorization server advertises it.
+
+All discovery, registration and token requests retain SSRF/DNS validation and
+require HTTPS. Token requests do not forward MCP custom headers, and OAuth
+clients do not follow redirects. Stdio servers and HTTP servers without
+`oauth.enabled` keep their existing behavior.
+
 Two transport modes are supported:
 
 | Mode | Config | Example |
@@ -1937,6 +2037,20 @@ Use `enabledTools` to register only a subset of tools from an MCP server:
 - Set `enabledTools` to a non-empty list of names to register only those tools — resources and prompts are not registered.
 
 MCP tools are automatically discovered and registered on startup. The LLM can use them alongside built-in tools — no extra configuration needed.
+
+Tool calls are not automatically repeated after an uncertain failure by default. A lost
+reply, timeout, server cancellation, malformed reply, or tool error does not prove that a
+remote change failed. The result instructs the agent to inspect remote state before
+repeating the operation. A terminated connection can still be refreshed for subsequent
+work without replaying the failed call. User cancellation continues to stop execution.
+
+For tools whose implementation you have verified is read-only or idempotent, set
+`tools.mcpServers.<name>.retrySafeTools` to exact raw or wrapped tool names, for example
+`["get_status", "mcp_filesystem_read_file"]`. Such tools may retry once after a transient
+connection failure, with at most two calls total including a reconnect attempt. The
+default is `[]`; wildcard entries do not enable retries. This list grants no execution
+permission and does not change mutation classification. Server-supplied annotations do
+not enable retries. Resource and prompt reads retain their existing recovery behavior.
 
 
 

@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -20,7 +21,7 @@ interface DeleteConfirmProps {
   title: string;
   automations?: SessionAutomationJob[];
   onCancel: () => void;
-  onConfirm: () => void;
+  onConfirm: (deleteMemory: boolean) => void;
 }
 
 export function DeleteConfirm({
@@ -31,6 +32,8 @@ export function DeleteConfirm({
   onConfirm,
 }: DeleteConfirmProps) {
   const { t } = useTranslation();
+  const [deleteMemory, setDeleteMemory] = useState(true);
+  useEffect(() => { if (open) setDeleteMemory(true); }, [open, title]);
   const locale = currentLocale();
   const hasAutomations = automations.length > 0;
   const visibleAutomations = automations.slice(0, 4);
@@ -80,6 +83,14 @@ export function DeleteConfirm({
             </div>
           ) : null}
         </AlertDialogHeader>
+        <label className="mt-4 flex items-start gap-2 text-left text-sm">
+          <input type="checkbox" checked={deleteMemory}
+            onChange={(event) => setDeleteMemory(event.target.checked)} className="mt-1" />
+          <span>{t("deleteConfirm.deleteMemory", { defaultValue: "Also delete this chat's raw memory and search indexes" })}</span>
+        </label>
+        <p className="mt-2 text-left text-xs text-muted-foreground">
+          {t("deleteConfirm.memoryNotice", { defaultValue: "Curated memory summaries and backups are retained separately." })}
+        </p>
         <AlertDialogFooter className="mt-7 !grid grid-cols-1 gap-3 space-x-0 sm:grid-cols-2 sm:space-x-0">
           <AlertDialogCancel
             onClick={onCancel}
@@ -88,7 +99,7 @@ export function DeleteConfirm({
             {t("deleteConfirm.cancel")}
           </AlertDialogCancel>
           <AlertDialogAction
-            onClick={onConfirm}
+            onClick={() => onConfirm(deleteMemory)}
             className="h-11 w-full min-w-0 !whitespace-normal rounded-full bg-destructive px-5 text-center text-[15px] font-semibold text-destructive-foreground shadow-[0_10px_25px_rgba(239,68,68,0.28)] hover:bg-destructive/90"
           >
             {hasAutomations

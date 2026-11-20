@@ -542,13 +542,14 @@ export async function discardManagedSkillDraft(
 export async function deleteSession(
   token: string,
   key: string,
-  optionsOrBase?: { deleteAutomations?: boolean } | string,
+  optionsOrBase?: { deleteAutomations?: boolean; deleteMemory?: boolean } | string,
   base: string = "",
 ): Promise<SessionDeleteResult> {
   const options = typeof optionsOrBase === "string" ? undefined : optionsOrBase;
   const resolvedBase = typeof optionsOrBase === "string" ? optionsOrBase : base;
   const query = new URLSearchParams();
   if (options?.deleteAutomations) query.set("delete_automations", "true");
+  if (options?.deleteMemory !== undefined) query.set("delete_memory", String(options.deleteMemory));
   const suffix = query.toString() ? `?${query}` : "";
   return request<SessionDeleteResult>(
     `${resolvedBase}/api/sessions/${encodeURIComponent(key)}/delete${suffix}`,

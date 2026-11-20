@@ -238,6 +238,17 @@ async def test_repeat_of_previous_session_final_is_not_resent():
     assert "실행된 도구가 없습니다" in result.final_content
 
 
+async def test_same_status_after_fresh_successful_check_is_delivered():
+    check = _FakeTool("check_status", read_only=True, result="A7Q-314 is still active")
+    provider = _provider(_call("check_status"), LLMResponse(content=FACT, tool_calls=[]))
+    history = [{"role": "assistant", "content": FACT},
+               {"role": "user", "content": "현재 상태를 다시 확인해줘"}]
+    result = await AgentRunner(provider).run(_spec(_registry(check), initial_messages=history))
+    assert result.stop_reason == "completed"
+    assert result.final_content == FACT
+    assert check.calls == 1
+
+
 @pytest.mark.parametrize("user_request", [
     "그 코드를 다시 알려줘.",
     "이전 답변을 그대로 다시 보여주세요.",

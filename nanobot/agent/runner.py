@@ -30,6 +30,7 @@ from nanobot.agent.context_selection import ContextCapacityError
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.premature_final import CORRECTION, INCOMPLETE, is_premature_final
 from nanobot.agent.repetition_guard import RepeatedSentenceGuard
+from nanobot.agent.tool_repetition import WARNING, ReadRepetitionObserver, active_read_observer
 from nanobot.agent.tools.registry import ToolRegistry, is_tool_error_result
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.session.history_visibility import is_hidden_history_message
@@ -163,6 +164,7 @@ class AgentRunSpec:
     task_note_metadata: dict[str, Any] | None = None
     task_state: Any | None = None
     task_note_persist_callback: Any | None = None
+    task_note_verified_reads: bool = False
     stall_guard: bool = True
 
 
@@ -349,6 +351,8 @@ class AgentRunner:
         if spec.task_state is not None and injected_messages:
             spec.task_state.revise(injected_messages)
             injected_messages.append(spec.task_state.guidance())
+        if injected_messages and (observer := active_read_observer.get()) is not None:
+            observer.reset()
         return injected_messages
 
     @staticmethod
@@ -372,12 +376,21 @@ class AgentRunner:
             spec.selected_context.trace.stage = "legacy_fallback" if spec.selected_context.legacy_fallback else "execute"
             if spec.selected_context.control is None:
                 spec.selected_context.control = TaskControl(spec.selected_context)
-        from nanobot.agent.task_note import TaskNote, TaskTools, active_task_note, needs_note
+        from nanobot.agent.task_note import (
+            TaskNote,
+            TaskTools,
+            active_task_note,
+            needs_note,
+            read_permission,
+        )
 
         task_token = None
         if spec.task_note_enabled and needs_note(spec.initial_messages):
             note = TaskNote(spec.initial_messages, spec.workspace, spec.task_note_metadata,
-                            spec.task_note_persist_callback)
+                            spec.task_note_persist_callback,
+                            verified_reads=spec.task_note_verified_reads,
+                            read_allowed=(read_permission(spec.tools)
+                                          if spec.task_note_verified_reads else None))
             spec = replace(spec, task_state=note, tools=TaskTools(spec.tools, note),
                            initial_messages=[*spec.initial_messages, note.guidance()],
                            stream_progress_deltas=False)
@@ -387,6 +400,7 @@ class AgentRunner:
         hook = spec.hook or AgentHook()
         messages = list(spec.initial_messages)
         context = AgentRunHookContext(messages=deepcopy(messages))
+        read_observer_token = active_read_observer.set(ReadRepetitionObserver())
 
         try:
             await hook.before_run(context)
@@ -438,6 +452,7 @@ class AgentRunner:
             await hook.after_run(context)
             return result
         finally:
+            active_read_observer.reset(read_observer_token)
             if spec.selected_context:
                 spec.selected_context.trace.persist()
             active_context_trace.reset(trace_token)
@@ -486,7 +501,8 @@ class AgentRunner:
         stall_guard = spec.stall_guard and not (
             spec.selected_context and not spec.selected_context.legacy_fallback
         )
-        previous_finals = self._prior_session_final(spec.initial_messages) if stall_guard else []
+        session_previous_finals = self._prior_session_final(spec.initial_messages) if stall_guard else []
+        previous_finals: list[str] = []
 
         async def guard_final(clean, assistant_message, iteration, *, already_appended=False):
             nonlocal premature_final_corrections, task_corrections, report_corrections, stop_reason
@@ -499,7 +515,8 @@ class AgentRunner:
                 defects, terminal = spec.task_state.final_check()
                 if terminal:
                     stop_reason = "incomplete"
-                    clean = str(clean or "") + "\n\n미완료 상태: " + spec.task_state.update.explanation
+                    clean = (spec.task_state.update.final_answer or clean or "").strip()
+                    clean += "\n\n미완료 상태: " + spec.task_state.update.explanation
                     assistant_message["content"] = clean
                     return clean, False
                 if defects:
@@ -523,6 +540,14 @@ class AgentRunner:
                             "blocked or clarification in update_task and report the actual limit. "
                             "Do not infer intent from response wording. "
                         )
+                        if spec.task_state.scope_conflicts():
+                            feedback += (
+                                "Resolve the request/selection disagreement shown in scope_conflicts "
+                                "before doing more work. A reference is not an acquisition order. "
+                                "Do not invent file work or search for unrelated targets to clear "
+                                "the check. If scope is genuinely ambiguous, report known findings "
+                                "and the limit as partial/clarification instead of claiming completion. "
+                            )
                         if reporting_only:
                             feedback += (
                                 "The requested result has not been delivered. Use the already "
@@ -686,12 +711,18 @@ class AgentRunner:
                     )
                 except Exception:
                     messages_for_model = messages
+            # Optional hints describe the model copy *after* every governance/repair path.
+            from nanobot.session.user_scope_messages import finalize_quotes
+
+            messages_for_model = finalize_quotes(messages_for_model)
             context = AgentHookContext(
                 iteration=iteration,
                 messages=messages,
                 session_key=spec.session_key,
             )
             await hook.before_iteration(context)
+            if getattr(spec.task_state, "verified_reads", False):
+                messages_for_model = spec.task_state.refresh_visible_reads(messages_for_model)
             request_started = time.monotonic()
             logger.info(
                 "LLM request start: session={} iteration={} model={}",
@@ -733,7 +764,9 @@ class AgentRunner:
             if response.should_execute_tools:
                 context.tool_calls = list(response.tool_calls)
                 structured_report = spec.task_state is not None and any(
-                    call.name == "update_task" and call.arguments.get("status") in {"completed", "cancelled"}
+                    call.name == "update_task" and call.arguments.get("status") in {
+                        "completed", "cancelled", "partial", "blocked", "clarification",
+                    }
                     and str(call.arguments.get("final_answer") or "").strip()
                     for call in response.tool_calls
                 )
@@ -794,6 +827,7 @@ class AgentRunner:
                 last_tool_failures = [
                     event for call, event in zip(response.tool_calls, new_events)
                     if event.get("status") in _STALL_FAILURE_STATUSES
+                    and not event.get("execution_unknown")
                     and not isinstance(event, _RefusedToolEvent)
                     and not str(event.get("detail") or "").startswith(_STALL_POLICY_DETAILS)
                     and getattr(spec.tools.get(call.name), "read_only", False) is not True
@@ -1030,7 +1064,14 @@ class AgentRunner:
                 )
 
             if assistant_message is not None and stall_guard:
-                if self._repeats_previous_final(clean, previous_finals):
+                fresh_execution = any(
+                    event.get("status") == "ok"
+                    and not getattr(spec.tools.get(event.get("name", "")), "observability", False)
+                    for event in tool_events
+                )
+                if (self._repeats_previous_final(clean, previous_finals)
+                        or (not fresh_execution
+                            and self._repeats_previous_final(clean, session_previous_finals))):
                     # Same no-tool reply again: resending it cannot make progress.
                     logger.warning(
                         "Stopping turn for {}: no-tool final repeats an earlier final (iteration {})",
@@ -1218,6 +1259,7 @@ class AgentRunner:
                     final_content = spec.task_state.final_report()
                     stop_reason = spec.task_state.final_status
                 elif terminal:
+                    final_content = spec.task_state.update.final_answer or final_content
                     final_content = str(final_content or "") + "\n\n미완료 상태: " + spec.task_state.update.explanation
             if spec.premature_final_guard and needs_answer_body(final_content, messages):
                 final_content = str(final_content or "") + "\n\n" + ANSWER_BODY_INCOMPLETE
@@ -1816,14 +1858,31 @@ class AgentRunner:
         return results, events, fatal_error
 
     async def _run_tool(self, spec, tool_call, external_lookup_counts, workspace_violation_counts):
+        from nanobot.agent.tools.context import current_tool_output_limit
+
         tool = spec.tools.get(tool_call.name)
         async def operation():
-            return await self._run_tool_with_task_note(
+            result, event, error = await self._run_tool_with_task_note(
                 spec, tool_call, external_lookup_counts, workspace_violation_counts)
-        if spec.selected_context and tool is not None and not tool.read_only:
-            return await spec.selected_context.control.run_mutation(
-                tool_call, tool, operation, lambda: self._drain_injections(spec, wait=False))
-        return await operation()
+            observer = active_read_observer.get()
+            if observer is not None and observer.observe(
+                    tool_call.name, tool_call.arguments, result, event.get("status"),
+                    observability=bool(getattr(tool, "observability", False))):
+                from nanobot.agent.tools.base import ToolResult
+
+                payload = ToolResult(result + WARNING)
+                payload.__dict__.update(getattr(result, "__dict__", {}))
+                result = payload
+                event = dict(event, repeat_warning=True)
+            return result, event, error
+        token = current_tool_output_limit.set(spec.max_tool_result_chars)
+        try:
+            if spec.selected_context and tool is not None and not tool.read_only:
+                return await spec.selected_context.control.run_mutation(
+                    tool_call, tool, operation, lambda: self._drain_injections(spec, wait=False))
+            return await operation()
+        finally:
+            current_tool_output_limit.reset(token)
 
     async def _run_tool_with_task_note(
         self,
@@ -1851,10 +1910,19 @@ class AgentRunner:
             notice = note.progress.operation(tool_call.name, tool_call.arguments)
             if notice:
                 await spec.progress_callback(notice, tool_hint=False)
+        # Native command/session and MCP tools already enforce their configured timeout.
+        # A second, fixed 65s deadline must not shorten a trusted longer operation.
+        from nanobot.agent.tools.exec_session import WriteStdinTool
+        from nanobot.agent.tools.mcp import _MCPWrapperBase
+        from nanobot.agent.tools.shell import ExecTool
+
+        operation_limits = {"timeout": None} if isinstance(
+            tool, (ExecTool, WriteStdinTool, _MCPWrapperBase),
+        ) else {}
         try:
             outcome = await bounded_operation(note, tool_call.name, lambda: self._run_tool_unchecked(
                 spec, tool_call, external_lookup_counts, workspace_violation_counts,
-            ))
+            ), **operation_limits)
         except asyncio.CancelledError:
             if tool is not None and not tool.read_only:
                 note.observe(tool_call.name, tool_call.arguments,
@@ -2041,6 +2109,8 @@ class AgentRunner:
             return payload, event, None
 
         if is_tool_error_result(tool_call.name, result):
+            execution_unknown = bool(getattr(result, "execution_unknown", False))
+            error_hint = "" if execution_unknown else hint
             if file_edit_trackers and progress_callback is not None:
                 await invoke_file_edit_progress(
                     progress_callback,
@@ -2054,9 +2124,11 @@ class AgentRunner:
                 "status": "error",
                 "detail": result.replace("\n", " ").strip()[:120],
             }
+            if execution_unknown:
+                event["execution_unknown"] = True
             handled = self._classify_violation(
                 raw_text=result,
-                soft_payload=result + hint,
+                soft_payload=result + error_hint,
                 event=event,
                 tool_call=tool_call,
                 workspace_violation_counts=workspace_violation_counts,
@@ -2064,8 +2136,10 @@ class AgentRunner:
             if handled is not None:
                 return handled
             if spec.fail_on_tool_error:
-                return result + hint, event, RuntimeError(result)
-            return result + hint, event, None
+                return result + error_hint, event, RuntimeError(result)
+            payload = ToolResult.error(result + error_hint)
+            payload.__dict__.update(getattr(result, "__dict__", {}))
+            return payload, event, None
 
         if file_edit_trackers and progress_callback is not None:
             await invoke_file_edit_progress(

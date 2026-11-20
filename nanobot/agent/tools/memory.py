@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,9 @@ class _MemoryToolBase(Tool):
     def __init__(self, workspace: str) -> None:
         self.workspace = workspace
         self.store = ConversationEventStore(workspace)
-        self._ctx: RequestContext | None = None
+        self._ctx: ContextVar[RequestContext | None] = ContextVar(
+            "memory_tool_request_context", default=None
+        )
 
     @classmethod
     def create(cls, ctx: ToolContext) -> Tool:
@@ -44,10 +47,10 @@ class _MemoryToolBase(Tool):
         return True
 
     def set_context(self, ctx: RequestContext) -> None:
-        self._ctx = ctx
+        self._ctx.set(ctx)
 
     def _scope(self) -> MemoryScope:
-        return _scope_from_context(self.workspace, self._ctx or current_request_context())
+        return _scope_from_context(self.workspace, current_request_context() or self._ctx.get())
 
 
 class SearchMemoryTool(_MemoryToolBase):

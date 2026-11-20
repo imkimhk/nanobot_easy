@@ -868,6 +868,10 @@ def _skill_approve_reply(loop: Any, args: str) -> str:
         return f"Cannot approve `{name}` from chat: {message}. Reply `/skill approve {name} <reason>` if this needs an override reason."
     skill = result.get("skill")
     status = skill.get("status") if isinstance(skill, dict) else None
+    from nanobot.security.action_audit import approval_receipt
+
+    approval_receipt(loop.workspace, getattr(loop.tools_config, 'action_audit', None),
+                     status='approved', source='chat_command', subject=name)
     return f"Approved `{name}`" + (f" — status is now `{status}`." if status else ".")
 
 

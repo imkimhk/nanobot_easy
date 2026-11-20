@@ -290,6 +290,10 @@ class ToolRegistry:
             assert tool is not None  # guarded by prepare_call()
             result = await tool.execute(**params)
             if is_tool_error_result(name, result):
+                if getattr(result, "execution_unknown", False):
+                    # Preserve the uncertainty marker and the state-inspection
+                    # instruction instead of appending a generic retry hint.
+                    return result
                 return ToolResult.error(str(result) + hint)
             return result
         except Exception as e:

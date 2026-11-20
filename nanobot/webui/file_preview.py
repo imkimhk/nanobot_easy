@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from nanobot.security.secrets import is_sensitive_path
 from nanobot.security.workspace_access import WorkspaceScope
 from nanobot.security.workspace_policy import WorkspaceBoundaryError, resolve_allowed_path
 
@@ -50,6 +51,8 @@ def file_preview_payload(
     except OSError as e:
         raise WebUIFilePreviewError(400, "invalid path") from e
 
+    if is_sensitive_path(path) or is_sensitive_path(resolved):
+        raise WebUIFilePreviewError(403, "credential files cannot be previewed")
     if not resolved.is_file():
         raise WebUIFilePreviewError(404, "file not found")
 

@@ -248,6 +248,7 @@ class AgentLoop:
         stepwise_layout: str = "auto",
         stepwise_review_required: list[str] | None = None,
         stepwise_lightweight: bool = False,
+        task_note_verified_reads: bool = False,
         max_tool_result_chars: int | None = None,
         fail_on_tool_error: bool | None = None,
         provider_retry_mode: str = "standard",
@@ -285,6 +286,9 @@ class AgentLoop:
         context_selection: Any | None = None,
         compact_context: bool = False,
         selective_memory: bool = False,
+        memory_prompt_tokens: int = 0,
+        history_context_tokens: int | None = None,
+        preserve_user_scope_messages: bool = False,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -303,6 +307,9 @@ class AgentLoop:
         self._provider_signature = provider_signature
         self._default_selection_signature = preset_helpers.default_selection_signature(provider_signature)
         self.workspace = workspace
+        from nanobot.security.action_audit import ActionAuditStore
+
+        self.action_audit = ActionAuditStore.from_config(workspace, _tc.action_audit)
         self.model = model or provider.get_default_model()
         self.max_iterations = (
             max_iterations if max_iterations is not None else defaults.max_tool_iterations
@@ -313,6 +320,12 @@ class AgentLoop:
             else defaults.context_window_tokens
         )
         self.context_selection_config = context_selection or defaults.context_selection
+        self.history_context_tokens = (
+            defaults.history_context_tokens
+            if history_context_tokens is None else history_context_tokens
+        )
+        # Opt-in: quote earlier user scope messages that replay no longer contains.
+        self.preserve_user_scope_messages = preserve_user_scope_messages
         self.compact_context = compact_context
         self.context_block_limit = context_block_limit
         self.reasoning_effort = reasoning_effort
@@ -323,6 +336,7 @@ class AgentLoop:
         self.stepwise_layout = stepwise_layout
         self.stepwise_review_required = list(stepwise_review_required or [])
         self.stepwise_lightweight = stepwise_lightweight
+        self.task_note_verified_reads = task_note_verified_reads
         if stepwise_lightweight:
             logger.info("Lightweight task evidence enabled for workspace {}", workspace)
         if stepwise_enabled:
@@ -362,6 +376,7 @@ class AgentLoop:
         self.workspace_scopes = WorkspaceScopeResolver(
             default_workspace=workspace,
             default_restrict_to_workspace=restrict_to_workspace,
+            locked=_tc.hardened_mode,
         )
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
@@ -409,6 +424,7 @@ class AgentLoop:
             preload_always_skills=preload_always_skills,
             on_demand_skills=on_demand_skills,
             selective_memory=selective_memory and self.tools_config.file.enable,
+            memory_prompt_tokens=memory_prompt_tokens if self.tools_config.file.enable else 0,
         )
         self.conversation_memory = ConversationEventStore(workspace)
         self._memory_workspace_id = str(Path(workspace).expanduser().resolve())
@@ -438,7 +454,7 @@ class AgentLoop:
         self._unified_session = unified_session
         self._max_messages = replay_max_messages_for_context(self.context_window_tokens)
         self._running = False
-        self._mcp_servers = mcp_servers or {}
+        self._mcp_servers = {} if _tc.hardened_mode else (mcp_servers or {})
         self._mcp_stacks: dict[str, AsyncExitStack] = {}
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
@@ -534,10 +550,14 @@ class AgentLoop:
             subagent_profiles=defaults.subagent_profiles,
             max_subagent_depth=defaults.max_subagent_depth,
             context_window_tokens=context_window_tokens,
+            history_context_tokens=extra.pop("history_context_tokens", defaults.history_context_tokens),
+            preserve_user_scope_messages=extra.pop(
+                "preserve_user_scope_messages", defaults.preserve_user_scope_messages),
             context_block_limit=defaults.context_block_limit,
             context_selection=defaults.context_selection,
             compact_context=defaults.compact_context,
             selective_memory=defaults.selective_memory,
+            memory_prompt_tokens=defaults.memory_prompt_tokens,
             reasoning_effort=getattr(resolved, "reasoning_effort", None) or defaults.reasoning_effort,
             stepwise_enabled=defaults.stepwise.enabled,
             stepwise_applied_at=defaults.stepwise.applied_at,
@@ -545,6 +565,7 @@ class AgentLoop:
             stepwise_layout=defaults.stepwise.layout,
             stepwise_review_required=defaults.stepwise.review_required,
             stepwise_lightweight=defaults.stepwise.lightweight,
+            task_note_verified_reads=defaults.stepwise.verified_read_summary,
             max_tool_result_chars=defaults.max_tool_result_chars,
             fail_on_tool_error=defaults.fail_on_tool_error,
             provider_retry_mode=defaults.provider_retry_mode,
@@ -684,14 +705,15 @@ class AgentLoop:
         registered = loader.load(ctx, self.tools)
 
         # MyTool needs runtime state reference — manual registration
-        if self.tools_config.my.enable and not self.tools_config.safe_mode:
+        if (self.tools_config.my.enable and not self.tools_config.safe_mode
+                and not self.tools_config.hardened_mode):
             self.tools.register(
                 MyTool(runtime_state=self, modify_allowed=self.tools_config.my.allow_set)
             )
             registered.append("my")
 
         testy_root = Path(self.workspace)
-        if testy_root.name == "workspace-testy":
+        if testy_root.name == "workspace-testy" and not self.tools_config.hardened_mode:
             import sys
 
             if str(testy_root) not in sys.path:
@@ -924,6 +946,8 @@ class AgentLoop:
                 extra.setdefault("memory_event_id", "E" + uuid.uuid4().hex)
             before_count = len(session.messages)
             session.add_message("user", text, **extra)
+            if text_override is None and not automation_extra and not kwargs.get("_command"):
+                self._record_user_scope_message(msg, session, text, session.messages[-1].get("timestamp"))
             self.conversation_memory.insert_events(
                 self._memory_events_from_session_messages(
                     msg=msg,
@@ -948,6 +972,14 @@ class AgentLoop:
         """Build the initial message list for the LLM turn."""
         scope = self.workspace_scopes.for_message(msg, session.metadata)
         current_runtime_lines = self._proactive_skill_card_lines(msg, session)
+        earlier_user_messages = None
+        earlier_user_visibility = {}
+        if getattr(self, "preserve_user_scope_messages", False):
+            from nanobot.session.user_scope_messages import build_block
+            earlier_user_messages = build_block(
+                session.metadata, session_key=session.key, workspace=str(scope.project_path),
+                history=history, current_text=msg.content if isinstance(msg.content, str) else "",
+                session_messages=session.messages, visibility=earlier_user_visibility)
         return self.context.build_messages(
             history=history,
             current_message=image_generation_prompt(msg.content, msg.metadata),
@@ -964,7 +996,26 @@ class AgentLoop:
             include_memory_recent_history=include_memory_recent_history,
             session_key=session.key,
             unified_session=self._unified_session,
+            **({"earlier_user_messages": earlier_user_messages,
+                "earlier_user_visibility": earlier_user_visibility} if earlier_user_messages else {}),
         )
+
+    def _record_user_scope_message(
+        self, msg: InboundMessage, session: Session, text: str, timestamp: str | None = None,
+    ) -> None:
+        """Opt-in: keep a verbatim copy of a genuine channel user message that states scope."""
+        if not getattr(self, "preserve_user_scope_messages", False):
+            return
+        if msg.sender_id == "subagent" or msg.channel == "system":
+            return
+        from datetime import datetime
+
+        from nanobot.session.user_scope_messages import record
+        metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
+        scope = self.workspace_scopes.for_message(msg, session.metadata)
+        record(session.metadata, session_key=session.key, workspace=str(scope.project_path),
+               text=text, timestamp=timestamp or datetime.now().isoformat(),
+               message_id=metadata.get("message_id"), channel=msg.channel)
 
     async def _dispatch_command_inline(
         self,
@@ -1001,9 +1052,9 @@ class AgentLoop:
         return msg.session_key
 
     def _replay_token_budget(self) -> int:
-        """Derive a token budget for session history replay from the context window."""
+        """Bound old history independently of the active model context window."""
         if self.context_window_tokens <= 0:
-            return 0
+            return self.history_context_tokens
         max_output = getattr(getattr(self.provider, "generation", None), "max_tokens", 4096)
         try:
             reserved_output = int(max_output)
@@ -1014,7 +1065,8 @@ class AgentLoop:
             - max(1, reserved_output)
             - input_token_safety_buffer(self.context_window_tokens)
         )
-        return budget if budget > 0 else max(128, self.context_window_tokens // 2)
+        available = budget if budget > 0 else max(128, self.context_window_tokens // 2)
+        return min(available, self.history_context_tokens) if self.history_context_tokens > 0 else available
 
     async def _run_agent_loop(
         self,
@@ -1066,6 +1118,14 @@ class AgentLoop:
         hook: AgentHook = loop_hook
         if run_hooks and (not ephemeral or run_extra_hooks_for_ephemeral):
             hook = CompositeHook([loop_hook, *run_hooks])
+        if self.action_audit.enabled:
+            from nanobot.agent.audit_hook import ActionAuditHook
+
+            active_hooks = run_hooks if not ephemeral or run_extra_hooks_for_ephemeral else []
+            hook = CompositeHook([loop_hook, *active_hooks, ActionAuditHook(
+                self.action_audit, tools or self.tools, session_key,
+                source='ephemeral' if ephemeral else 'agent',
+            )])
 
         async def _checkpoint(payload: dict[str, Any]) -> None:
             if session is None:
@@ -1195,6 +1255,7 @@ class AgentLoop:
                 task_note_enabled=bool(getattr(self, "stepwise_lightweight", False)) and user_facing,
                 task_note_metadata=session_metadata,
                 task_note_persist_callback=(lambda: self.sessions.save(session)) if session else None,
+                task_note_verified_reads=bool(getattr(self, "task_note_verified_reads", False)),
                 premature_final_session_metadata=session_metadata if user_facing else None,
                 tools=tools or self.tools,
                 model=self.model,
@@ -1379,12 +1440,15 @@ class AgentLoop:
         session_key = self._effective_session_key(msg)
         if session_key != msg.session_key:
             msg = dataclasses.replace(msg, session_key_override=session_key)
+        dispatch_session = self.sessions.get_or_create(session_key)
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
 
         pending: asyncio.Queue | None = None
         try:
             async with lock, gate:
+                if not self.sessions.is_current(dispatch_session):
+                    return
                 # Only the task that owns the session lock may publish the
                 # active mid-turn injection queue for this session.
                 pending = asyncio.Queue(maxsize=20)
@@ -1465,8 +1529,8 @@ class AgentLoop:
                     # next conversation turn.
                     try:
                         key = self._effective_session_key(msg)
-                        session = self.sessions.get_or_create(key)
-                        if self._restore_runtime_checkpoint(session):
+                        session = dispatch_session
+                        if self.sessions.is_current(session) and self._restore_runtime_checkpoint(session):
                             self._clear_pending_user_turn(session)
                             self.sessions.save(session)
                             logger.info(
@@ -1513,8 +1577,9 @@ class AgentLoop:
                                 item = queue.get_nowait()
                             except asyncio.QueueEmpty:
                                 break
-                            await self.bus.publish_inbound(item)
-                            leftover += 1
+                            if self.sessions.is_current(dispatch_session):
+                                await self.bus.publish_inbound(item)
+                                leftover += 1
                         if leftover:
                             logger.info(
                                 "Re-published {} leftover message(s) to bus for session {}",
@@ -1575,6 +1640,17 @@ class AgentLoop:
         logger.info("Processing system message from {}", msg.sender_id)
         key = msg.session_key_override or f"{channel}:{chat_id}"
         session = self.sessions.get_or_create(key)
+        with self.sessions.session_scope(session):
+            return await self._process_system_turn(
+                msg, session, key, channel=channel, chat_id=chat_id,
+                on_progress=on_progress, on_stream=on_stream,
+                on_stream_end=on_stream_end, pending_queue=pending_queue,
+            )
+
+    async def _process_system_turn(
+        self, msg: InboundMessage, session: Session, key: str, *, channel: str, chat_id: str,
+        on_progress=None, on_stream=None, on_stream_end=None, pending_queue=None,
+    ) -> OutboundMessage | None:
         if self._restore_runtime_checkpoint(session):
             self.sessions.save(session)
         if self._restore_pending_user_turn(session):
@@ -1722,7 +1798,7 @@ class AgentLoop:
         t0 = time.time()
         ctx = TurnContext(
             msg=msg,
-            session=None,
+            session=self.sessions.get_or_create(key),
             session_key=key,
             state=TurnState.RESTORE,
             turn_id=f"{key}:{time.time_ns()}",
@@ -1740,7 +1816,13 @@ class AgentLoop:
             tools=tools,
         )
 
+        with self.sessions.session_scope(ctx.session):
+            return await self._run_turn_states(ctx)
+
+    async def _run_turn_states(self, ctx: TurnContext) -> OutboundMessage | None:
         while ctx.state is not TurnState.DONE:
+            if not self.sessions.is_current(ctx.session):
+                return None
             handler_name = f"_state_{ctx.state.name.lower()}"
             handler = getattr(self, handler_name, None)
             if handler is None:
@@ -1899,6 +1981,7 @@ class AgentLoop:
         name = str(pending.get("name") or "")
         clear_pending_skill_approval(session.metadata)
         self.sessions.save(session)
+        audit_status = 'rejected' if reply == 'no' else 'approval_failed'
         if reply == "no":
             content = f"Cancelled — `{name}` was not approved."
         else:
@@ -1917,9 +2000,12 @@ class AgentLoop:
             except ValueError as exc:
                 content = f"Could not approve `{name}`: {exc}"
             else:
+                audit_status = 'approved'
                 skill = result.get("skill")
                 status = skill.get("status") if isinstance(skill, dict) else None
                 content = f"Approved `{name}`" + (f" — status is now `{status}`." if status else ".")
+        self.action_audit.record(kind='approval', status=audit_status, source='chat_confirmation',
+                                 tool='skill_registration', subject=name, session_key=session.key)
         return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
 
     async def _state_command(self, ctx: TurnContext) -> str:
@@ -2403,6 +2489,9 @@ class AgentLoop:
         return "ok"
 
     async def _state_save(self, ctx: TurnContext) -> str:
+        if not self.sessions.is_current(ctx.session):
+            ctx.suppress_response = True
+            return "ok"
         turn_continuation.prepare_save_boundary(ctx)
 
         if (
@@ -2562,6 +2651,8 @@ class AgentLoop:
         for m in messages[skip:]:
             if m.get("_answer_delivery_feedback"):
                 continue  # Runtime feedback is not a new human instruction or durable memory.
+            if m.get("_user_scope_quotes"):
+                continue  # Opt-in quotes of earlier messages are rebuilt each turn, never stored.
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
@@ -2793,9 +2884,12 @@ class AgentLoop:
             content=content, media=media or [], metadata=metadata,
         )
         # Share the dispatch lock so direct calls serialize with bus turns.
+        direct_session = self.sessions.get_or_create(session_key)
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         try:
             async with lock:
+                if not self.sessions.is_current(direct_session):
+                    return None
                 kwargs: dict[str, Any] = {
                     "session_key": session_key,
                     "on_progress": on_progress,

@@ -144,6 +144,9 @@ class StepwiseConfig(Base):
     review_required: list[str] = Field(default_factory=list)  # procedure ids whose S6 model review always runs
     z3_check: bool = False  # Z3 entailment in rule judgments; off until rules are formalized
     lightweight: bool = False  # Explicit per-gateway opt-in; independent of stepwise.enabled.
+    # Experimental, off until a same-condition model comparison justifies it: show the model
+    # which earlier reads still match the current file content (lightweight task evidence).
+    verified_read_summary: bool = False
 
 
 class ContextSelectionConfig(Base):
@@ -190,10 +193,16 @@ class AgentDefaults(Base):
     )
     max_tokens: int = 8192
     context_window_tokens: int = 200_000
+    history_context_tokens: int = Field(default=16_000, ge=0, le=1_000_000)
+    # Opt-in, unverified with real models: quote earlier user messages that state limits,
+    # permissions or changes when replay history no longer contains them.
+    preserve_user_scope_messages: bool = False
     context_block_limit: int | None = None
     context_selection: ContextSelectionConfig = Field(default_factory=ContextSelectionConfig)
     compact_context: bool = False  # Opt-in: defer execution tutorials/schemas until needed.
     selective_memory: bool = False  # Opt-in: select explicitly marked reference notes only.
+    memory_prompt_tokens: int = Field(default=0, ge=0, le=20_000)
+    # Opt-in reviewed memory/prompt_snapshot.json; invalid/stale snapshots retain legacy memory.
     temperature: float = 0.1
     fallback_models: list[FallbackCandidate] = Field(default_factory=list)
     max_tool_iterations: int = 200
@@ -467,6 +476,19 @@ class SkillsConfig(Base):
     embedding: SkillEmbeddingConfig = Field(default_factory=SkillEmbeddingConfig)
 
 
+class MCPOAuthConfig(Base):
+    """Opt-in OAuth for HTTP MCP; credentials are stored separately from config."""
+
+    enabled: bool = False
+    profile: str = ""  # Same profile/server + URL in one data directory shares credentials.
+    scope: str | None = None
+    client_id: str | None = None
+    issuer: str | None = None  # Required for pre-registered client IDs.
+    client_secret: str | None = Field(default=None, repr=False)
+    client_metadata_url: str | None = None
+    callback_port: int = Field(default=8768, ge=1024, le=65535)
+
+
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
 
@@ -477,7 +499,9 @@ class MCPServerConfig(Base):
     cwd: str = ""  # Stdio: working directory for MCP server runtime artifacts
     url: str = ""  # HTTP/SSE: endpoint URL
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
+    oauth: MCPOAuthConfig = Field(default_factory=MCPOAuthConfig)
     tool_timeout: int = 30  # seconds before a tool call is cancelled
+    retry_safe_tools: list[str] = Field(default_factory=list)  # Exact raw/wrapped names verified by the operator as read-only or idempotent; no wildcard matching
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all capabilities (tools, resources, prompts); any restriction = only listed tools, no resources/prompts
 
 
@@ -530,6 +554,11 @@ def _lazy_default(module_path: str, class_name: str) -> Any:
     return getattr(module, class_name)()
 
 
+class ActionAuditConfig(Base):
+    enabled: bool = False
+    max_records: int = Field(default=10_000, ge=100, le=1_000_000)
+
+
 class ToolsConfig(Base):
     """Tools configuration.
 
@@ -559,6 +588,7 @@ class ToolsConfig(Base):
         validation_alias=AliasChoices("safeMode", "safe_mode"),
     )  # server-side policy intent for beginner/student surfaces; CLI keeps existing defaults
     restrict_to_workspace: bool = False  # policy intent: keep tool access inside workspace when possible
+    hardened_mode: bool = False  # lock workspace; disable native code, plugins and MCP execution
     webui_allow_local_service_access: bool = Field(
         default=True,
         validation_alias=AliasChoices(
@@ -584,6 +614,7 @@ class ToolsConfig(Base):
         validation_alias=AliasChoices("externalToolSkills", "external_tool_skills"),
     )
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+    action_audit: ActionAuditConfig = Field(default_factory=ActionAuditConfig)
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 

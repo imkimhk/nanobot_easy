@@ -8,6 +8,7 @@ import pytest
 
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.task_note import (
+    Target,
     TaskNote,
     TaskUpdate,
     UpdateTaskTool,
@@ -1018,3 +1019,189 @@ async def test_structured_report_still_passes_existing_public_content_filter(tmp
     ], request="제공된 본문을 분석해 줘\n```duplicate calls```", hook=AgentProgressHook())
     assert result.final_content == "원인은 중복 호출입니다."
     assert "private reasoning" not in metadata["task_note"]["update"]["final_answer"]
+
+
+async def test_live_log_ranges_survive_append_without_claiming_new_tail(tmp_path):
+    log = tmp_path / "live.log"
+    log.write_text("one\ntwo\nthree\nfour\n")
+    note = TaskNote([{"role": "user", "content": "최근 로그 원인 분석"}], tmp_path, {})
+    await read(note, tmp_path, "live.log", offset=1, limit=2)
+    with log.open("a") as stream:
+        stream.write("five\n")
+    await read(note, tmp_path, "live.log", offset=3, limit=2)
+    note.accept(update(note, targets=[target("live.log", unit="lines", start=1, end=4)]))
+    assert note.defects() == []
+    assert not note.covered(Target.model_validate(target("live.log")))
+    log.write_text("changed\ntwo\nthree\nfour\nfive\n")
+    assert not note.covered(Target.model_validate(target("live.log", unit="lines", start=1, end=4)))
+
+
+async def test_live_log_pagination_finishes_under_actual_model_limit(tmp_path):
+    log = tmp_path / "live.log"
+    log.write_text("\n".join(f"event {i}: " + "x" * 950 for i in range(1, 21)) + "\n")
+    calls = 0
+
+    def step(kwargs):
+        nonlocal calls
+        calls += 1
+        observed = [m for m in kwargs["messages"] if m.get("role") == "tool"
+                    and m.get("name") == "read_file"]
+        if not observed:
+            return call("read_file", path="live.log")
+        output = observed[-1]["content"]
+        assert len(output) <= 8000
+        covered = [int(n) for n in re.findall(r"^(\d+)\|", output, re.M)]
+        assert covered
+        end = max(covered)
+        if end >= 20:
+            return control(targets=[target("live.log", unit="lines", start=1, end=20)],
+                           final_answer="요청한 로그 1–20행의 검증을 마쳤습니다.")(kwargs)
+        with log.open("a") as stream:
+            stream.write("new runtime event\n")
+        return call("read_file", path="live.log", offset=end + 1, limit=20 - end)
+
+    result, provider, metadata = await run(tmp_path, [step] * 8, request="최근 로그를 분석해줘")
+    assert result.stop_reason == "completed"
+    assert len(provider.calls) <= 5
+    assert all(e["extraction_ok"] for e in metadata["task_note"]["evidence"])
+
+
+@pytest.mark.parametrize("status", ["partial", "blocked", "clarification"])
+@pytest.mark.parametrize("max_iterations", [1, 8])
+async def test_terminal_structured_report_is_delivered_without_extra_generation(
+    tmp_path, status, max_iterations,
+):
+    report = "테스트 실행은 성공했습니다. 외부 서버 인증 확인은 남아 있습니다."
+    result, provider, _ = await run(tmp_path, [
+        control(source="none", targets=[], status=status, analysis_complete=False,
+                final_answer=report, explanation="외부 로그인 필요"),
+    ], request="동작을 분석해줘", max_iterations=max_iterations)
+    assert result.stop_reason == "incomplete"
+    assert report in result.final_content
+    assert "외부 로그인 필요" in result.final_content
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.parametrize("configured_timeout", [60, 300, 0])
+async def test_exec_does_not_inherit_hidden_short_task_timeout(tmp_path, monkeypatch, configured_timeout):
+    from nanobot.agent import task_note as module
+    from nanobot.agent.tools.shell import ExecTool
+
+    observed = []
+
+    async def observe_timeout(note, name, operation, **kwargs):
+        observed.append(kwargs.get("timeout", "default"))
+        return await operation()
+
+    tool = ExecTool(working_dir=str(tmp_path), timeout=configured_timeout)
+    monkeypatch.setattr(tool, "execute", AsyncMock(return_value=ToolResult("Exit code: 0")))
+    monkeypatch.setattr(module, "bounded_operation", observe_timeout)
+    tools = ToolRegistry()
+    tools.register(tool)
+    provider = Script([
+        control(source="none", targets=[], status="active", analysis_complete=False),
+        call("exec", command="long-running fixture", timeout=300,
+             intent_summary="run fixture", target="fixture", scope="once", reversible=True),
+        control(source="none", targets=[], final_answer="명령 실행 결과를 확인했습니다."),
+    ])
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{"role": "user", "content": "명령 실행 결과를 분석해줘"}], tools=tools,
+        model="test", max_iterations=4, max_tool_result_chars=8000, workspace=tmp_path,
+        task_note_enabled=True, task_note_metadata={},
+    ))
+    assert result.stop_reason == "completed"
+    assert observed[1] is None
+
+
+def test_revisiting_an_earlier_file_content_is_not_a_duplicate_of_latest_write(tmp_path):
+    note = TaskNote([{"role": "user", "content": "a.md를 수정해줘"}], tmp_path, {})
+    note.accept(update(note, targets=[target(action="write")], status="active"))
+    tool = WriteFileTool(workspace=tmp_path)
+    first = {"path": "a.md", "content": "first"}
+    second = {"path": "a.md", "content": "second"}
+    note.observe("write_file", first, "saved", tool, "ok", "one")
+    note.observe("write_file", second, "saved", tool, "ok", "two")
+    assert note.mutation_error("write_file", first) is None
+    assert note.mutation_error("write_file", second) is not None
+
+
+@pytest.mark.parametrize("user_request", [
+    "설정 저장 방법을 설명해줘", "수정해야 하나? 현재 문제를 분석해줘",
+    "How do I edit this setting?", "Should I fix this configuration?",
+    "설정 저장 방법을 설명해줘. 파일은 만들거나 변경하지 마.",
+    "설정의 의미를 설명해줘. 파일을 만들지 마세요.",
+    "Explain the setting without modifying files.",
+])
+def test_questions_about_editing_do_not_require_a_write(tmp_path, user_request):
+    note = TaskNote([{"role": "user", "content": user_request}], tmp_path, {})
+    note.accept(update(note, source="none", targets=[]))
+    assert note.defects() == []
+
+
+@pytest.mark.parametrize("user_request", [
+    "결과를 저장해줘", "설정을 수정해 주세요", "잘못된 부분 고쳐줘",
+    "Please fix the issue", "Can you edit the configuration?",
+])
+def test_actual_edit_requests_still_require_execution(tmp_path, user_request):
+    note = TaskNote([{"role": "user", "content": user_request}], tmp_path, {})
+    note.accept(update(note, source="none", targets=[]))
+    assert "write_target_unresolved" in note.defects()
+
+
+def test_prohibition_does_not_hide_the_actual_requested_read_target(tmp_path):
+    note = TaskNote([{"role": "user", "content": "그 파일을 분석해줘. 파일은 만들거나 변경하지 마."}],
+                    tmp_path, {})
+    note.accept(update(note, source="none", targets=[]))
+    assert "target_unresolved" in note.defects()
+
+
+async def test_large_request_keeps_first_read_after_many_other_sources(tmp_path):
+    metadata = {}
+    note = TaskNote([{"role": "user", "content": "a.md를 분석해줘"}], tmp_path, metadata)
+    (tmp_path / "a.md").write_text("requested source\n")
+    await read(note, tmp_path)
+    for i in range(80):
+        name = f"diagnostic-{i}.txt"
+        (tmp_path / name).write_text("supporting source\n")
+        await read(note, tmp_path, name)
+    note.accept(update(note))
+    assert note.defects() == []
+    assert len(metadata["task_note"]["evidence"]) == 81
+    # Follow-up/restart can still use the selected original after large work.
+    restored = TaskNote([{"role": "user", "content": "a.md 분석을 계속해줘"}], tmp_path, metadata)
+    restored.accept(update(restored))
+    assert restored.defects() == []
+    # An unrelated new request releases old selected proofs into a bounded cache.
+    fresh = TaskNote([{"role": "user", "content": "제공된 본문 분석"}], tmp_path, metadata)
+    fresh.accept(update(fresh, source="provided", targets=[]))
+    assert len(fresh.evidence) <= 40
+
+
+async def test_many_pages_keep_whole_file_coverage_and_reject_changed_source(tmp_path):
+    metadata = {}
+    fp = tmp_path / "a.md"
+    fp.write_text("\n".join(f"line {i}" for i in range(80)))
+    note = TaskNote([{"role": "user", "content": "a.md 전체 분석"}], tmp_path, metadata)
+    for offset in range(1, 81):
+        await read(note, tmp_path, offset=offset, limit=1)
+    note.accept(update(note))
+    assert note.defects() == []
+    restored = TaskNote([{"role": "user", "content": "a.md 전체 분석 계속"}], tmp_path, metadata)
+    restored.accept(update(restored))
+    assert restored.defects() == []
+    fp.write_text("changed\n" + fp.read_text())
+    stale = TaskNote([{"role": "user", "content": "a.md 전체 분석"}], tmp_path, metadata)
+    stale.accept(update(stale))
+    assert "coverage_unconfirmed:a.md" in stale.defects()
+
+
+async def test_large_evidence_does_not_expand_model_guidance(tmp_path):
+    note = TaskNote([{"role": "user", "content": "a.md 분석"}], tmp_path, {})
+    (tmp_path / "a.md").write_text("\n".join(str(i) for i in range(80)))
+    for offset in range(1, 81):
+        await read(note, tmp_path, offset=offset, limit=1)
+    response = json.loads(note.accept(update(note)))
+    assert response["defects"] == []
+    assert len(response["evidence"]) == 20
+    cached = json.loads(note.guidance()["content"].split("\n")[-1])["cached_reads"]
+    assert len(cached) == 20

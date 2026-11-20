@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shlex
 import shutil
 import signal
 import sys
@@ -361,8 +362,11 @@ class ExecTool(Tool):
                 )
 
             from nanobot.agent.context_evidence import active_evidence_capture, test_command
-            if active_evidence_capture.get():
-                output = ToolResult(result, is_error=process.returncode != 0)
+            from nanobot.agent.task_note import active_task_note
+
+            output = ToolResult(result, is_error=process.returncode != 0)
+            output.execution_evidence = {"exit_code": process.returncode}
+            if active_evidence_capture.get() or active_task_note.get() is not None:
                 evidence_text = stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")
                 passed = re.search(r"\b(\d+) passed\b", evidence_text)
                 unittest_count = re.search(r"Ran (\d+) tests?", evidence_text)
@@ -371,8 +375,7 @@ class ExecTool(Tool):
                 output.execution_evidence = {"exit_code": process.returncode,
                     "result_kind": "test_result" if ran else "execution_result",
                     "tests_executed": ran, "test_counts": {"observed_executed": count}}
-                return output
-            return result
+            return output
 
         except Exception as e:
             return ToolResult.error(f"Error executing command: {str(e)}")
@@ -421,13 +424,15 @@ class ExecTool(Tool):
         except Exception as exc:
             return ToolResult.error(f"Error starting background job: {exc}")
         limit = f"{prepared.timeout}s" if prepared.timeout else "none"
-        return (
+        result = ToolResult(
             f"Background job started. job_id: {job.job_id}\n"
             f"pid: {job.pid}\nlog: {job.log_path}\ntimeout: {limit}\n"
             "The command keeps running after this reply. Check it with "
             f"exec_job(action='status', job_id='{job.job_id}') before reporting "
             "completion; do not start the same command again while it runs."
         )
+        result.execution_target = f"exec-job://{job.job_id}"
+        return result
 
     def _resolve_timeout(self, timeout: int | None) -> int | None:
         """Resolve the effective hard timeout in seconds (None = no limit).
@@ -796,15 +801,16 @@ class ExecTool(Tool):
             if self.allow_patterns:
                 return ToolResult.error("Error: Command blocked by allowlist filter (not in allowlist)")
 
-        from nanobot.security.network import contains_internal_url
-        if contains_internal_url(
+        from nanobot.security.network import command_url_error
+        network_error = command_url_error(
             cmd,
             allow_loopback=current_scope_allows_loopback(
                 enabled=self.webui_allow_local_service_access,
             ),
-        ):
+        )
+        if network_error:
             # The runner turns this marker into a non-retryable security hint.
-            return ToolResult.error("Error: Command blocked by safety guard (internal/private URL detected)")
+            return ToolResult.error(network_error)
 
         should_restrict = self.restrict_to_workspace if restrict_to_workspace is None else restrict_to_workspace
         if should_restrict:
@@ -896,11 +902,20 @@ class ExecTool(Tool):
     @staticmethod
     def _extract_absolute_paths(command: str) -> list[str]:
         # Windows: match drive-root paths like `C:\` as well as `C:\path\to\file`, and UNC paths like `\\server\share`
-        # NOTE: `*` is required so `C:\` (nothing after the slash) is still extracted.
+        # Require path content after the colon: Python's `lambda d: ...` is
+        # not a drive path. Bare drive operands are checked as shell tokens below.
         win_paths = re.findall(
-            r"(?<![A-Za-z])(?:[A-Za-z]:[^\s\"'|><;]*|\\\\[^\s\"'|><;]+(?:\\[^\s\"'|><;]+)*)",
+            r"(?<![A-Za-z%])(?:[A-Za-z]:[^\s\"'|><;]+|\\\\[^\s\"'|><;]+(?:\\[^\s\"'|><;]+)*)",
             command
         )
+        try:
+            args = shlex.shlex(command, posix=not _IS_WINDOWS, punctuation_chars=";&|")
+            args.whitespace_split = True
+            win_paths.extend(arg.strip("\"'") for arg in args
+                             if re.fullmatch(r"[\"']?[A-Za-z]:[\"']?", arg))
+        except ValueError:
+            # Malformed shell quoting must not hide a possible bare drive.
+            win_paths.extend(re.findall(r"(?<![A-Za-z%])[A-Za-z]:(?=\s|$)", command))
         posix_paths = re.findall(r"(?:^|[\s|>'\"])(/[^\s\"'>;|<]+)", command) # POSIX: /absolute only
         home_paths = re.findall(r"(?:^|[\s>'\"])(~[^\s\"'>;|<]*)", command) # POSIX/Windows home shortcut: ~
         return win_paths + posix_paths + home_paths

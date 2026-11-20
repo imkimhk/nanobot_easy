@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo } from "react";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { ChevronLeft, ChevronRight, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { mediaTarget } from "@/components/AttachmentTile";
 
 import { cn } from "@/lib/utils";
 import type { UIImage } from "@/lib/types";
@@ -73,7 +74,7 @@ export function ImageLightbox({
     if (index === null || total <= 1) return [] as UIImage[];
     const prev = images[(index - 1 + total) % total];
     const next = images[(index + 1) % total];
-    return [prev, next].filter((i) => i && i.url);
+    return [prev, next].filter((i) => i && mediaTarget(i.url)?.remote === false);
   }, [images, index, total]);
 
   if (!current || !current.url) return null;
@@ -119,6 +120,7 @@ export function ImageLightbox({
               src={current.url}
               alt={current.name ?? ""}
               decoding="async"
+              referrerPolicy="no-referrer"
               draggable={false}
               className="max-h-[92vh] max-w-[94vw] select-none rounded-[6px] object-contain shadow-2xl"
             />

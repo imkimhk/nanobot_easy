@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import os
 import re
 from contextlib import suppress
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, TypeVar
+from threading import Event
+from typing import Any, Callable, Iterable, TypeVar
 
 from nanobot.agent.tools.base import ToolResult
 from nanobot.agent.tools.filesystem import ListDirTool, _FsTool
@@ -101,6 +103,15 @@ def _matches_query(rel_path: str, query: str | None) -> bool:
 class _SearchTool(_FsTool):
     _IGNORE_DIRS = set(ListDirTool._IGNORE_DIRS)
 
+    async def _run_search(self, search: Callable[..., str], **kwargs: Any) -> str:
+        # to_thread copies the caller's workspace/security ContextVars. A stop request
+        # cancels the await immediately and tells the read-only worker to end its scan.
+        stop = Event()
+        try:
+            return await asyncio.to_thread(search, _stop=stop, **kwargs)
+        finally:
+            stop.set()
+
     def _display_path(self, target: Path, root: Path) -> str:
         workspace = self._display_workspace()
         if workspace:
@@ -108,16 +119,25 @@ class _SearchTool(_FsTool):
                 return target.relative_to(workspace).as_posix()
         return target.relative_to(root).as_posix()
 
-    def _iter_files(self, root: Path) -> Iterable[Path]:
+    def _iter_files(self, root: Path, stop: Event) -> Iterable[Path]:
         if root.is_file():
             yield root
             return
 
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = sorted(d for d in dirnames if d not in self._IGNORE_DIRS)
+            if stop.is_set():
+                return
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if d not in self._IGNORE_DIRS and self._is_visible_entry(Path(dirpath) / d)
+            )
             current = Path(dirpath)
             for filename in sorted(filenames):
-                yield current / filename
+                if stop.is_set():
+                    return
+                candidate = current / filename
+                if self._is_visible_entry(candidate):
+                    yield candidate
 
 
 class FindFilesTool(_SearchTool):
@@ -190,19 +210,28 @@ class FindFilesTool(_SearchTool):
             },
         }
 
-    def _iter_paths(self, root: Path, *, include_dirs: bool) -> Iterable[Path]:
+    def _iter_paths(self, root: Path, *, include_dirs: bool, stop: Event) -> Iterable[Path]:
         if root.is_file():
             yield root
             return
         if include_dirs:
             yield root
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = sorted(d for d in dirnames if d not in self._IGNORE_DIRS)
+            if stop.is_set():
+                return
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if d not in self._IGNORE_DIRS and self._is_visible_entry(Path(dirpath) / d)
+            )
             current = Path(dirpath)
             if include_dirs and current != root:
                 yield current
             for filename in sorted(filenames):
-                yield current / filename
+                if stop.is_set():
+                    return
+                candidate = current / filename
+                if self._is_visible_entry(candidate):
+                    yield candidate
 
     async def execute(
         self,
@@ -214,6 +243,25 @@ class FindFilesTool(_SearchTool):
         sort: str = "path",
         head_limit: int | None = None,
         offset: int = 0,
+        **kwargs: Any,
+    ) -> str:
+        return await self._run_search(
+            self._search, path=path, query=query, glob=glob, type=type, include_dirs=include_dirs,
+            sort=sort, head_limit=head_limit, offset=offset, **kwargs,
+        )
+
+    def _search(
+        self,
+        path: str = ".",
+        query: str | None = None,
+        glob: str | None = None,
+        type: str | None = None,
+        include_dirs: bool = False,
+        sort: str = "path",
+        head_limit: int | None = None,
+        offset: int = 0,
+        *,
+        _stop: Event,
         **kwargs: Any,
     ) -> str:
         try:
@@ -234,7 +282,7 @@ class FindFilesTool(_SearchTool):
             root = target if target.is_dir() else target.parent
             matches: list[tuple[str, float]] = []
 
-            for candidate in self._iter_paths(target, include_dirs=include_dirs):
+            for candidate in self._iter_paths(target, include_dirs=include_dirs, stop=_stop):
                 if candidate.is_dir() and not include_dirs:
                     continue
                 rel_path = candidate.relative_to(root).as_posix()
@@ -423,6 +471,32 @@ class GrepTool(_SearchTool):
         offset: int = 0,
         **kwargs: Any,
     ) -> str:
+        return await self._run_search(
+            self._search, pattern=pattern, path=path, glob=glob, type=type, case_insensitive=case_insensitive,
+            fixed_strings=fixed_strings, output_mode=output_mode, context_before=context_before,
+            context_after=context_after, max_matches=max_matches, max_results=max_results,
+            head_limit=head_limit, offset=offset, **kwargs,
+        )
+
+    def _search(
+        self,
+        pattern: str,
+        path: str = ".",
+        glob: str | None = None,
+        type: str | None = None,
+        case_insensitive: bool = False,
+        fixed_strings: bool = False,
+        output_mode: str = "files_with_matches",
+        context_before: int = 0,
+        context_after: int = 0,
+        max_matches: int | None = None,
+        max_results: int | None = None,
+        head_limit: int | None = None,
+        offset: int = 0,
+        *,
+        _stop: Event,
+        **kwargs: Any,
+    ) -> str:
         try:
             target = self._resolve(path or ".")
             if not target.exists():
@@ -457,14 +531,15 @@ class GrepTool(_SearchTool):
             file_mtimes: dict[str, float] = {}
             root = target if target.is_dir() else target.parent
 
-            for file_path in self._iter_files(target):
+            for file_path in self._iter_files(target, _stop):
                 rel_path = file_path.relative_to(root).as_posix()
                 if glob and not _match_glob(rel_path, file_path.name, glob):
                     continue
                 if not _matches_type(file_path.name, type):
                     continue
 
-                raw = file_path.read_bytes()
+                with file_path.open("rb") as handle:
+                    raw = handle.read(self._MAX_FILE_BYTES + 1)
                 if len(raw) > self._MAX_FILE_BYTES:
                     skipped_large += 1
                     continue
@@ -485,6 +560,8 @@ class GrepTool(_SearchTool):
                 display_path = self._display_path(file_path, root)
                 file_had_match = False
                 for idx, line in enumerate(lines, start=1):
+                    if _stop.is_set():
+                        return ToolResult.error("Search cancelled")
                     if not regex.search(line):
                         continue
                     file_had_match = True

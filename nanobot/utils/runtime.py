@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -92,14 +94,17 @@ def external_lookup_signature(tool_name: str, arguments: Any) -> str | None:
     """Stable signature for repeated external lookups we want to throttle."""
     if not isinstance(arguments, dict):
         return None
-    if tool_name == "web_fetch":
-        url = str(arguments.get("url") or "").strip()
-        if url:
-            return f"web_fetch:{url.lower()}"
-    if tool_name == "web_search":
-        query = str(arguments.get("query") or arguments.get("search_term") or "").strip()
-        if query:
-            return f"web_search:{query.lower()}"
+    field = "url" if tool_name == "web_fetch" else "query"
+    if tool_name in {"web_fetch", "web_search"} and str(
+            arguments.get(field) or arguments.get("search_term") or "").strip():
+        # All execution arguments matter (count, extraction mode, pagination, ...).
+        # URL paths and query strings may be case-sensitive. Hashing also keeps
+        # private query text / URLs out of repeat-limit log messages.
+        try:
+            canonical = json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return None
+        return tool_name + ":" + hashlib.sha256(canonical.encode()).hexdigest()
     return None
 
 

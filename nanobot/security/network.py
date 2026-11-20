@@ -285,6 +285,32 @@ def contains_internal_url(command: str, *, allow_loopback: bool = False) -> bool
     return False
 
 
+def command_url_error(command: str, *, allow_loopback: bool = False) -> str | None:
+    """Keep unsafe commands blocked, distinguishing unknown templates from private destinations."""
+    for match in _URL_RE.finditer(command):
+        url = match.group(0)
+        try:
+            hostname = urlparse(url).hostname or ""
+        except ValueError:
+            hostname = ""
+        if any(marker in hostname for marker in ("{", "}", "$", "%")):
+            return (
+                "Error: URL template cannot be validated before execution. Use a complete "
+                "literal URL so the existing network policy can validate its destination. "
+                "The command was not executed."
+            )
+        ok, error = validate_url_target(url, allow_loopback=allow_loopback)
+        if not ok:
+            if error.startswith("Cannot resolve hostname:"):
+                return (
+                    "Error: URL hostname could not be resolved before execution. Verify DNS "
+                    "or provide a complete literal URL permitted by the existing network policy. "
+                    "The command was not executed."
+                )
+            return "Error: Command blocked by safety guard (internal/private URL detected)"
+    return None
+
+
 def _is_allowed_loopback_target(
     hostname: str,
     addrs: list[ipaddress.IPv4Address | ipaddress.IPv6Address],

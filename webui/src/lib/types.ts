@@ -159,6 +159,8 @@ export interface AutomationUpdatePayload {
 
 export interface SessionDeleteResult {
   deleted: boolean;
+  memory_events_deleted?: number;
+  memory_retained?: boolean;
   blocked_by_automations?: boolean;
   automations?: SessionAutomationJob[];
 }

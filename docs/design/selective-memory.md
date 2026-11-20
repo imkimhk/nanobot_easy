@@ -114,25 +114,23 @@ queries, generic and deictic queries, complete corrections over budget, malforme
 reference fallback, cross-project fallback and full-guidance activation.
 
 ```bash
-pytest tests/agent/test_memory_selection.py tests/agent/test_memory_archive_context.py \
-  tests/agent/test_compact_context.py tests/agent/test_context_builder.py -q
-python -m scripts.improvement_eval.live_tool_context --config .local/config.json \
-  --selective-memory --out .local/evaluations/memory-selection-new
+pytest tests/agent/test_memory_selection.py tests/agent/test_compact_context.py \
+  tests/agent/test_context_builder.py -q
+python -m scripts.improvement_eval.live_memory_selection --config .local/config.json \
+  --out .local/evaluations/memory-selection-new
 ```
 
-The live evaluator copies the configured workspace's policy, memory and skill
-instructions into a private evaluation directory. It uses the configured
-provider with isolated real files for math and save-and-reread. For memory and
-exact-replay cases, pass --memory-prompt-file and --cases math write memory repeat.
-Historical retrieval additionally accepts --history-prompt-file and the history
-case. No MCP servers are connected; unrelated tool actions refuse execution.
-The evaluator incurs model usage. Copied instructions and results are private
-artifacts and must be reviewed before sharing.
+The live evaluator uses the operating provider with synthetic memory and isolated
+real files. It measures math, save-and-reread, Korean fact recall, followups,
+missing-fact full-source reads and a pinned approval gate. It incurs model usage.
 
-An earlier operating evaluation exposed a stall-guard false positive on an exact
-repeat-answer request. That guard and its correction belong to separate runtime
-work; this change does not add or modify a runner repetition detector. The
-selector independently preserves full active memory on previous-dialogue turns.
+The initial evaluation exposed a pre-existing stall guard false positive on an
+exact repeat-answer request, both before and after selection. A separate runner
+fix now exempts explicit answer-only replay requests from cross-turn comparisons.
+It does not disable comparisons within the current run, failed-tool recovery,
+task evidence checks or execution-request guards. It uses the current visible
+user text, excluding runtime metadata and background memory; ambiguous requests
+and requests combining a replay with more work retain the guard.
 
 Six subsequent live checks passed with selection both off and on: factual recall,
 the repeated answer and a followup asking for only the last three digits. One

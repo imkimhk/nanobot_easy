@@ -17,7 +17,7 @@ const CLI_APPS: CliAppInfo[] = [
     installed: true,
     available: true,
     status: "installed",
-    logo_url: "https://example.invalid/zoom.svg",
+    logo_url: "/brand/zoom.svg",
     brand_color: "#0B5CFF",
     skill_installed: true,
   },
@@ -54,7 +54,7 @@ const MCP_PRESETS: McpPresetInfo[] = [
     configured: true,
     available: true,
     status: "configured",
-    logo_url: "https://example.invalid/browserbase.svg",
+    logo_url: "/brand/browserbase.svg",
     brand_color: "#111827",
     required_fields: [],
     connection_summary: "https://mcp.browserbase.com/mcp",
@@ -144,7 +144,7 @@ describe("MessageBubble", () => {
         display_name: "Draw.io",
         category: "diagram",
         entry_point: "cli-anything-drawio",
-        logo_url: "https://example.invalid/drawio.svg",
+        logo_url: "/brand/drawio.svg",
         brand_color: "#F08705",
       }],
     };
@@ -334,7 +334,7 @@ describe("MessageBubble", () => {
     const video = screen.getByLabelText(/video attachment/i);
     expect(video.tagName).toBe("VIDEO");
     expect(video).toHaveAttribute("src", "/api/media/sig/payload");
-    expect(video).toHaveAttribute("preload", "auto");
+    expect(video).toHaveAttribute("preload", "none");
     expect(container.querySelector("video[controls]")).toBeInTheDocument();
     expect(screen.queryByText("Preview")).not.toBeInTheDocument();
     expect(screen.queryByText("Code")).not.toBeInTheDocument();

@@ -156,6 +156,8 @@ class ChannelManager:
                     from nanobot.webui.gateway_services import build_gateway_services
 
                     parsed = WebSocketConfig.model_validate(section)
+                    if self.config.tools.hardened_mode:
+                        parsed.workspace_controls_enabled = False
                     static_path = _default_webui_dist() if self._webui_static_dist else None
                     workspace = Path(self.config.workspace_path)
 
@@ -188,13 +190,15 @@ class ChannelManager:
                         session_manager=self._session_manager,
                         static_dist_path=static_path,
                         workspace_path=workspace,
-                        default_restrict_to_workspace=self.config.tools.restrict_to_workspace,
+                        default_restrict_to_workspace=(self.config.tools.restrict_to_workspace
+                                                       or self.config.tools.hardened_mode),
                         disabled_skills=set(self.config.agents.defaults.disabled_skills),
                         runtime_model_name=self._webui_runtime_model_name,
                         runtime_surface=self._webui_runtime_surface,
                         runtime_capabilities_overrides=self._webui_runtime_capabilities,
                         skill_management_enabled=self.config.tools.webui_skill_management.enabled,
                         skill_management_red_flags=self.config.tools.webui_skill_management.red_flags,
+                        action_audit=self.config.tools.action_audit,
                         skill_draft_composer=_compose_skill_draft,
                         cron_service=self._cron_service,
                         local_trigger_store=self._local_trigger_store,

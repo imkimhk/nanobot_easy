@@ -880,7 +880,10 @@ class Consolidator:
             replay_max_messages,
         )
         summary = await self.archive(chunk, session_key=session.key)
+        if not summary:
+            return None
         session.last_consolidated = end_idx
+        self._persist_last_summary(session, summary)
         self.sessions.save(session)
         return summary
 
@@ -958,6 +961,16 @@ class Consolidator:
         messages_to_summarize = summary_messages if summary_messages is not None else messages
         try:
             formatted = MemoryStore._format_messages(messages_to_summarize)
+            if session_key:
+                previous = self.sessions.get_or_create(session_key).metadata.get("_last_summary")
+                previous_text = previous.get("text") if isinstance(previous, dict) else None
+                if isinstance(previous_text, str) and previous_text.strip():
+                    formatted = (
+                        "Earlier summary (historical context, not current authorization):\n"
+                        + truncate_text(previous_text, _ARCHIVE_SUMMARY_MAX_CHARS)
+                        + "\n\nNewer conversation (newer user instructions take precedence):\n"
+                        + formatted
+                    )
             formatted = self._truncate_to_token_budget(formatted)
             response = await self.provider.chat_with_retry(
                 model=self.model,
@@ -974,9 +987,11 @@ class Consolidator:
                 tools=None,
                 tool_choice=None,
             )
-            if response.finish_reason == "error":
-                raise RuntimeError(f"LLM returned error: {response.content}")
-            summary = response.content or "[no summary]"
+            if response.finish_reason in {"error", "length"}:
+                raise RuntimeError("Consolidation did not return a complete summary")
+            summary = (response.content or "").strip()
+            if not summary or len(summary) > _ARCHIVE_SUMMARY_MAX_CHARS:
+                raise RuntimeError("Consolidation summary is empty or exceeds its size limit")
             self.store.append_history(
                 summary,
                 max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
@@ -1017,6 +1032,10 @@ class Consolidator:
                 session,
                 replay_max_messages,
             )
+            # A failed replay summary must not hide its source or trigger a second
+            # summary request in this same preflight.
+            if self._replay_overflow_boundary(session, replay_max_messages) is not None:
+                return
             try:
                 estimated, source = self.estimate_session_prompt_tokens(
                     session,
@@ -1069,18 +1088,15 @@ class Consolidator:
                     len(chunk),
                 )
                 summary = await self.archive(chunk, session_key=session.key)
-                # Advance the cursor either way: on success the chunk was
-                # summarized; on failure archive() already raw-archived it as
-                # a breadcrumb. Re-archiving the same chunk on the next call
-                # would just emit duplicate [RAW] entries.
-                if summary:
-                    last_summary = summary
-                session.last_consolidated = end_idx
-                self.sessions.save(session)
                 if not summary:
-                    # LLM is degraded — stop hammering it this call;
-                    # the next invocation can retry a fresh chunk.
+                    # The raw fallback is bounded, so it cannot replace the source.
+                    # Preserve the live cursor and let normal context governance run.
                     break
+                last_summary = summary
+                session.last_consolidated = end_idx
+                # Each subsequent round must see the preceding checkpoint.
+                self._persist_last_summary(session, summary)
+                self.sessions.save(session)
 
                 try:
                     estimated, source = self.estimate_session_prompt_tokens(
@@ -1145,6 +1161,10 @@ class Consolidator:
                     session_key=session_key,
                     summary_messages=messages_to_summarize,
                 )
+                if not summary:
+                    # Keep originals and the previous checkpoint when the model
+                    # is unavailable, empty, or cut off mid-summary.
+                    return None
 
             if summary and summary != "(nothing)":
                 session.metadata["_last_summary"] = {

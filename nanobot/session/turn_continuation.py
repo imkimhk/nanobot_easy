@@ -183,7 +183,9 @@ def prepare_save_boundary(ctx: Any) -> None:
     ctx.save_skip = _save_skip_for_turn(
         message_metadata=ctx.msg.metadata,
         initial_message_count=len(ctx.initial_messages),
-        history_count=len(ctx.history),
+        # Opt-in quote messages sit among the initial messages but are not the current request.
+        history_count=len(ctx.history) + sum(
+            1 for m in ctx.initial_messages if isinstance(m, dict) and m.get("_user_scope_quotes")),
         user_persisted_early=ctx.user_persisted_early,
     )
 

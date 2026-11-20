@@ -3460,7 +3460,6 @@ class SelectedContext:
                            "user_request": self.request_text,
                            "required_results": self.required_results() if self.design else [],
                            "reference": (self.state or {}).get("reference"),
-                           "carried_conditions": (self.state or {}).get("carried_conditions", []),
                            "this_request_changes": [
                                {k: o.get(k) for k in ("tool_call_id", "name", "status", "failure_class",
                                                       "executed", "resource_id")}

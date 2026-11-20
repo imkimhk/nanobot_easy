@@ -9,7 +9,11 @@ from unittest.mock import patch
 import pytest
 
 from nanobot.agent.tools.shell import ExecTool
-from nanobot.security.workspace_access import bind_workspace_scope, build_workspace_scope, reset_workspace_scope
+from nanobot.security.workspace_access import (
+    bind_workspace_scope,
+    build_workspace_scope,
+    reset_workspace_scope,
+)
 
 
 def _fake_resolve_private(hostname, port, family=0, type_=0):
@@ -113,6 +117,34 @@ async def test_exec_allows_normal_commands():
     result = await tool.execute(command="echo hello")
     assert "hello" in result
     assert "Error" not in result.split("\n")[0]
+
+
+async def test_nonzero_exit_is_a_structured_failure_without_context_selection(tmp_path):
+    from nanobot.agent.tools.registry import is_tool_error_result
+
+    tool = ExecTool(working_dir=str(tmp_path), timeout=5)
+    result = await tool.execute(command=f'"{sys.executable}" -c "raise SystemExit(7)"')
+    assert is_tool_error_result("exec", result)
+    assert result.execution_evidence["exit_code"] == 7
+
+
+def test_dynamic_url_stays_blocked_with_actionable_error(tmp_path):
+    tool = ExecTool(working_dir=str(tmp_path))
+    with patch("nanobot.security.network.socket.getaddrinfo") as resolve:
+        error = tool._guard_command("url = f'http://{host}:{port}/health'", str(tmp_path))
+    assert error is not None
+    assert "URL template cannot be validated" in error
+    assert "command was not executed" in error
+    resolve.assert_not_called()
+
+
+def test_dns_failure_is_not_misreported_as_a_private_network_violation(tmp_path):
+    tool = ExecTool(working_dir=str(tmp_path))
+    with patch("nanobot.security.network.socket.getaddrinfo", side_effect=socket.gaierror()):
+        error = tool._guard_command("curl https://unresolved.invalid/health", str(tmp_path))
+    assert error is not None
+    assert "hostname could not be resolved" in error
+    assert "internal/private" not in error
 
 
 @pytest.mark.asyncio

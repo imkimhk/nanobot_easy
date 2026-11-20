@@ -111,7 +111,7 @@ async def test_tool_retries_on_transient_error():
     exc = _FakeClosedResourceError("connection lost")
     session.call_tool = AsyncMock(side_effect=[exc, result])
 
-    wrapper = MCPToolWrapper(session, "test_server", _make_tool_def(), tool_timeout=5)
+    wrapper = MCPToolWrapper(session, "test_server", _make_tool_def(), tool_timeout=5, retry_safe=True)
 
     with patch("nanobot.agent.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
         output = await wrapper.execute(foo="bar")
@@ -128,7 +128,7 @@ async def test_tool_fails_after_retry_exhausted():
     exc2 = _FakeClosedResourceError("still dead again")
     session.call_tool = AsyncMock(side_effect=[exc1, exc2])
 
-    wrapper = MCPToolWrapper(session, "test_server", _make_tool_def(), tool_timeout=5)
+    wrapper = MCPToolWrapper(session, "test_server", _make_tool_def(), tool_timeout=5, retry_safe=True)
 
     with patch("nanobot.agent.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
         output = await wrapper.execute()
@@ -213,7 +213,7 @@ async def test_tool_retry_on_connection_reset():
         side_effect=[ConnectionResetError("reset by peer"), result]
     )
 
-    wrapper = MCPToolWrapper(session, "test_server", _make_tool_def(), tool_timeout=5)
+    wrapper = MCPToolWrapper(session, "test_server", _make_tool_def(), tool_timeout=5, retry_safe=True)
 
     with patch("nanobot.agent.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
         output = await wrapper.execute()
@@ -229,7 +229,7 @@ async def test_tool_retry_on_end_of_stream():
     result = _make_tool_result("back")
     session.call_tool = AsyncMock(side_effect=[_FakeEndOfStreamError("eof"), result])
 
-    wrapper = MCPToolWrapper(session, "test_server", _make_tool_def(), tool_timeout=5)
+    wrapper = MCPToolWrapper(session, "test_server", _make_tool_def(), tool_timeout=5, retry_safe=True)
 
     with patch("nanobot.agent.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
         output = await wrapper.execute()
@@ -246,8 +246,8 @@ async def test_tool_reconnects_on_transient_failure():
     new_session = AsyncMock()
     new_session.call_tool = AsyncMock(return_value=_make_tool_result("fresh"))
 
-    wrapper = MCPToolWrapper(old_session, "test_server", _make_tool_def(), tool_timeout=5)
-    replacement = MCPToolWrapper(new_session, "test_server", _make_tool_def(), tool_timeout=5)
+    wrapper = MCPToolWrapper(old_session, "test_server", _make_tool_def(), tool_timeout=5, retry_safe=True)
+    replacement = MCPToolWrapper(new_session, "test_server", _make_tool_def(), tool_timeout=5, retry_safe=True)
 
     async def reconnect(server_name: str, tool_name: str, stale_tool):
         assert server_name == "test_server"
@@ -264,6 +264,92 @@ async def test_tool_reconnects_on_transient_failure():
     assert old_session.call_tool.call_count == 1
     assert new_session.call_tool.call_count == 1
     mock_sleep.assert_not_called()
+
+
+@pytest.mark.parametrize("annotations", [None, {"readOnlyHint": True}, {"idempotentHint": True}])
+async def test_uncertain_mutation_is_not_replayed_even_with_server_hints(annotations):
+    effects = []
+
+    async def mutate(*args, **kwargs):
+        effects.append("created")
+        raise ConnectionError("reply lost after commit")
+
+    session = SimpleNamespace(call_tool=AsyncMock(side_effect=mutate))
+    definition = _make_tool_def()
+    definition.annotations = annotations
+    wrapper = MCPToolWrapper(session, "test_server", definition)
+    output = await wrapper.execute()
+    assert effects == ["created"]
+    assert "unknown" in output.lower()
+    assert "inspect" in output.lower()
+    assert output.execution_unknown is True
+    assert wrapper.read_only is False
+
+
+async def test_uncertain_mutation_reconnects_without_replaying_call():
+    old = AsyncMock()
+    old.call_tool.side_effect = _session_terminated_error()
+    new = AsyncMock()
+    new.call_tool.return_value = _make_tool_result("next separate request")
+    wrapper = MCPToolWrapper(old, "test_server", _make_tool_def())
+    replacement = MCPToolWrapper(new, "test_server", _make_tool_def())
+    reconnect = AsyncMock(return_value=replacement)
+    wrapper.set_reconnect_handler(reconnect)
+    output = await wrapper.execute()
+    assert output.execution_unknown is True
+    assert old.call_tool.call_count == 1
+    reconnect.assert_awaited_once()
+    new.call_tool.assert_not_called()
+    assert await wrapper.execute() == "next separate request"
+
+
+async def test_reconnect_does_not_expand_single_retry_budget():
+    old = AsyncMock()
+    old.call_tool.side_effect = ConnectionError("closed")
+    new = AsyncMock()
+    new.call_tool.side_effect = ConnectionError("still closed")
+    wrapper = MCPToolWrapper(old, "test_server", _make_tool_def(), retry_safe=True)
+    replacement = MCPToolWrapper(new, "test_server", _make_tool_def(), retry_safe=True)
+    reconnect = AsyncMock(return_value=replacement)
+    wrapper.set_reconnect_handler(reconnect)
+    with patch("nanobot.agent.tools.mcp.asyncio.sleep", new_callable=AsyncMock):
+        output = await wrapper.execute()
+    assert "failed after retry" in output
+    assert old.call_tool.call_count + new.call_tool.call_count == 2
+
+
+async def test_revoked_retry_policy_is_respected_after_reconnect():
+    old = AsyncMock()
+    old.call_tool.side_effect = ConnectionError("closed")
+    new = AsyncMock()
+    wrapper = MCPToolWrapper(old, "test_server", _make_tool_def(), retry_safe=True)
+    replacement = MCPToolWrapper(new, "test_server", _make_tool_def())
+    wrapper.set_reconnect_handler(AsyncMock(return_value=replacement))
+    output = await wrapper.execute()
+    assert output.execution_unknown is True
+    new.call_tool.assert_not_called()
+
+
+async def test_new_retry_policy_cannot_replay_an_already_uncertain_mutation():
+    old = AsyncMock()
+    old.call_tool.side_effect = ConnectionError("reply lost")
+    new = AsyncMock()
+    wrapper = MCPToolWrapper(old, "test_server", _make_tool_def())
+    replacement = MCPToolWrapper(new, "test_server", _make_tool_def(), retry_safe=True)
+    wrapper.set_reconnect_handler(AsyncMock(return_value=replacement))
+    output = await wrapper.execute()
+    assert output.execution_unknown is True
+    new.call_tool.assert_not_called()
+
+
+async def test_reconnect_failure_preserves_uncertain_result():
+    session = AsyncMock()
+    session.call_tool.side_effect = ConnectionError("closed")
+    wrapper = MCPToolWrapper(session, "test_server", _make_tool_def())
+    wrapper.set_reconnect_handler(AsyncMock(side_effect=RuntimeError("cannot reconnect")))
+    output = await wrapper.execute()
+    assert output.execution_unknown is True
+    assert session.call_tool.call_count == 1
 
 
 # ---------------------------------------------------------------------------

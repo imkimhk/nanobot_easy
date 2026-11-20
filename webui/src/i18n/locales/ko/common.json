@@ -592,6 +592,7 @@
         "none": "다음 실행 없음"
       },
       "message": {
+    "loadRemoteMedia": "외부 미디어 불러오기",
         "showMore": "전체 메시지 보기",
         "showLess": "접기"
       },
@@ -760,6 +761,8 @@
     }
   },
   "deleteConfirm": {
+    "deleteMemory": "이 대화의 원문 메모리와 검색 색인도 삭제",
+    "memoryNotice": "정리된 메모리 요약과 백업은 별도로 보관됩니다.",
     "title": "이 채팅을 삭제할까요?",
     "description": "이 작업은 되돌릴 수 없습니다.",
     "cancel": "취소",

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Callable, Coroutine
 
 from loguru import logger
@@ -25,6 +25,7 @@ class AutoCompact:
         self._ttl = session_ttl_minutes
         self._archiving: set[str] = set()
         self._summaries: dict[str, tuple[str, datetime]] = {}
+        self._retry_after: dict[str, datetime] = {}
 
     def _is_expired(self, ts: datetime | str | None,
                     now: datetime | None = None) -> bool:
@@ -72,6 +73,9 @@ class AutoCompact:
                 continue
             if key in active_session_keys:
                 continue
+            if self._retry_after.get(key, datetime.min) > now:
+                continue
+            self._retry_after.pop(key, None)
             updated_at = info.get("updated_at")
             if self._is_expired(updated_at, now) and self._has_compactable_idle_tail(key):
                 self._archiving.add(key)
@@ -85,6 +89,10 @@ class AutoCompact:
             summary = await self.consolidator.compact_idle_session(
                 key, self._RECENT_SUFFIX_MESSAGES,
             )
+            if summary is None:
+                self._retry_after[key] = datetime.now() + timedelta(minutes=max(1, self._ttl))
+                return
+            self._retry_after.pop(key, None)
             if summary and summary != "(nothing)":
                 session = self.sessions.get_or_create(key)
                 meta = session.metadata.get("_last_summary")

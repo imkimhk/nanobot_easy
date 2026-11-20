@@ -589,6 +589,7 @@
         "none": "Tidak ada jadwal berikutnya"
       },
       "message": {
+    "loadRemoteMedia": "Load external media",
         "showMore": "Tampilkan pesan lengkap",
         "showLess": "Tampilkan lebih sedikit"
       },
@@ -760,6 +761,8 @@
     }
   },
   "deleteConfirm": {
+    "deleteMemory": "Also delete this chat’s raw memory and search indexes",
+    "memoryNotice": "Curated memory summaries and backups are retained separately.",
     "title": "Hapus obrolan ini?",
     "description": "Tindakan ini tidak dapat dibatalkan.",
     "cancel": "Batal",

@@ -20,3 +20,12 @@ def _has_hidden_history_marker(message: Mapping[str, Any] | None) -> bool:
 def is_hidden_history_message(message: Mapping[str, Any] | None) -> bool:
     """True for persisted messages that should not be shown as chat turns."""
     return _has_hidden_history_marker(message) or is_automation_history_message(message)
+
+
+def is_task_control_message(message: Mapping[str, Any]) -> bool:
+    """Identify obsolete per-request guidance without hiding literal user text."""
+    return (
+        message.get("role") == "user"
+        and _has_hidden_history_marker(message)
+        and str(message.get("content", "")).startswith("[Task evidence control;")
+    )

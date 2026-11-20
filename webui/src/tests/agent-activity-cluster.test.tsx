@@ -704,7 +704,7 @@ describe("AgentActivityCluster", () => {
     expect(screen.queryByText(/mcp_browserbase_browser_navigate/)).not.toBeInTheDocument();
   });
 
-  it("renders public web fetch traces with the site favicon", () => {
+  it("renders public web fetch traces without contacting favicon services", () => {
     render(
       <AgentActivityCluster
         messages={[{
@@ -720,13 +720,12 @@ describe("AgentActivityCluster", () => {
       />,
     );
 
-    const favicon = screen.getByTestId("activity-web-favicon-auth0.com");
-    expect(favicon.querySelector("img")?.getAttribute("src")).toContain("auth0.com");
+    expect(screen.queryByTestId("activity-web-favicon-auth0.com")).not.toBeInTheDocument();
     expect(screen.getByText("Reading")).toBeInTheDocument();
     expect(screen.getByText("auth0.com/blog/jwt-security-best-practices")).toBeInTheDocument();
   });
 
-  it("renders plain-text fetch progress with the site favicon", () => {
+  it("renders plain-text fetch progress without contacting favicon services", () => {
     render(
       <AgentActivityCluster
         messages={[{
@@ -742,7 +741,7 @@ describe("AgentActivityCluster", () => {
       />,
     );
 
-    expect(screen.getByTestId("activity-web-favicon-auth0.com")).toBeInTheDocument();
+    expect(screen.queryByTestId("activity-web-favicon-auth0.com")).not.toBeInTheDocument();
     expect(screen.getByText("Reading")).toBeInTheDocument();
     expect(screen.getByText("auth0.com/blog/jwt-security-best-practices")).toBeInTheDocument();
   });

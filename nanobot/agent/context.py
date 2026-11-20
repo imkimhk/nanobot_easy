@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.memory_context import MEMORY_TOOL_GUIDANCE
+from nanobot.agent.memory_prompt import BoundedMemoryPrompt
 from nanobot.agent.skills import SkillsLoader
 from nanobot.agent.tools import mcp as mcp_tools
 from nanobot.agent.tools.registry import ToolRegistry
@@ -15,6 +16,7 @@ from nanobot.apps.cli import utils as cli_app_utils
 from nanobot.bus.events import InboundMessage
 from nanobot.session.conversation_focus import focus_runtime_lines
 from nanobot.session.goal_state import goal_state_runtime_lines
+from nanobot.session.user_scope_messages import quote_message
 from nanobot.utils.helpers import (
     current_time_str,
     detect_image_mime,
@@ -83,10 +85,12 @@ class ContextBuilder:
         preload_always_skills: bool = True,
         on_demand_skills: list[str] | None = None,
         selective_memory: bool = False,
+        memory_prompt_tokens: int = 0,
     ):
         self.workspace = workspace
         self.timezone = timezone
         self.memory = MemoryStore(workspace)
+        self.memory_prompt = BoundedMemoryPrompt(self.memory.memory_file, memory_prompt_tokens)
         self.hot_path_skills = list(dict.fromkeys(hot_path_skills or []))
         self.selective_memory = selective_memory
         self.preload_always_skills = preload_always_skills
@@ -107,6 +111,8 @@ class ContextBuilder:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         root = workspace or self.workspace
         parts = [self._get_identity(channel=channel, workspace=root)]
+        if facts := self._configuration_facts(memory_query):
+            parts.append(facts)
 
         bootstrap = self._load_bootstrap_files(root)
         if bootstrap:
@@ -198,6 +204,8 @@ class ContextBuilder:
         parts = [render_template("agent/compact_identity.md",
                                  workspace_path=str(root.expanduser().resolve()),
                                  channel=channel or ""), self._load_bootstrap_files(root)]
+        if facts := self._configuration_facts(memory_query):
+            parts.append(facts)
         memory = self._memory_context(memory_query, root)
         if memory:
             parts.append(f"# Memory\n\n{memory}")
@@ -212,12 +220,27 @@ class ContextBuilder:
             parts.append(f"[Archived Context Summary]\n\n{session_summary}")
         return "\n\n---\n\n".join(part for part in parts if part)
 
+    @staticmethod
+    def _configuration_facts(query: str | None) -> str:
+        # The query is available only for a fresh conversation. Keep unrelated
+        # prompts and existing conversation replay unchanged.
+        text = (query or "").lower()
+        if (any(name in text for name in ("nanobot", "나노봇"))
+                and any(word in text for word in ("config", "settings", "설정"))):
+            return render_template("agent/_snippets/configuration_facts.md")
+        return ""
+
     def _memory_context(self, query: str | None = None, workspace: Path | None = None) -> str:
         text = self.memory.read_memory()
         if not text or self._is_template_content(text, "memory/MEMORY.md"):
             return ""
+        same_workspace = workspace is None or workspace.resolve() == self.workspace.resolve()
+        if same_workspace:
+            projection = self.memory_prompt.build(text)
+            if projection is not None:
+                return f"## Long-term Memory\n{projection}"
         if (self.selective_memory and query is not None
-                and (workspace is None or workspace.resolve() == self.workspace.resolve())):
+                and same_workspace):
             from nanobot.agent.memory_selection import select_memory
 
             text = select_memory(text, query, source=str(self.memory.memory_file))
@@ -351,6 +374,8 @@ class ContextBuilder:
         include_memory_recent_history: bool = True,
         session_key: str | None = None,
         unified_session: bool = False,
+        earlier_user_messages: str | None = None,
+        earlier_user_visibility: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         root = workspace or self.workspace
@@ -413,8 +438,16 @@ class ContextBuilder:
         if messages[-1].get("role") == current_role:
             last = dict(messages[-1])
             last["content"] = self._merge_message_content(last.get("content"), merged)
+            if earlier_user_messages:
+                # Merged into the history tail: the quotes go before it, so the current request
+                # stays last; the save boundary counts them (prepare_save_boundary).
+                messages.insert(len(messages) - 1, quote_message(earlier_user_messages, earlier_user_visibility))
             messages[-1] = last
             return messages
+        if earlier_user_messages:
+            # Opt-in quotes are their own hidden message, so request classifiers, task notes
+            # and persistence never read them as the current user request.
+            messages.append(quote_message(earlier_user_messages, earlier_user_visibility))
         messages.append({"role": current_role, "content": merged})
         return messages
 

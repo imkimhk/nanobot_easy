@@ -166,9 +166,10 @@ async def maybe_generate_webui_title(
             response.finish_reason,
         )
         return False
+    if not sessions.is_current(session):
+        return False
     session.metadata[WEBUI_TITLE_METADATA_KEY] = title
-    sessions.save(session)
-    return True
+    return sessions.save(session) is not False
 
 
 async def maybe_generate_webui_title_after_turn(

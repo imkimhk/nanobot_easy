@@ -509,11 +509,13 @@ async def test_empty_response_falls_back(aiohttp_client) -> None:
 
 
 @pytest.mark.asyncio
-async def test_process_direct_accepts_media() -> None:
+async def test_process_direct_accepts_media(tmp_path) -> None:
     """process_direct should forward media paths to _process_message."""
     from nanobot.agent.loop import AgentLoop
+    from nanobot.session.manager import SessionManager
 
     loop = AgentLoop.__new__(AgentLoop)
+    loop.sessions = SessionManager(tmp_path)
     loop._connect_mcp = AsyncMock()
     loop._session_locks = {}
 

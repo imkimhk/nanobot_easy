@@ -621,8 +621,8 @@ class TestAutoCompactEdgeCases:
         await loop.close_mcp()
 
     @pytest.mark.asyncio
-    async def test_auto_compact_archive_failure_still_keeps_recent_suffix(self, tmp_path):
-        """Auto-new should keep the recent suffix even if LLM archive falls back to raw dump."""
+    async def test_auto_compact_archive_failure_preserves_originals(self, tmp_path):
+        """A bounded raw dump cannot replace originals when the summary failed."""
         loop = _make_loop(tmp_path, session_ttl_minutes=15)
         session = loop.sessions.get_or_create("cli:test")
         _add_turns(session, 6, prefix="important")
@@ -635,7 +635,13 @@ class TestAutoCompactEdgeCases:
         await loop.auto_compact._archive("cli:test")
 
         session_after = loop.sessions.get_or_create("cli:test")
-        assert len(session_after.messages) == loop.auto_compact._RECENT_SUFFIX_MESSAGES
+        assert len(session_after.messages) == 12
+        assert session_after.messages[0]["content"] == "important user 0"
+        assert session_after.last_consolidated == 0
+        # Failure retains the source; a cooldown prevents a hot idle-retry loop.
+        scheduled = []
+        loop.auto_compact.check_expired(scheduled.append)
+        assert not scheduled
 
         await loop.close_mcp()
 

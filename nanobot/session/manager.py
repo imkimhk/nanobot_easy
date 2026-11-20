@@ -1,20 +1,24 @@
 """Session management for conversation history."""
 
+import asyncio
 import base64
 import json
 import os
 import re
 import shutil
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from loguru import logger
 
 from nanobot.config.paths import get_legacy_sessions_dir
+from nanobot.session.history_visibility import is_task_control_message
+from nanobot.session.lifecycle import bind_session_writes
 from nanobot.utils.helpers import (
     ensure_dir,
     estimate_message_tokens,
@@ -126,6 +130,7 @@ class Session:
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
     last_consolidated: int = 0  # Number of messages already consolidated to files
+    _generation: int = field(default=0, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # An out-of-range offset (corrupt metadata) would hide all history; reset it.
@@ -159,7 +164,12 @@ class Session:
         History is sliced by message count first (``max_messages``), then by
         token budget from the tail (``max_tokens``) when provided.
         """
-        unconsolidated = self.messages[self.last_consolidated:]
+        # Per-request controls are regenerated from current evidence. Keep their
+        # audit records on disk, but do not replay old controls as user requests.
+        unconsolidated = [
+            message for message in self.messages[self.last_consolidated:]
+            if not is_task_control_message(message)
+        ]
         max_messages = max_messages if max_messages > 0 else FILE_MAX_MESSAGES
         start_idx = recent_message_start_index(
             unconsolidated,
@@ -276,7 +286,10 @@ class Session:
                     None,
                 )
                 if recovered_user is not None:
-                    kept = out[recovered_user:]
+                    # Recover the request/constraints, not its entire oversized
+                    # tool transcript. The retained tail must start legally.
+                    kept = kept[find_legal_message_start(kept):]
+                    kept = [out[recovered_user], *kept]
 
             # And keep a legal tool-call boundary at the front.
             start = find_legal_message_start(kept)
@@ -287,6 +300,8 @@ class Session:
 
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
+        # Quotes of this conversation's user messages (opt-in) end with the conversation.
+        self.metadata.pop("user_scope_messages", None)
         self.messages = []
         self.last_consolidated = 0
         self.updated_at = datetime.now()
@@ -424,6 +439,33 @@ class SessionManager:
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
         self._cache: dict[str, Session] = {}
+        self._generations: dict[str, int] = {}
+        self._writers: dict[str, set[asyncio.Task]] = {}
+        self._write_lock = RLock()
+
+    def is_current(self, session: Session) -> bool:
+        with self._write_lock:
+            return session._generation == self._generations.get(session.key, 0)
+
+    @contextmanager
+    def session_scope(self, session: Session):
+        """Bind a turn and its child tasks to this session generation."""
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        writers = self._writers.setdefault(session.key, set())
+        already_registered = task in writers
+        if task is not None:
+            writers.add(task)
+        try:
+            with bind_session_writes(self.workspace, lambda: self.is_current(session)):
+                yield
+        finally:
+            if task is not None and not already_registered:
+                writers.discard(task)
+            if not writers and self._writers.get(session.key) is writers:
+                self._writers.pop(session.key, None)
 
     @staticmethod
     def safe_key(key: str) -> str:
@@ -492,7 +534,7 @@ class SessionManager:
 
         session = self._load(key)
         if session is None:
-            session = Session(key=key)
+            session = Session(key=key, _generation=self._generations.get(key, 0))
 
         self._cache[key] = session
         return session
@@ -556,7 +598,8 @@ class SessionManager:
                 created_at=created_at or datetime.now(),
                 updated_at=updated_at or datetime.now(),
                 metadata=metadata,
-                last_consolidated=last_consolidated
+                last_consolidated=last_consolidated,
+                _generation=self._generations.get(key, 0),
             )
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
@@ -615,7 +658,8 @@ class SessionManager:
                 created_at=created_at or datetime.now(),
                 updated_at=updated_at or datetime.now(),
                 metadata=metadata,
-                last_consolidated=last_consolidated
+                last_consolidated=last_consolidated,
+                _generation=self._generations.get(key, 0),
             )
         except Exception as e:
             logger.warning("Repair failed for session {}: {}", key, e)
@@ -631,7 +675,15 @@ class SessionManager:
             "messages": session.messages,
         }
 
-    def save(self, session: Session, *, fsync: bool = False) -> None:
+    def save(self, session: Session, *, fsync: bool = False) -> bool:
+        """Save atomically, or reject a writer from a deleted generation."""
+        with self._write_lock:
+            if not self.is_current(session):
+                return False
+            self._save_current(session, fsync=fsync)
+            return True
+
+    def _save_current(self, session: Session, *, fsync: bool = False) -> None:
         """Save a session to disk atomically.
 
         When *fsync* is ``True`` the final file and its parent directory are
@@ -701,6 +753,18 @@ class SessionManager:
         self._cache.pop(key, None)
 
     def delete_session(self, key: str) -> bool:
+        with self._write_lock:
+            self._generations[key] = self._generations.get(key, 0) + 1
+            try:
+                current = asyncio.current_task()
+            except RuntimeError:
+                current = None
+            for task in tuple(self._writers.get(key, ())):
+                if task is not current and not task.done():
+                    task.get_loop().call_soon_threadsafe(task.cancel)
+            return self._delete_session_files(key)
+
+    def _delete_session_files(self, key: str) -> bool:
         """Remove a session from disk (both workspace and legacy locations) and cache.
 
         Returns True if at least one JSONL file was found and unlinked.
@@ -774,6 +838,7 @@ class SessionManager:
             updated_at=now,
             metadata=metadata,
             last_consolidated=last_consolidated,
+            _generation=self._generations.get(target_key, 0),
         )
         self.save(target, fsync=True)
         return target
