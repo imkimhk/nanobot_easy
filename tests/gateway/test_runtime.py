@@ -109,6 +109,31 @@ def test_start_background_uses_windows_process_group_flags(tmp_path, monkeypatch
     assert "start_new_session" not in calls[0]["kwargs"]
 
 
+@pytest.mark.parametrize("platform_name", ["Linux", "Windows"])
+def test_gateway_does_not_inherit_restart_controller_grants(tmp_path, monkeypatch, platform_name):
+    monkeypatch.setenv("NANOBOT_ALLOW_SELF_STOP", "1")
+    monkeypatch.setenv("NANOBOT_DETACHED_RESTART", "1")
+    monkeypatch.setenv("NANOBOT_WORKSPACE", "preserved-workspace")
+    calls = []
+
+    def spawn(*args, **kwargs):
+        calls.append(kwargs)
+        return FakeProcess()
+
+    runtime = GatewayRuntime(paths=_paths(tmp_path), platform_name=platform_name,
+                             popen=spawn, sleep=lambda _: None)
+    monkeypatch.setattr(runtime, "_is_pid_running", lambda _: True)
+    monkeypatch.setattr(runtime, "_process_identity", lambda _: "start")
+    assert runtime.start_background(GatewayStartOptions(port=18790)).ok
+    env = calls[0]["env"]
+    assert "NANOBOT_ALLOW_SELF_STOP" not in env
+    assert "NANOBOT_DETACHED_RESTART" not in env
+    assert env["NANOBOT_WORKSPACE"] == "preserved-workspace"
+    # The controller still needs its own one-time grants to finish the restart.
+    import os
+    assert os.environ["NANOBOT_ALLOW_SELF_STOP"] == "1"
+
+
 def test_status_clears_stale_state(tmp_path, monkeypatch):
     runtime = GatewayRuntime(paths=_paths(tmp_path), platform_name="Linux")
     runtime.paths.run_dir.mkdir(parents=True)
@@ -155,6 +180,32 @@ def test_stop_terminates_recorded_process(tmp_path, monkeypatch):
     assert result.ok is True
     assert terminated == [12345]
     assert not runtime.paths.state_path.exists()
+
+
+def test_terminate_posix_signals_only_the_recorded_pid(tmp_path, monkeypatch):
+    signals: list[tuple[int, int]] = []
+    alive = True
+
+    def fake_kill(pid, sig):
+        nonlocal alive
+        signals.append((pid, sig))
+        if sig != 0:
+            alive = False
+
+    runtime = GatewayRuntime(paths=_paths(tmp_path), platform_name="Linux", sleep=lambda _seconds: None)
+    monkeypatch.setattr("nanobot.gateway.runtime.os.kill", fake_kill)
+    monkeypatch.setattr(
+        "nanobot.gateway.runtime.os.killpg",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("process group signal")),
+    )
+    monkeypatch.setattr("nanobot.gateway.runtime.os.getpgid", lambda _pid: 1)
+    monkeypatch.setattr(runtime, "_is_pid_running", lambda _pid: alive)
+    monkeypatch.setattr(runtime, "_process_identity", lambda _pid: "parent-start")
+    monkeypatch.setattr(runtime, "_posix_snapshot",
+                        lambda: {12345: (1, ["nanobot", "gateway"], "parent-start")})
+
+    assert runtime._terminate_posix(12345, timeout_s=1) is True
+    assert signals == [(12345, signal.SIGTERM)]
 
 
 def test_stop_keeps_state_when_process_survives_timeout(tmp_path, monkeypatch):

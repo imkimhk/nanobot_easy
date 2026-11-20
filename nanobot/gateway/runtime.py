@@ -159,6 +159,11 @@ class GatewayRuntime:
             return RuntimeResult(False, "gateway_identity_unverified", current)
 
         command = self._build_child_command(options)
+        # These grants belong to the short-lived restart controller only.
+        # Keeping them in the daemon would let later tool calls stop it inline.
+        child_env = os.environ.copy()
+        for key in ("NANOBOT_ALLOW_SELF_STOP", "NANOBOT_DETACHED_RESTART"):
+            child_env.pop(key, None)
         self.paths.run_dir.mkdir(parents=True, exist_ok=True)
         self.paths.logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -168,6 +173,7 @@ class GatewayRuntime:
                 stdin=subprocess.DEVNULL,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
+                env=child_env,
                 **self._popen_platform_kwargs(),
             )
 
@@ -311,25 +317,126 @@ class GatewayRuntime:
         return self._terminate_posix(pid, timeout_s=timeout_s)
 
     def _terminate_posix(self, pid: int, *, timeout_s: int) -> bool:
+        """Stop the gateway and its owned workers, never a shared process group."""
+        from nanobot.gateway.process_tree import owned_descendants
+
+        snapshot = self._posix_snapshot()
+        if snapshot is None:
+            return False  # Do not claim a clean shutdown without ownership evidence.
+        parent_identity = self._process_identity(pid)
+        if pid in snapshot and snapshot[pid][2] != parent_identity:
+            return False
+        state = self._read_state()
+        if state and _as_int(state.get("pid")) == pid and state.get("identity") != parent_identity:
+            return False
+        if pid not in snapshot and self._is_pid_running(pid):
+            return False
+        peers = self._peer_gateway_pids(snapshot)
+        peers.discard(pid)
+        owned = {}
+        for child in owned_descendants(snapshot, pid, os.getpid(), peers):
+            owned[child] = snapshot[child][2]
+        if self._process_identity(pid) != parent_identity:
+            return False
         try:
-            pgid = os.getpgid(pid)
-        except OSError:
-            pgid = None
-        try:
-            if pgid is not None:
-                os.killpg(pgid, signal.SIGTERM)
-            else:
-                os.kill(pid, signal.SIGTERM)
+            os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
-            return True
-        if self._wait_for_exit(pid, timeout_s):
-            return True
-        with suppress(ProcessLookupError):
-            if pgid is not None:
-                os.killpg(pgid, signal.SIGKILL)
+            return self._stop_posix_children(pid, owned)
+        parent_stopped = self._wait_for_exit(pid, timeout_s)
+        if not parent_stopped and parent_identity is None:
+            return False
+        if not parent_stopped and self._process_identity(pid) != parent_identity:
+            parent_stopped = True  # Never collect children from, or signal, a reused PID.
+        if not parent_stopped:
+            # Capture workers started while the gateway was draining, before
+            # killing their parent makes them orphans.
+            snapshot = self._posix_snapshot()
+            if snapshot is None:
+                return False
+            for child in owned_descendants(snapshot, pid, os.getpid(),
+                                           self._peer_gateway_pids(snapshot)):
+                # Never replace an earlier birth identity with a reused PID's.
+                owned.setdefault(child, snapshot[child][2])
+            if self._process_identity(pid) == parent_identity:
+                with suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+                parent_stopped = self._wait_for_exit(pid, 2)
             else:
-                os.kill(pid, signal.SIGKILL)
-        return self._wait_for_exit(pid, 2)
+                parent_stopped = True  # Never signal a reused PID.
+        children_stopped = self._stop_posix_children(pid, owned)
+        return parent_stopped and children_stopped
+
+    def _posix_snapshot(self):
+        from nanobot.gateway.process_tree import process_snapshot
+
+        return process_snapshot(self.platform_name, self._subprocess_run)
+
+    def _peer_gateway_pids(self, snapshot) -> set[int]:
+        peers = set()
+        for path in self.paths.run_dir.glob("gateway*.json"):
+            if path == self.paths.state_path:
+                continue
+            try:
+                state = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(state, dict):
+                continue
+            peer = _as_int(state.get("pid"))
+            if peer in snapshot and self._record_matches_process(state, peer):
+                peers.add(peer)
+        return peers
+
+    def _remaining_posix_children(self, root: int, owned: dict):
+        from nanobot.gateway.process_tree import is_gateway
+
+        snapshot = self._posix_snapshot()
+        if snapshot is None:
+            return None
+        peers = self._peer_gateway_pids(snapshot)
+        peers.discard(root)
+        peers.update(pid for pid, (_, argv, _) in snapshot.items()
+                     if pid != root and is_gateway(argv))
+        remaining = {}
+        for pid, identity in owned.items():
+            current, seen = pid, set()
+            while current in snapshot and current not in seen and current not in peers:
+                seen.add(current)
+                current = snapshot[current][0]
+            if current not in peers and pid in snapshot:
+                actual = self._process_identity(pid)
+                if actual == identity:
+                    remaining[pid] = identity
+                elif actual is None and self._is_pid_running(pid):
+                    return None
+        return remaining
+
+    def _stop_posix_children(self, root: int, owned: dict) -> bool:
+        if not owned:
+            return True
+        for sig, grace in ((signal.SIGTERM, 1.0), (signal.SIGKILL, 2.0)):
+            remaining = self._remaining_posix_children(root, owned)
+            if remaining is None:
+                return False
+            for child, identity in remaining.items():
+                # Recheck at the last possible point, including after the TERM grace.
+                if self._process_identity(child) != identity:
+                    continue
+                try:
+                    os.kill(child, sig)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    return False
+            deadline = time.monotonic() + grace
+            while time.monotonic() < deadline:
+                remaining = self._remaining_posix_children(root, owned)
+                if remaining is None:
+                    return False
+                if not remaining:
+                    return True
+                self._sleep(0.1)
+        return self._remaining_posix_children(root, owned) == {}
 
     def _terminate_windows(self, pid: int, *, timeout_s: int) -> bool:
         ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
