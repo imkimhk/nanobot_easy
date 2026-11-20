@@ -283,6 +283,41 @@ def test_run_up_already_running_skips_start_and_opens_browser(tmp_path: Path, mo
     assert opened  # browser was still opened
 
 
+def test_run_up_stale_code_refuses_to_stop_its_own_ancestor(tmp_path: Path, monkeypatch):
+    config_path = _config(tmp_path)
+    workspace_path = tmp_path / ".local" / "workspace"
+    (tmp_path / "webui").mkdir()
+    package = tmp_path / "nanobot"
+    package.mkdir()
+    (package / "changed.py").write_text("x = 1\n")
+    dist_index = package / "web" / "dist" / "index.html"
+    dist_index.parent.mkdir(parents=True)
+    dist_index.write_text("<html></html>")
+
+    status = GatewayStatus(
+        running=True,
+        pid=os.getpid(),
+        state_path=tmp_path / "gateway.json",
+        log_path=tmp_path / "gateway.log",
+        started_at="2000-01-01T00:00:00+00:00",
+        reason="running",
+    )
+    fake = FakeRuntime(status)
+    monkeypatch.delenv("NANOBOT_ALLOW_SELF_STOP", raising=False)
+    monkeypatch.setattr(up_mod, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(up_mod, "_runtime_for", lambda *_a, **_kw: fake)
+    monkeypatch.setattr(up_mod, "is_ancestor_pid", lambda _pid: True)
+
+    messages: list[str] = []
+    code = up_mod.run_up(
+        config_path=str(config_path), workspace_path=str(workspace_path), print_fn=messages.append
+    )
+
+    assert code == 2
+    assert fake.stopped is False
+    assert any("own process tree" in message for message in messages)
+
+
 def test_run_up_reports_port_conflict_without_starting(tmp_path: Path, monkeypatch):
     config_path = tmp_path / ".local" / "config.json"
     config_path.parent.mkdir(parents=True)

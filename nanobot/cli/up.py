@@ -530,6 +530,14 @@ def run_up(*, config_path: str, workspace_path: str, print_fn: Callable[[str], N
                 stale = False
         if stale:
             print_fn(f"nanobot-easy gateway is running (pid={status.pid}) but the code has changed since it started.")
+            if (
+                os.environ.get("NANOBOT_ALLOW_SELF_STOP", "0") != "1"
+                and status.pid
+                and is_ancestor_pid(status.pid)
+            ):
+                print_fn("refusing to stop nanobot-easy gateway from inside its own process tree")
+                print_fn("use `nanobot restart`, which schedules a detached restart safely")
+                return 2
             print_fn("restarting so the update actually takes effect...")
             stop_result = runtime.stop()
             if not stop_result.ok:

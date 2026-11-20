@@ -314,6 +314,19 @@ class ExecTool(Tool):
         if yield_time_ms is not None:
             return await self._execute_session(prepared, yield_time_ms, max_output_chars)
 
+        from nanobot.agent.task_note import active_task_note
+
+        note = active_task_note.get()
+        artifacts = []
+        if note is not None and note.update is not None:
+            from nanobot.agent.artifact_evidence import snapshot_writes
+
+            access = current_tool_workspace(
+                self.working_dir, restrict_to_workspace=self.restrict_to_workspace,
+                sandbox_restricts_workspace=bool(self.sandbox),
+            )
+            artifacts = snapshot_writes(note.update.targets, access.project_path, access.allowed_root)
+
         try:
             process = await self._spawn(
                 prepared.command,
@@ -362,7 +375,6 @@ class ExecTool(Tool):
                 )
 
             from nanobot.agent.context_evidence import active_evidence_capture, test_command
-            from nanobot.agent.task_note import active_task_note
 
             output = ToolResult(result, is_error=process.returncode != 0)
             output.execution_evidence = {"exit_code": process.returncode}
@@ -375,6 +387,12 @@ class ExecTool(Tool):
                 output.execution_evidence = {"exit_code": process.returncode,
                     "result_kind": "test_result" if ran else "execution_result",
                     "tests_executed": ran, "test_counts": {"observed_executed": count}}
+            if process.returncode == 0 and artifacts:
+                from nanobot.agent.artifact_evidence import changed_writes
+
+                output.write_evidence = await asyncio.to_thread(
+                    changed_writes, artifacts, access.project_path, access.allowed_root,
+                )
             return output
 
         except Exception as e:

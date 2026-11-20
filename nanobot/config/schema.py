@@ -64,7 +64,7 @@ class DreamConfig(Base):
     model_override: str | None = Field(
         default=None,
         validation_alias=AliasChoices("modelOverride", "model", "model_override"),
-    )  # Model used only by manual and scheduled Dream runs
+    )  # Dream only; provider/model explicitly selects a different provider
     max_batch_size: int = Field(default=20, ge=1)  # Deprecated: no longer used
     max_iterations: int = Field(default=15, ge=1)  # Deprecated: no longer used
     annotate_line_ages: bool = True  # Deprecated: no longer used
@@ -682,6 +682,26 @@ class Config(BaseSettings):
         """Get expanded workspace path."""
         return Path(self.agents.defaults.workspace).expanduser()
 
+    def get_explicit_provider_name(self, model: str) -> str | None:
+        """Resolve a complete provider prefix, including aliases, without credential fallback."""
+        from nanobot.providers.registry import PROVIDERS
+
+        if "/" not in model:
+            return None
+        prefix = model.split("/", 1)[0].lower().replace("-", "_")
+        specs = [spec for spec in PROVIDERS if not spec.is_transcription_only]
+        for spec in specs:
+            if prefix == spec.name:
+                return spec.name
+        # A configured custom namespace takes precedence over a keyword alias.
+        for name, provider in (self.providers.model_extra or {}).items():
+            if isinstance(provider, ProviderConfig) and prefix == name.lower().replace("-", "_"):
+                return name
+        for spec in specs:
+            if any(kw and kw.lower().replace("-", "_") == prefix for kw in spec.keywords):
+                return spec.name
+        return None
+
     def _match_provider(
         self, model: str | None = None,
         *,
@@ -717,39 +737,38 @@ class Config(BaseSettings):
 
         model_lower = (model or resolved.model).lower()
         model_normalized = model_lower.replace("-", "_")
-        model_prefix = model_lower.split("/", 1)[0] if "/" in model_lower else ""
-        normalized_prefix = model_prefix.replace("-", "_")
 
         def _kw_matches(kw: str) -> bool:
             kw = kw.lower()
             return kw in model_lower or kw.replace("-", "_") in model_normalized
 
-        # Explicit provider prefix wins — prevents `github-copilot/...codex` matching openai_codex.
+        # Explicit prefixes (including coding-plan aliases) win even without
+        # credentials. Let the factory report the error instead of misrouting.
+        explicit = self.get_explicit_provider_name(model or resolved.model)
+        if explicit is not None:
+            return getattr(self.providers, explicit), explicit
+
+        # Match by keyword. A longer keyword wins so "volcengine" does not
+        # capture "volcengine-plan/..." before the coding-plan provider, and
+        # "openai" does not capture "openai-codex". Equal lengths keep
+        # registry order.
+        best_keyword_len = -1
+        best_keyword_match: tuple[ProviderConfig, str] | None = None
         for spec in PROVIDERS:
             if spec.is_transcription_only:
                 continue
             p = getattr(self.providers, spec.name, None)
-            if p and model_prefix and normalized_prefix == spec.name:
-                if spec.is_oauth or spec.is_local or spec.is_direct or p.api_key:
-                    return p, spec.name
-
-        # Check for custom provider by prefix (e.g., "companyProxy/gpt-4").
-        # Return the matching provider even when apiBase is missing, so a
-        # malformed explicit prefix fails instead of falling through to a
-        # different custom provider.
-        if model_prefix:
-            custom = _custom_provider_by_name(normalized_prefix)
-            if custom is not None:
-                return custom
-
-        # Match by keyword (order follows PROVIDERS registry)
-        for spec in PROVIDERS:
-            if spec.is_transcription_only:
+            if not p or not (spec.is_oauth or spec.is_local or spec.is_direct or p.api_key):
                 continue
-            p = getattr(self.providers, spec.name, None)
-            if p and any(_kw_matches(kw) for kw in spec.keywords):
-                if spec.is_oauth or spec.is_local or spec.is_direct or p.api_key:
-                    return p, spec.name
+            matched_len = max(
+                (len(kw) for kw in spec.keywords if _kw_matches(kw)),
+                default=0,
+            )
+            if matched_len > 0 and matched_len > best_keyword_len:
+                best_keyword_len = matched_len
+                best_keyword_match = (p, spec.name)
+        if best_keyword_match is not None:
+            return best_keyword_match
 
         # Fallback: configured local providers can route models without
         # provider-specific keywords (for example plain "llama3.2" on Ollama).

@@ -629,7 +629,11 @@ class TaskNote:
             targets = {self.canonical(t.path) for t in value.targets if t.action == "write"}
             results = [e for e in self.write_results() if e["status"] == "ok"]
             refs = list(dict.fromkeys(e["id"] for e in results if e["target"] in targets))
-            if set(value.result_refs).issubset(e["id"] for e in results):
+            # The latest-per-target view omits earlier real command/delivery IDs.
+            known_successes = {e["id"] for e in self.events
+                               if e.get("mutating") and e.get("status") == "ok"
+                               and e.get("request_id") == self.request_id}
+            if set(value.result_refs).issubset(known_successes):
                 # Link real execution identities only. No new success, permission,
                 # analysis or coverage is inferred; unrelated defects stay independent.
                 # Incorrect supplied IDs are never silently replaced with valid ones.
@@ -713,8 +717,11 @@ class TaskNote:
                 event["status"] = "denied"
             elif re.search(r"timeout|timed out|unknown", detail, re.I):
                 event["status"] = "unknown"
+        trusted_write = isinstance(tool, ApplyPatchTool) or (
+            isinstance(tool, ExecTool) and isinstance(execution, dict)
+            and type(execution.get("exit_code")) is int and execution["exit_code"] == 0)
         receipts = (getattr(result, "write_evidence", None)
-                    if status == "ok" and isinstance(tool, ApplyPatchTool) and not read_only
+                    if status == "ok" and trusted_write and not read_only
                     else None)
         if isinstance(receipts, list) and receipts and all(
             isinstance(receipt, dict) and isinstance(receipt.get("target"), str)
