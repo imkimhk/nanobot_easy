@@ -289,6 +289,7 @@ class AgentLoop:
         memory_prompt_tokens: int = 0,
         history_context_tokens: int | None = None,
         preserve_user_scope_messages: bool = False,
+        stepwise_request_driven_assist: bool = False,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -331,6 +332,7 @@ class AgentLoop:
         self.reasoning_effort = reasoning_effort
         # Stepwise reasoning ("Genie method") is on only when applied explicitly.
         self.stepwise_enabled = stepwise_enabled
+        self.stepwise_request_driven_assist = stepwise_request_driven_assist
         self.stepwise_applied_at = stepwise_applied_at
         self.stepwise_z3_check = stepwise_z3_check
         self.stepwise_layout = stepwise_layout
@@ -560,6 +562,7 @@ class AgentLoop:
             memory_prompt_tokens=defaults.memory_prompt_tokens,
             reasoning_effort=getattr(resolved, "reasoning_effort", None) or defaults.reasoning_effort,
             stepwise_enabled=defaults.stepwise.enabled,
+            stepwise_request_driven_assist=defaults.stepwise.request_driven_assist,
             stepwise_applied_at=defaults.stepwise.applied_at,
             stepwise_z3_check=defaults.stepwise.z3_check,
             stepwise_layout=defaults.stepwise.layout,
@@ -2350,7 +2353,7 @@ class AgentLoop:
     def _stepwise_sessions(self) -> ReasoningSessions:
         sessions = getattr(self, "_reasoning_sessions", None)
         if sessions is None:
-            sessions = ReasoningSessions()
+            sessions = ReasoningSessions(workspace=self.workspace)
             self._reasoning_sessions = sessions
         return sessions
 
@@ -2392,6 +2395,13 @@ class AgentLoop:
             review_required=tuple(getattr(self, "stepwise_review_required", ())),
         )
         if case.status == "direct":
+            if case.request != ctx.msg.content:
+                # The normal tool loop otherwise sees only 'continue', losing the concrete target.
+                ctx.initial_messages = list(ctx.initial_messages)
+                ctx.initial_messages.append({
+                    "role": "user",
+                    "content": f"[계속할 원래 요청]\n{case.request}\n\n[현재 요청]\n{ctx.msg.content}",
+                })
             if case.path == "fallback" and ctx.on_progress is not None and case.stop_reason:
                 await ctx.on_progress(case.stop_reason, tool_hint=False)
             return False
@@ -2432,8 +2442,33 @@ class AgentLoop:
                 ctx.all_messages = [*ctx.initial_messages,
                                     {"role": "assistant", "content": ctx.final_content}]
                 return "ok"
+        assist_enabled = (
+            not ctx.selected_context and self._stepwise_enabled()
+            and getattr(self, "stepwise_request_driven_assist", False)
+        )
+        if assist_enabled:
+            from nanobot.reasoning.agent_tool import ReasoningAssistTool
+            from nanobot.reasoning.bridge import is_explicit_continuation
+
+            # Restore only an explicitly continued unfinished task; no routing call.
+            prior = self._stepwise_sessions().get(ctx.session_key)
+            if (prior is not None and prior[0].status in {"incomplete", "waiting_info"}
+                    and is_explicit_continuation(ctx.msg.content)):
+                ctx.initial_messages = list(ctx.initial_messages) + [{
+                    "role": "user",
+                    "content": f"[계속할 원래 요청]\n{prior[0].request}\n\n[현재 요청]\n{ctx.msg.content}",
+                }]
+            # Turn-local registry: do not widen disabled agents or caller tool allowlists.
+            if ctx.tools is None:
+                tools = ToolRegistry()
+                base_tools = getattr(self, "tools", None)
+                for name in base_tools.tool_names if base_tools is not None else ():
+                    tools.register(base_tools.get(name))
+                tools.register(ReasoningAssistTool(self, ctx, time.monotonic()))
+                ctx.tools = tools
         if (
-            not ctx.selected_context
+            not assist_enabled
+            and not ctx.selected_context
             and self._stepwise_enabled()
             and not self._is_direct_request(ctx.msg.content)
             and await self._run_stepwise(ctx)

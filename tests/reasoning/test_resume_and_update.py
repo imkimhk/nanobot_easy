@@ -182,7 +182,7 @@ def test_agent_loop_keeps_one_session_store_across_turns(monkeypatch) -> None:
 
     def ctx():
         return SimpleNamespace(
-            msg=SimpleNamespace(content="이 방법이 적합한지 평가해 주세요"),
+            msg=SimpleNamespace(content="이 방법이 적합한지 평가해 주세요"), selected_context=None,
             session_key=KEY, visible_run_started_at=None, initial_messages=[],
             final_content=None, tools_used=None, all_messages=None, stop_reason=None,
             had_injections=None, on_progress=None,

@@ -139,6 +139,7 @@ class StepwiseConfig(Base):
 
     enabled: bool = False
     method: str = "genie"
+    request_driven_assist: bool = False  # Requires enabled; preserves automatic routing by default.
     applied_at: str | None = None
     layout: Literal["auto", "two_call", "compact", "fine"] = "auto"  # auto follows the model's reasoning
     review_required: list[str] = Field(default_factory=list)  # procedure ids whose S6 model review always runs

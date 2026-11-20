@@ -1397,6 +1397,18 @@ exceeds the replay budget, the user request and a legal recent tail are retained
 without restoring its entire tool transcript. A necessary user request can itself
 exceed the budget.
 
+### Optional reasoning assistance
+
+`agents.defaults.stepwise.requestDrivenAssist` defaults to `false`. With
+`stepwise.enabled: true`, the default automatic stepwise route remains available.
+Set both values to `true` to let the normal agent choose the bounded
+`reasoning_assist` tool instead of automatically routing each request through steps.
+The tool is turn-local and does not expand a caller's explicit tool allowlist or
+the context-selection path. It grants no shell or external execution permission.
+Standalone continuation requests restore only unfinished saved reasoning tasks.
+Turning this option off restores automatic routing; saved cases remain in the
+workspace's `memory/reasoning-sessions/` directory.
+
 ### Task evidence and completion checks
 
 `agents.defaults.stepwise.lightweight` enables optional task evidence checks independently
