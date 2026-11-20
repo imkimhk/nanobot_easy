@@ -21,7 +21,14 @@ class ActionAuditHook(AgentHook):
 
     async def _record(self, call, status):
         registered = self.registry.get(call.name)
-        tool = registered.name if registered is not None else 'unregistered_tool'
+        if registered is not None:
+            tool = registered.name
+        elif call.name == 'update_task':
+            # TaskTools adds this fixed control after the loop creates the
+            # observer. This label grants no tool or execution permission.
+            tool = 'update_task'
+        else:
+            tool = 'unregistered_tool'
         try:
             await asyncio.wait_for(asyncio.to_thread(
                 self.store.record, kind='tool', status=status, tool=tool, source=self.source,

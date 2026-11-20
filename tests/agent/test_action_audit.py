@@ -301,3 +301,28 @@ def test_cli_approval_keeps_workspace_resolution_and_records_success(tmp_path, m
     rows = ActionAuditStore(tmp_path).read()
     assert len(rows) == 1 and rows[0]['source'] == 'cli' and rows[0]['status'] == 'approved'
     assert path.read_text() == content
+
+
+async def test_runtime_task_control_keeps_its_name_without_registering_a_new_tool(tmp_path):
+    from tests.agent.test_task_note import Script as TaskScript
+    from tests.agent.test_task_note import control, target
+
+    (tmp_path / 'a.md').write_text('actual evidence')
+    tools = registry(tmp_path)
+    store = ActionAuditStore(tmp_path, enabled=True)
+    provider = TaskScript([
+        control(targets=[target()], status='active', analysis_complete=False),
+        call('read_file', path='a.md'),
+        control(targets=[target()], answer='actual evidence'),
+    ])
+    result = await AgentRunner(provider).run(AgentRunSpec(
+        initial_messages=[{'role': 'user', 'content': 'a.md를 읽어줘.'}], tools=tools,
+        model='test', workspace=tmp_path, max_iterations=4, max_tool_result_chars=4000,
+        task_note_enabled=True, task_note_metadata={},
+        hook=CompositeHook([ActionAuditHook(store, tools)]),
+    ))
+    assert result.stop_reason == 'completed' and result.final_content == 'actual evidence'
+    rows = store.read()
+    assert [r['tool'] for r in rows] == ['update_task'] * 2 + ['read_file'] * 2 + ['update_task'] * 2
+    assert not tools.has('update_task')
+    assert len(provider.calls) == 3
