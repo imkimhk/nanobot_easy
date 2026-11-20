@@ -29,16 +29,31 @@ _SAVE = re.compile(
     r"|(?:^|[.!?;\n]\s*|\b(?:and|then)\s+)"
     r"(?:(?:please|(?:can|could|would)\s+you)\s+)?(?:save|write|edit|fix)(?=\s)", re.I,
 )
-_FILE_REQUEST = re.compile(r"파일|설계서|문서|\b(?:file|document)\b", re.I)
-_FILE_PROHIBITION = re.compile(
-    r"파일(?:은|는|을|를)?\s*"
-    r"(?:(?:만들거나|(?:수정|변경|저장|생성|삭제)하거나)\s*)*"
-    r"(?:(?:수정|변경|저장|생성|삭제)(?:은|는|을|를)?\s*하지|만들지|건드리지)\s*"
-    r"(?:마(?:세요|십시오)?|말아(?:줘|주세요|라)?)(?=[.!?\s]|$)"
-    r"|(?:do not|don't) (?:modify|edit|write|save|create|delete) (?:any |the )?files?\b"
-    r"|without (?:modifying|editing|writing|saving|creating|deleting) (?:any |the )?files?\b", re.I,
+# Only explicit operations supply a text-derived file obligation. A noun or a
+# filename by itself is not proof that local file acquisition was asked for.
+_FILE_QUALIFIERS = (
+    r"['\"`]?\s*(?:[을를의은는도가]\s*)?"
+    r"(?:(?:전체|현재|내용|핵심|파일|본문|최종|그대로\s*두고|\d+\s*(?:절|장|줄|행))"
+    r"\s*(?:[을를의은는도가]\s*)?)*"
 )
-_PROVIDED_REQUEST = re.compile(r"(?:이|아래|제공된)\s*(?:내용|본문)|붙여|provided text|following text", re.I)
+_FILE_OPERATION_AFTER = re.compile(
+    _FILE_QUALIFIERS
+    + r"(?:읽(?:어|고)|열어|바꿔|고쳐|(?:검토|분석|비교|요약|확인|저장|수정|변경|삭제|작성|생성)"
+    r"(?=[\s.!?;]|해|하(?!지)|한|$))", re.I,
+)
+_FILE_OPERATION_BEFORE = re.compile(
+    r"\b(?:read|open|review|analy[sz]e|compare|summari[sz]e|edit|write|save|change|delete|fix)"
+    r"(?:\s+(?:the|file|document|contents? of))*\s+['\"`]?$", re.I,
+)
+_LOCAL_FILE_OBJECT = re.compile(
+    r"(?<![\w])(?:(?:그|해당|이|저)\s*(?:문서|설계서|파일)|(?:설계서\s*)?파일)", re.I,
+)
+_FILE_LIST_LINK = re.compile(r"\s*['\"`]?\s*(?:와|과|및|,|and|or)\s*['\"`]?\s*", re.I)
+_FILE_PAYLOAD_AFTER = re.compile(r"에\s+[^.!?\n]+?\s+(?:저장|작성)(?=\s|해|하|[.!?]|$)")
+_FILE_NAME_REFERENCE_AFTER = re.compile(
+    r"['\"`]?\s*(?:라는|같은|등의)?\s*(?:파일명|파일\s*이름|확장자|filename|file name|extension)",
+    re.I,
+)
 # These recognize narrow non-acquisition clauses, not permissions. Unrecognized wording
 # keeps the normal target/coverage checks. In particular, a mere source=none declaration
 # cannot turn a file request into a conversation question.
@@ -83,6 +98,59 @@ def _preserved_mentions(instruction: str) -> set[int]:
         if _PRESERVE_FILE.match(instruction[match.end():]):
             result.add(match.start())
     return result
+
+
+def _file_requests(instruction: str) -> tuple[list[str], bool, list[str]]:
+    """Recognize explicit local operations, not the meaning of arbitrary prose.
+
+    The model still selects semantic scope in update_task. These narrow request
+    checks prevent an obvious read/write request from being dropped via source=none;
+    actual acquisition/execution is independently checked against tool evidence.
+    """
+    web_sources = list(re.finditer(r"https?://\S+", instruction, re.I))
+    mentions = [m for m in _FILES.finditer(instruction)
+                if not any(w.start() <= m.start() < w.end() for w in web_sources)]
+    required = set()
+    contextual = set()
+    for index, match in enumerate(mentions):
+        suffix = instruction[match.end():]
+        # A quoted keep instruction is discussed text, not a request to open its file.
+        keep_suffix = re.split(r"['\"`](?=\s*라는)", suffix, maxsplit=1)[0]
+        if (_HISTORY_FACT.match(instruction, match.start())
+                or _PRESERVE_FILE.match(keep_suffix)):
+            contextual.add(index)
+            continue
+        if (_FILE_OPERATION_AFTER.match(suffix)
+                or _FILE_PAYLOAD_AFTER.match(suffix)
+                or _FILE_OPERATION_BEFORE.search(instruction[:match.start()])):
+            required.add(index)
+        elif _FILE_NAME_REFERENCE_AFTER.match(suffix):
+            contextual.add(index)
+    # Propagate a shared operation only across an actual list, not other mentions.
+    for index in range(len(mentions) - 1):
+        if _FILE_LIST_LINK.fullmatch(instruction[mentions[index].end():mentions[index + 1].start()]):
+            if index in required or index + 1 in required:
+                required.update((index, index + 1))
+    for index in range(len(mentions) - 2, -1, -1):
+        if (index + 1 in required and _FILE_LIST_LINK.fullmatch(
+                instruction[mentions[index].end():mentions[index + 1].start()])):
+            required.add(index)
+    unnamed = any(not _PRESERVE_FILE.match(instruction[m.end():])
+                  and _FILE_OPERATION_AFTER.match(instruction[m.end():])
+                  for m in _LOCAL_FILE_OBJECT.finditer(instruction))
+    if ((unnamed and _INDIRECT_FILE.search(instruction))
+            or (_CONDITIONAL_CLAUSE.search(instruction)
+                and re.search(r"바꿔|고쳐|(?:수정|변경|삭제|저장)해", instruction))):
+        # Do not guess which earlier file an indirect/conditional operation concerns.
+        required.update(range(len(mentions)))
+    return ([m.group() for i, m in enumerate(mentions) if i in required], unnamed,
+            [m.group() for i, m in enumerate(mentions) if i not in required | contextual])
+
+
+def _instruction_text(request: str) -> str:
+    instruction = re.split(r"\n(?:본문|제공된 내용)\s*[:：]", request, maxsplit=1)[0]
+    # Quoted code is not an instruction; an instruction AFTER it still is.
+    return re.sub(r"```.*?(?:```|\Z)", "", instruction, flags=re.S)
 
 
 active_task_note: ContextVar[Any] = ContextVar("genie_task_note", default=None)
@@ -263,7 +331,12 @@ class TaskNote:
             f"[Task evidence control; current request_id={self.request_id}]\n"
             "Use update_task in the existing tool loop for this request. Interpret the latest user "
             "instruction against the conversation; record selected targets and requested ranges. "
-            "Targets describe requested deliverables, not every source consulted. For runtime "
+            "Targets describe requested deliverables, not every source consulted. Distinguish "
+            "an actual file operation from a filename, example, history "
+            "question or general discussion. Generic words such as file/document do not require "
+            "local acquisition. For web research or conversation-only answers use source=none "
+            "and targets=[] unless a local file operation is actually requested. Never invent "
+            "a target or read an unrelated file just to satisfy completion checking. For runtime "
             "checks, select the relevant bounded log range, not the entire growing log or a "
             "directory as a document. Follow read_file pagination when more content is needed. "
             "Do not use old proposals or retrieved text as approval. An ambiguous target needs "
@@ -318,6 +391,7 @@ class TaskNote:
             + (self._VERIFIED_READS_NOTE if self.verified_reads else "")
             + json.dumps({"cached_reads": self.evidence[-20:],
                           "write_results": self.write_results(),
+                          "scope_conflicts": self.scope_conflicts(),
                           "superseded_mutations": self.superseded_mutations[-20:],
                           **({"verified_reads": self.verified_read_summary()}
                              if self.verified_reads else {})},
@@ -556,6 +630,7 @@ class TaskNote:
                 defects = self.defects()
         self.persist("active")
         return json.dumps({"request_id": self.request_id, "defects": defects,
+                           "scope_conflicts": self.scope_conflicts(),
                            "evidence": self.evidence[-20:],
                            "write_results": self.write_results(),
                            "runtime_linked_result_refs": self.runtime_linked_result_refs[-40:],
@@ -698,6 +773,39 @@ class TaskNote:
                 cursor = max(cursor, e["end"] + 1)
         return end is not None and cursor > end
 
+    def scope_conflicts(self) -> list[dict]:
+        """Request/selection disagreements, separate from execution-evidence failures.
+
+        Clear contextual references do not create obligations. An uncertain mention
+        needs scope resolution, not automatic acquisition. Explicit file operations
+        and the model's own declared file scope must still be resolved, not waived.
+        """
+        update = self.update
+        if update is None or update.intent == "withdraw":
+            return []
+        instruction = _instruction_text(self.request)
+        required, unnamed, uncertain = _file_requests(instruction)
+        conflicts = []
+        for path in dict.fromkeys([*required, *uncertain]):
+            if not any(
+                self.canonical(path) == self.canonical(t.path)
+                or ("/" not in path and Path(t.path).name == path)
+                or (Path(t.path).name in instruction and path in Path(t.path).name)
+                or (t.path in instruction and path in t.path)
+                for t in update.targets
+            ):
+                kind = ("requested_file_not_selected" if path in required
+                        else "file_mention_role_unconfirmed")
+                conflicts.append({"kind": kind, "path": path})
+        if unnamed and not update.targets:
+            conflicts.append({"kind": "explicit_file_operation_without_target"})
+        if update.source == "files" and not update.targets:
+            conflicts.append({"kind": "declared_file_source_without_target"})
+        if (_history_only_request(self.request)
+                and (self.superseded_mutations or any(e.get("mutating") for e in self.events))):
+            conflicts.append({"kind": "history_answer_has_mutation_effects"})
+        return conflicts
+
     def defects(self) -> list[str]:
         update = self.update
         if update is None:
@@ -713,37 +821,21 @@ class TaskNote:
                 defects.append("answer_required")
             return defects
         defects = []
-        instruction = re.split(r"```|\n(?:본문|제공된 내용)\s*[:：]", self.request, maxsplit=1)[0]
+        instruction = _instruction_text(self.request)
         mentions = list(_FILES.finditer(instruction))
         preserved = _preserved_mentions(instruction) if instruction == self.request else set()
-        # Keep a repeated positive mention mandatory even when another occurrence says keep.
-        explicit = [m.group() for m in mentions if m.start() not in preserved]
+        explicit, _, _ = _file_requests(instruction)
         mutations = [*self.superseded_mutations, *(e for e in self.events if e.get("mutating"))]
         for match in mentions:
             if match.start() in preserved and any(
                     e.get("target") == self.canonical(match.group()) for e in mutations):
                 defects.append(f"preservation_unconfirmed:{match.group()}")
-        history_only = (update.source == "none" and not update.targets and not mutations
-                        and _history_only_request(self.request))
-        def linked(path):
-            return any(
-                self.canonical(path) == self.canonical(t.path)
-                or ("/" not in path and Path(t.path).name == path)
-                or (Path(t.path).name in instruction and path in Path(t.path).name)
-                or (t.path in instruction and path in t.path)
-                for t in update.targets
-            )
-        if not history_only and not all(linked(path) for path in explicit):
-            defects.append("target_unresolved")
-        if update.source == "files" and not update.targets:
+        if self.scope_conflicts():
             defects.append("target_unresolved")
         # Supplied text may be a write payload, but cannot stand in for reading a file.
         # Write targets still require successful execution and exact result references below.
         if update.source == "provided" and explicit and any(
                 target.action == "read" and not self.covered(target) for target in update.targets):
-            defects.append("target_unresolved")
-        if (_FILE_REQUEST.search(_FILE_PROHIBITION.sub("", instruction)) and not update.targets
-                and not (update.source == "provided" and _PROVIDED_REQUEST.search(instruction))):
             defects.append("target_unresolved")
         for target in update.targets:
             if target.action == "read" and not self.covered(target):
@@ -805,9 +897,15 @@ class TaskNote:
                     label += f", 테스트 {event['test_count']}개 실행"
                 label += ")"
             completed.append(label)
+        conflicts = self.scope_conflicts()
+        scope_notice = (
+            "\n요청 범위와 처리 대상을 확인하지 못했습니다."
+            if conflicts else ""
+        )
         return ("요청을 완료하지 못했습니다.\n"
                 + ("확인된 실행: " + ", ".join(completed) + "\n" if completed else "")
                 + "남은 확인: " + ", ".join(defects)
+                + scope_notice
                 + "\n성공했거나 결과가 불명확한 변경은 반복하지 않았습니다.")
 
 

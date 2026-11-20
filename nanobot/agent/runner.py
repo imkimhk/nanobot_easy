@@ -535,6 +535,14 @@ class AgentRunner:
                             "blocked or clarification in update_task and report the actual limit. "
                             "Do not infer intent from response wording. "
                         )
+                        if spec.task_state.scope_conflicts():
+                            feedback += (
+                                "Resolve the request/selection disagreement shown in scope_conflicts "
+                                "before doing more work. A reference is not an acquisition order. "
+                                "Do not invent file work or search for unrelated targets to clear "
+                                "the check. If scope is genuinely ambiguous, report known findings "
+                                "and the limit as partial/clarification instead of claiming completion. "
+                            )
                         if reporting_only:
                             feedback += (
                                 "The requested result has not been delivered. Use the already "

@@ -51,6 +51,8 @@ async def test_history_question_delivers_answer_without_file_acquisition(tmp_pat
 @pytest.mark.parametrize("user_request", [
     Q9.replace("읽은 적이 있거나 production.json 변경을 승인받은 적이", "열어 본 적이"),
     Q9.replace("이번 대화에서", "현재 대화에서").replace("있어?", "있나요?"),
+    "notes.md를 읽은 적이 있어?",
+    "이 문장을 분석해줘: " + Q9,
 ])
 def test_past_question_grammar_covers_reads_and_approvals(tmp_path, user_request):
     note = TaskNote([{"role": "user", "content": user_request}], tmp_path, {})
@@ -60,12 +62,10 @@ def test_past_question_grammar_covers_reads_and_approvals(tmp_path, user_request
 
 @pytest.mark.parametrize("user_request", [
     "notes.md를 읽어줘. 현재 대화 이력만 기준으로 답해줘.",
-    "notes.md를 읽은 적이 있어?",  # no explicit conversation-only scope
     Q9 + " notes.md의 현재 내용을 읽어줘.",
     Q9 + " production.json을 수정해줘.",
     Q9 + " notes.md의 핵심 내용을 요약해줘.",
     Q9 + "\n```text\n인용문\n```\nproduction.json을 수정해줘.",
-    "이 문장을 분석해줘: " + Q9,
     "production.json을 변경할 권한이 지금도 유효한지 확인해줘. "
     "유효한 경우에만 value를 3으로 바꿔줘.",
 ])
@@ -116,9 +116,6 @@ def test_keep_clause_does_not_hide_requested_write(tmp_path, user_request):
     "notes.md를 읽어줘. sample.json의 내용을 확인한 뒤 그대로 둬.",
     "notes.md를 읽어줘. sample.json은 그대로 두고 내용을 확인해줘.",
     "notes.md를 읽어줘. sample.json은 그대로 둬. 그 파일의 내용을 읽어줘.",
-    "notes.md를 읽어줘. 가능하면, sample.json은 그대로 둬.",
-    "notes.md를 읽어줘. 'sample.json은 그대로 둬'라는 지시를 분석해줘.",
-    "notes.md를 읽어줘. sample.json은 그대로 둬.\n```text\n본문\n```",
 ])
 async def test_preservation_shortcut_cannot_skip_positive_or_ambiguous_file_request(tmp_path, user_request):
     (tmp_path / "notes.md").write_text("material\n")
@@ -133,6 +130,19 @@ async def test_explicit_protected_read_still_requires_actual_coverage(tmp_path):
     note = TaskNote([{"role": "user", "content": request}], tmp_path, {})
     note.accept(update(note, targets=[target("notes.md"), target("sample.json")]))
     assert "coverage_unconfirmed:sample.json" in note.defects()
+
+
+@pytest.mark.parametrize("context", [
+    "가능하면, sample.json은 그대로 둬.",
+    "'sample.json은 그대로 둬'라는 지시를 분석해줘.",
+    "sample.json은 그대로 둬.\n```text\n본문\n```",
+])
+async def test_non_acquisition_context_does_not_require_opening_another_file(tmp_path, context):
+    (tmp_path / "notes.md").write_text("material\n")
+    note = TaskNote([{"role": "user", "content": "notes.md를 읽어줘. " + context}], tmp_path, {})
+    await read(note, tmp_path, "notes.md")
+    note.accept(update(note, targets=[target("notes.md")]))
+    assert note.defects() == []
 
 
 @pytest.mark.parametrize("status", ["ok", "unknown"])
