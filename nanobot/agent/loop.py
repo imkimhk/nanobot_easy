@@ -168,6 +168,7 @@ class TurnContext:
     run_extra_hooks_for_ephemeral: bool = False
     hooks: list[AgentHook] = field(default_factory=list)
     tools: ToolRegistry | None = None
+    model: str | None = None
 
     turn_wall_started_at: float = field(default_factory=time.time)
     visible_run_started_at: float | None = None
@@ -290,6 +291,7 @@ class AgentLoop:
         history_context_tokens: int | None = None,
         preserve_user_scope_messages: bool = False,
         stepwise_request_driven_assist: bool = False,
+        dream_model: str | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -312,6 +314,7 @@ class AgentLoop:
 
         self.action_audit = ActionAuditStore.from_config(workspace, _tc.action_audit)
         self.model = model or provider.get_default_model()
+        self.dream_model = dream_model.strip() if isinstance(dream_model, str) and dream_model.strip() else None
         self.max_iterations = (
             max_iterations if max_iterations is not None else defaults.max_tool_iterations
         )
@@ -547,6 +550,7 @@ class AgentLoop:
             provider=provider,
             workspace=config.workspace_path,
             model=model,
+            dream_model=str(getattr(defaults.dream, "model_override", None) or "").strip() or None,
             max_iterations=defaults.max_tool_iterations,
             max_concurrent_subagents=defaults.max_concurrent_subagents,
             subagent_profiles=defaults.subagent_profiles,
@@ -1092,6 +1096,7 @@ class AgentLoop:
         tools: ToolRegistry | None = None,
         user_message: str | None = None,
         selected_context: Any | None = None,
+        model: str | None = None,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
         """Run the agent iteration loop.
 
@@ -1261,7 +1266,7 @@ class AgentLoop:
                 task_note_verified_reads=bool(getattr(self, "task_note_verified_reads", False)),
                 premature_final_session_metadata=session_metadata if user_facing else None,
                 tools=tools or self.tools,
-                model=self.model,
+                model=model or self.model,
                 max_iterations=self.max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
                 reasoning_effort=self.reasoning_effort,
@@ -1783,6 +1788,7 @@ class AgentLoop:
         run_extra_hooks_for_ephemeral: bool = False,
         hooks: list[AgentHook] | None = None,
         tools: ToolRegistry | None = None,
+        model: str | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         self._refresh_provider_snapshot()
@@ -1817,6 +1823,7 @@ class AgentLoop:
             run_extra_hooks_for_ephemeral=run_extra_hooks_for_ephemeral,
             hooks=list(hooks or []),
             tools=tools,
+            model=model,
         )
 
         with self.sessions.session_scope(ctx.session):
@@ -2360,6 +2367,7 @@ class AgentLoop:
     async def _run_stepwise(self, ctx: TurnContext) -> bool:
         """Run the code-controlled stepwise procedure. False hands the turn to the normal loop."""
 
+        chosen = ctx.model or self.model
         if ctx.visible_run_started_at is None:
             ctx.visible_run_started_at = time.time()
         await self._runtime_events().run_status_changed(
@@ -2369,7 +2377,7 @@ class AgentLoop:
             started_at=ctx.visible_run_started_at,
         )
         # Design 1: check reasoning-off support before running and say so when unsupported.
-        notice = reasoning_mode_notice(self.provider, self.model)
+        notice = reasoning_mode_notice(self.provider, chosen)
         notified: set[str] | None = getattr(self, "_reasoning_notice_sessions", None)
         if notified is None:
             notified = set()
@@ -2383,7 +2391,7 @@ class AgentLoop:
                 prefix = notice + "\n\n"
         case = await run_reasoning_procedure(
             self.provider,
-            model=self.model,
+            model=chosen,
             request=ctx.msg.content,
             workspace=self.workspace,
             on_progress=ctx.on_progress,
@@ -2510,6 +2518,7 @@ class AgentLoop:
             hooks=ctx.hooks,
             tools=ctx.tools,
             selected_context=ctx.selected_context,
+            model=ctx.model,
         )
         final_content, tools_used, all_msgs, stop_reason, had_injections = result
         ctx.final_content = final_content
@@ -2908,6 +2917,7 @@ class AgentLoop:
         hooks: list[AgentHook] | None = None,
         tools: ToolRegistry | None = None,
         persist_user_message: bool = True,
+        model: str | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
@@ -2938,6 +2948,8 @@ class AgentLoop:
                     kwargs["hooks"] = hooks
                 if tools is not None:
                     kwargs["tools"] = tools
+                if model:
+                    kwargs["model"] = model
                 return await self._process_message(
                     msg,
                     **kwargs,

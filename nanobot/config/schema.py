@@ -64,7 +64,7 @@ class DreamConfig(Base):
     model_override: str | None = Field(
         default=None,
         validation_alias=AliasChoices("modelOverride", "model", "model_override"),
-    )  # Override model for Dream sessions (pending implementation)
+    )  # Model used only by manual and scheduled Dream runs
     max_batch_size: int = Field(default=20, ge=1)  # Deprecated: no longer used
     max_iterations: int = Field(default=15, ge=1)  # Deprecated: no longer used
     annotate_line_ages: bool = True  # Deprecated: no longer used

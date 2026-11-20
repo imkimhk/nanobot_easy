@@ -1487,6 +1487,7 @@ def _run_gateway(
                     ephemeral=True,
                     tools=store.build_dream_tools(),
                     on_progress=_silent,
+                    model=getattr(agent, "dream_model", None),
                 )
                 # Ground truth: the real file delta, not the LLM's self-report.
                 diff_body = store.dream_content_diff()

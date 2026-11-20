@@ -538,8 +538,13 @@ def test_runtime_linking_does_not_repair_other_completion_defects(tmp_path, chan
                  "ok", "actual-write")
     note.accept(update(note, targets=[target(action="write")],
                        **{"result_refs": [], **changes}))
-    assert note.runtime_linked_result_refs == []
-    assert any("missing_result_reference" in d for d in note.defects())
+    if "analysis_complete" in changes or "final_answer" in changes:
+        assert note.runtime_linked_result_refs == ["actual-write"]
+        expected = "analysis_incomplete" if "analysis_complete" in changes else "answer_required"
+        assert expected in note.defects()
+    else:
+        assert note.runtime_linked_result_refs == []
+        assert any("missing_result_reference" in d for d in note.defects())
 
 
 @pytest.mark.parametrize("status", ["unknown", "denied", "error"])
@@ -584,12 +589,13 @@ async def test_runtime_linking_requires_read_coverage_and_verified_unknown_write
     assert next(e for e in note["events"] if e["name"] == "write_file")["verification"] == "read_after_unknown_write"
 
 
-def test_missing_read_coverage_prevents_runtime_linking(tmp_path):
+def test_missing_read_coverage_remains_incomplete_after_runtime_linking(tmp_path):
     note = TaskNote([{"role": "user", "content": "a.md를 저장하고 b.md도 읽어줘"}], tmp_path, {})
     note.observe("write_file", write_args(), "saved", WriteFileTool(workspace=tmp_path),
                  "ok", "actual-write")
     note.accept(update(note, targets=[target(action="write"), target("b.md")], result_refs=[]))
-    assert note.runtime_linked_result_refs == []
+    assert note.runtime_linked_result_refs == ["actual-write"]
+    assert note.defects() == ["coverage_unconfirmed:b.md"]
     assert "coverage_unconfirmed:b.md" in note.defects()
 
 

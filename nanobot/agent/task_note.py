@@ -23,7 +23,7 @@ _ADVICE = re.compile(r"설명|방법|절차|개념|의미|\b(?:explain|how|shoul
 _REVIEW = re.compile(r"검토|분석|비교|파악|판정|진단|조사|review|analy[sz]|compare|diagnos|investigat", re.I)
 _ACTION = re.compile(r"(?:저장|수정|변경|삭제|실행|구현)\s*(?:해(?=[\s.!?]|$)|해\s*(?:줘|주세요)|하(?:세요|십시오|라))", re.I)
 _NO_WRITE = re.compile(r"저장\s*(?:하지\s*(?:마|말)|금지)|수정\s*하지\s*(?:마|말)|검토만|읽기\s*전용|do not (?:save|write|edit)|review only", re.I)
-_FILES = re.compile(r"(?:[\w.~/-]+/)?[\w.~-]+\.(?:md|txt|py|json|pdf|docx|xlsx|csv|yaml|yml|ts|tsx)(?![A-Za-z0-9_])", re.I)
+_FILES = re.compile(r"(?:(?<=['\"`])[\w.~ /-]+|(?:[\w.~/-]+/)?[\w.~-]+)\.(?:md|txt|py|json|pdf|docx|xlsx|csv|yaml|yml|ts|tsx)(?![A-Za-z0-9_])", re.I)
 _SAVE = re.compile(
     r"(?:저장|수정)\s*(?:해\s*(?:줘|주세요)|하(?:세요|십시오|라))|고쳐\s*(?:줘|주세요)"
     r"|(?:^|[.!?;\n]\s*|\b(?:and|then)\s+)"
@@ -39,13 +39,14 @@ _FILE_QUALIFIERS = (
 _FILE_OPERATION_AFTER = re.compile(
     _FILE_QUALIFIERS
     + r"(?:(?:수정|변경|저장)\s*하지\s*말고\s*)?"
-    + r"(?:읽(?:어|고)|열어|바꿔|고쳐|(?:검토|분석|비교|요약|확인|저장|수정|변경|삭제|작성|생성)"
+    + r"(?:읽(?:어|고)|열어|바꿔|고쳐|알려|보여|(?:검토|분석|비교|요약|확인|저장|수정|변경|삭제|작성|생성)"
     r"(?=[\s.!?;]|해|하(?!지)|한|$))", re.I,
 )
 _FILE_OPERATION_BEFORE = re.compile(
     r"\b(?:read|open|review|analy[sz]e|compare|summari[sz]e|edit|write|save|change|delete|fix)"
     r"(?:\s+(?:the|file|document|contents? of))*\s+['\"`]?$", re.I,
 )
+_FILE_CONTENT_QUESTION = re.compile(r"\bwhat\s+(?:does|is\s+in)\s+['\"`]?$", re.I)
 _LOCAL_FILE_OBJECT = re.compile(
     r"(?<![\w])(?:(?:그|해당|이|저)\s*(?:문서|설계서|파일)|(?:설계서\s*)?파일)", re.I,
 )
@@ -123,7 +124,8 @@ def _file_requests(instruction: str) -> tuple[list[str], bool, list[str]]:
             continue
         if (_FILE_OPERATION_AFTER.match(suffix)
                 or _FILE_PAYLOAD_AFTER.match(suffix)
-                or _FILE_OPERATION_BEFORE.search(instruction[:match.start()])):
+                or _FILE_OPERATION_BEFORE.search(instruction[:match.start()])
+                or _FILE_CONTENT_QUESTION.search(instruction[:match.start()])):
             required.add(index)
         elif _FILE_NAME_REFERENCE_AFTER.match(suffix):
             contextual.add(index)
@@ -243,6 +245,12 @@ class TaskUpdate(BaseModel):
     intent: Literal["continue", "change", "withdraw", "new"]
     goal: str = Field(min_length=1, max_length=2000)
     targets: list[Target] = Field(max_length=30)
+    contextual_files: list[Annotated[str, Field(min_length=1, max_length=2000)]] = Field(
+        default_factory=list, max_length=40,
+        description="Mentioned filenames that are examples, history or context, not requested "
+        "file operations. Resolve file_mention_role_unconfirmed here instead of opening unrelated "
+        "files. Explicit read/write requests and selected targets still require actual evidence.",
+    )
     source: Literal["files", "provided", "none"]
     analysis_complete: bool
     status: Literal["active", "completed", "cancelled", "partial", "blocked", "clarification"]
@@ -336,7 +344,9 @@ class TaskNote:
             "instruction against the conversation; record selected targets and requested ranges. "
             "Targets describe requested deliverables, not every source consulted. Distinguish "
             "an actual file operation from a filename, example, history "
-            "question or general discussion. Generic words such as file/document do not require "
+            "question or general discussion. List ambiguous mentions used only as context in "
+            "contextual_files; this cannot waive explicit operations or evidence for selected "
+            "targets. Generic words such as file/document do not require "
             "local acquisition. For web research or conversation-only answers use source=none "
             "and targets=[] unless a local file operation is actually requested. Never invent "
             "a target or read an unrelated file just to satisfy completion checking. For runtime "
@@ -615,17 +625,14 @@ class TaskNote:
             return ToolResult.error("Stale request_id; reinterpret the latest user instruction.")
         self.update = value
         defects = self.defects()
-        if (value.status == "completed" and defects
-                and all(d.startswith("answer_correction:")
-                        and d.endswith(":missing_result_reference") for d in defects)):
+        if value.status == "completed":
             targets = {self.canonical(t.path) for t in value.targets if t.action == "write"}
-            results = [e for e in self.write_results()
-                       if e["status"] == "ok" and e["target"] in targets]
-            refs = list(dict.fromkeys(e["id"] for e in results))
-            if ({e["target"] for e in results} == targets
-                    and set(value.result_refs).issubset(refs)):
+            results = [e for e in self.write_results() if e["status"] == "ok"]
+            refs = list(dict.fromkeys(e["id"] for e in results if e["target"] in targets))
+            if set(value.result_refs).issubset(e["id"] for e in results):
                 # Link real execution identities only. No new success, permission,
-                # analysis or coverage is inferred; incorrect supplied IDs stay errors.
+                # analysis or coverage is inferred; unrelated defects stay independent.
+                # Incorrect supplied IDs are never silently replaced with valid ones.
                 added = [ref for ref in refs if ref not in value.result_refs]
                 self.update = value.model_copy(update={"result_refs": [*value.result_refs, *added]})
                 self.runtime_linked_result_refs = list(dict.fromkeys(
@@ -812,11 +819,15 @@ class TaskNote:
         required, unnamed, uncertain = _file_requests(instruction)
         conflicts = []
         for path in dict.fromkeys([*required, *uncertain]):
+            if path not in required and any(
+                self.canonical(path) == self.canonical(reference)
+                or ("/" not in path and Path(reference).name == path)
+                for reference in update.contextual_files
+            ):
+                continue
             if not any(
                 self.canonical(path) == self.canonical(t.path)
                 or ("/" not in path and Path(t.path).name == path)
-                or (Path(t.path).name in instruction and path in Path(t.path).name)
-                or (t.path in instruction and path in t.path)
                 for t in update.targets
             ):
                 kind = ("requested_file_not_selected" if path in required

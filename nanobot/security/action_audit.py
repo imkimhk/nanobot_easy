@@ -3,6 +3,7 @@
 import hashlib
 import re
 import sqlite3
+import time
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
@@ -56,17 +57,28 @@ class ActionAuditStore:
                 except FileExistsError:
                     pass  # Another session may have initialized it meanwhile.
                 self.path.chmod(0o600)
-            with closing(sqlite3.connect(self.path, timeout=0.05)) as conn, conn:
-                conn.execute('''CREATE TABLE IF NOT EXISTS actions (
-                    seq INTEGER PRIMARY KEY, ts TEXT NOT NULL, kind TEXT NOT NULL,
-                    status TEXT NOT NULL, tool TEXT NOT NULL, source TEXT NOT NULL,
-                    session_ref TEXT, run_ref TEXT, call_ref TEXT, subject_ref TEXT)''')
-                conn.execute('INSERT INTO actions VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (
-                    datetime.now(UTC).isoformat(), kind, status, safe_tool, source,
-                    reference(session_key), reference(run_id), reference(call_id), reference(subject),
-                ))
-                conn.execute('DELETE FROM actions WHERE seq <= '
-                             '(SELECT MAX(seq) - ? FROM actions)', (self.max_records,))
+            # The hook stops waiting after 200ms. This thread keeps a short lock
+            # retry so a busy database still gets the receipt without holding the tool.
+            deadline = time.monotonic() + 2.0
+            while True:
+                try:
+                    with closing(sqlite3.connect(self.path, timeout=0.2)) as conn, conn:
+                        conn.execute('''CREATE TABLE IF NOT EXISTS actions (
+                            seq INTEGER PRIMARY KEY, ts TEXT NOT NULL, kind TEXT NOT NULL,
+                            status TEXT NOT NULL, tool TEXT NOT NULL, source TEXT NOT NULL,
+                            session_ref TEXT, run_ref TEXT, call_ref TEXT, subject_ref TEXT)''')
+                        conn.execute('INSERT INTO actions VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (
+                            datetime.now(UTC).isoformat(), kind, status, safe_tool, source,
+                            reference(session_key), reference(run_id), reference(call_id), reference(subject),
+                        ))
+                        conn.execute('DELETE FROM actions WHERE seq <= '
+                                     '(SELECT MAX(seq) - ? FROM actions)', (self.max_records,))
+                    break
+                except sqlite3.OperationalError as exc:
+                    locked = 'locked' in str(exc).lower() or 'busy' in str(exc).lower()
+                    if not locked or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
             self._warned = False
             return True
         except (OSError, sqlite3.Error, ValueError, RuntimeError, TypeError, AttributeError) as exc:

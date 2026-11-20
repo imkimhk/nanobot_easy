@@ -14,6 +14,18 @@ from contextvars import ContextVar
 from loguru import logger
 
 READ_TOOLS = frozenset({"read_file", "web_search", "web_fetch"})
+
+
+def _content_version(version) -> str:
+    """Prefer a content digest. A size or mtime change still means the file changed."""
+    if not isinstance(version, dict):
+        return ""
+    digest = version.get("sha256")
+    if digest:
+        return str(digest)
+    if version.get("mtime_ns") is None and version.get("size") is None:
+        return ""
+    return str(version.get("mtime_ns")) + ":" + str(version.get("size"))
 WARNING = (
     "\n\n[Runtime notice: this same read request has returned identical content "
     "at least three times without intervening work. Reuse the available evidence "
@@ -44,7 +56,7 @@ class ReadRepetitionObserver:
             return False
         evidence = getattr(result, "read_evidence", None)
         version = evidence.get("version") if isinstance(evidence, dict) else None
-        content_version = version.get("sha256", "") if isinstance(version, dict) else ""
+        content_version = _content_version(version)
         identity = hashlib.sha256(
             (name + "\0" + request + "\0" + str(content_version) + "\0" + result).encode(),
         ).hexdigest()

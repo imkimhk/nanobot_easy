@@ -410,6 +410,7 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
                 ephemeral=True,
                 tools=store.build_dream_tools(),
                 on_progress=_silent,
+                model=getattr(loop, "dream_model", None),
             )
             elapsed = time.monotonic() - t0
             # Ground truth: the real file delta, not the LLM's self-report.

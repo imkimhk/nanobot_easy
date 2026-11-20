@@ -3,7 +3,9 @@
 import asyncio
 import json
 import os
+import sqlite3
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -326,3 +328,31 @@ async def test_runtime_task_control_keeps_its_name_without_registering_a_new_too
     assert [r['tool'] for r in rows] == ['update_task'] * 2 + ['read_file'] * 2 + ['update_task'] * 2
     assert not tools.has('update_task')
     assert len(provider.calls) == 3
+
+
+def test_lock_past_the_first_wait_still_keeps_the_receipt(tmp_path):
+    store = ActionAuditStore(tmp_path, enabled=True)
+    assert store.record(kind='tool', status='attempted', tool='read_file')
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        conn = sqlite3.connect(store.path, timeout=5)
+        conn.execute('BEGIN IMMEDIATE')
+        held.set()
+        release.wait(5)
+        conn.rollback()
+        conn.close()
+
+    locker = threading.Thread(target=hold)
+    locker.start()
+    assert held.wait(2)
+    threading.Timer(0.3, release.set).start()
+    started = time.monotonic()
+    try:
+        assert store.record(kind='tool', status='tool_ok', tool='read_file')
+    finally:
+        release.set()
+        locker.join(3)
+    assert time.monotonic() - started < 2
+    assert [row['status'] for row in store.read()] == ['attempted', 'tool_ok']
