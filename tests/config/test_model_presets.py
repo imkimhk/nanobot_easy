@@ -351,6 +351,58 @@ def test_match_provider_routes_forced_novita_model_api_models() -> None:
     assert config.get_api_base() == "https://api.novita.ai/openai"
 
 
+def test_longer_model_keyword_beats_shorter_provider_keyword() -> None:
+    config = Config.model_validate({
+        "providers": {
+            "openai": {"apiKey": "sk-test"},
+            "volcengine": {"apiKey": "vk"},
+            "volcengine_coding_plan": {"apiKey": "vk"},
+            "byteplus": {"apiKey": "bk"},
+            "byteplus_coding_plan": {"apiKey": "bk"},
+        },
+    })
+
+    assert config.get_provider_name("volcengine-plan/doubao") == "volcengine_coding_plan"
+    assert config.get_provider_name("volcengine/doubao") == "volcengine"
+    assert config.get_provider_name("byteplus-plan/seed") == "byteplus_coding_plan"
+    assert config.get_provider_name("byteplus/seed") == "byteplus"
+    assert config.get_provider_name("openai-codex") == "openai_codex"
+    assert config.get_provider_name("gpt-4.1") == "openai"
+
+
+@pytest.mark.parametrize(("model", "provider"), [
+    ("volcengine-plan/doubao", "volcengine_coding_plan"),
+    ("volcengine_coding_plan/doubao", "volcengine_coding_plan"),
+    ("byteplus-plan/seed", "byteplus_coding_plan"),
+    ("byteplus_coding_plan/seed", "byteplus_coding_plan"),
+    ("openai/gpt-4.1", "openai"),
+])
+def test_explicit_provider_without_key_does_not_use_another_endpoint(model, provider) -> None:
+    from nanobot.providers.factory import make_provider
+
+    config = Config.model_validate({
+        "agents": {"defaults": {"model": model}},
+        "providers": {
+            "volcengine": {"apiKey": "regular-volcengine"},
+            "byteplus": {"apiKey": "regular-byteplus"},
+        },
+    })
+
+    assert config.get_provider_name() == provider
+    with pytest.raises(ValueError, match=f"No API key configured for provider '{provider}'"):
+        make_provider(config)
+
+
+def test_forced_gateway_still_routes_a_vendor_prefixed_model() -> None:
+    config = Config.model_validate({
+        "agents": {"defaults": {
+            "provider": "openrouter", "model": "anthropic/claude-sonnet-4-6",
+        }},
+        "providers": {"openrouter": {"apiKey": "router-key"}},
+    })
+    assert config.get_provider_name() == "openrouter"
+
+
 def test_transcription_only_provider_is_not_chat_fallback() -> None:
     config = Config.model_validate({
         "providers": {

@@ -169,6 +169,7 @@ class TurnContext:
     hooks: list[AgentHook] = field(default_factory=list)
     tools: ToolRegistry | None = None
     model: str | None = None
+    provider: LLMProvider | None = None
 
     turn_wall_started_at: float = field(default_factory=time.time)
     visible_run_started_at: float | None = None
@@ -292,6 +293,7 @@ class AgentLoop:
         preserve_user_scope_messages: bool = False,
         stepwise_request_driven_assist: bool = False,
         dream_model: str | None = None,
+        model_provider_factory: Callable[[str, str | None], LLMProvider] | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -315,6 +317,7 @@ class AgentLoop:
         self.action_audit = ActionAuditStore.from_config(workspace, _tc.action_audit)
         self.model = model or provider.get_default_model()
         self.dream_model = dream_model.strip() if isinstance(dream_model, str) and dream_model.strip() else None
+        self._model_provider_factory = model_provider_factory
         self.max_iterations = (
             max_iterations if max_iterations is not None else defaults.max_tool_iterations
         )
@@ -531,7 +534,7 @@ class AgentLoop:
         allowing callers to override or extend the standard config-derived
         parameters (e.g. ``cron_service``, ``session_manager``).
         """
-        from nanobot.providers.factory import make_provider
+        from nanobot.providers.factory import make_model_override_provider, make_provider
 
         if bus is None:
             bus = MessageBus()
@@ -551,6 +554,11 @@ class AgentLoop:
             workspace=config.workspace_path,
             model=model,
             dream_model=str(getattr(defaults.dream, "model_override", None) or "").strip() or None,
+            model_provider_factory=extra.pop("model_provider_factory", None) or (
+                lambda name, preset_name: make_model_override_provider(
+                    config, name, preset_name=preset_name,
+                )
+            ),
             max_iterations=defaults.max_tool_iterations,
             max_concurrent_subagents=defaults.max_concurrent_subagents,
             subagent_profiles=defaults.subagent_profiles,
@@ -1097,6 +1105,7 @@ class AgentLoop:
         user_message: str | None = None,
         selected_context: Any | None = None,
         model: str | None = None,
+        provider: LLMProvider | None = None,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
         """Run the agent iteration loop.
 
@@ -1253,7 +1262,9 @@ class AgentLoop:
         if selected_context:
             selected_context.trace.stage = "legacy_fallback" if selected_context.legacy_fallback else "execute"
         try:
-            result = await self.runner.run(AgentRunSpec(
+            # A per-run override must never replace the shared chat provider.
+            runner = AgentRunner(provider) if provider is not None else self.runner
+            result = await runner.run(AgentRunSpec(
                 initial_messages=initial_messages,
                 selected_context=(selected_context if selected_context
                                   and not selected_context.legacy_fallback else None),
@@ -1789,6 +1800,7 @@ class AgentLoop:
         hooks: list[AgentHook] | None = None,
         tools: ToolRegistry | None = None,
         model: str | None = None,
+        provider: LLMProvider | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         self._refresh_provider_snapshot()
@@ -1824,6 +1836,7 @@ class AgentLoop:
             hooks=list(hooks or []),
             tools=tools,
             model=model,
+            provider=provider,
         )
 
         with self.sessions.session_scope(ctx.session):
@@ -2368,6 +2381,7 @@ class AgentLoop:
         """Run the code-controlled stepwise procedure. False hands the turn to the normal loop."""
 
         chosen = ctx.model or self.model
+        provider = ctx.provider or self.provider
         if ctx.visible_run_started_at is None:
             ctx.visible_run_started_at = time.time()
         await self._runtime_events().run_status_changed(
@@ -2377,7 +2391,7 @@ class AgentLoop:
             started_at=ctx.visible_run_started_at,
         )
         # Design 1: check reasoning-off support before running and say so when unsupported.
-        notice = reasoning_mode_notice(self.provider, chosen)
+        notice = reasoning_mode_notice(provider, chosen)
         notified: set[str] | None = getattr(self, "_reasoning_notice_sessions", None)
         if notified is None:
             notified = set()
@@ -2390,7 +2404,7 @@ class AgentLoop:
             else:
                 prefix = notice + "\n\n"
         case = await run_reasoning_procedure(
-            self.provider,
+            provider,
             model=chosen,
             request=ctx.msg.content,
             workspace=self.workspace,
@@ -2519,6 +2533,7 @@ class AgentLoop:
             tools=ctx.tools,
             selected_context=ctx.selected_context,
             model=ctx.model,
+            provider=ctx.provider,
         )
         final_content, tools_used, all_msgs, stop_reason, had_injections = result
         ctx.final_content = final_content
@@ -2950,6 +2965,8 @@ class AgentLoop:
                     kwargs["tools"] = tools
                 if model:
                     kwargs["model"] = model
+                    if model != self.model and self._model_provider_factory is not None:
+                        kwargs["provider"] = self._model_provider_factory(model, self.model_preset)
                 return await self._process_message(
                     msg,
                     **kwargs,

@@ -215,6 +215,21 @@ def _resolve_fallback_presets(config: Config, primary: ModelPresetConfig) -> lis
     return presets
 
 
+def make_model_override_provider(
+    config: Config, model: str, *, preset_name: str | None = None,
+) -> LLMProvider:
+    """Build a separate connection for a per-run model override.
+
+    Bare model names retain the selected preset's provider, including gateways
+    and local endpoints. A recognized provider/model prefix explicitly changes
+    the route; a missing key/base must fail rather than use another endpoint.
+    """
+    resolved = config.resolve_preset(preset_name)
+    provider = config.get_explicit_provider_name(model) or resolved.provider
+    preset = resolved.model_copy(update={"model": model, "provider": provider})
+    return make_provider(config, preset=preset)
+
+
 def make_provider(
     config: Config,
     *,

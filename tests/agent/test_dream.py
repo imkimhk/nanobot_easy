@@ -716,7 +716,9 @@ async def test_dream_run_uses_configured_model_without_changing_the_chat_model(t
             "dream": {"model": "dream-only-model"},
         }},
     })
-    loop = AgentLoop.from_config(config, provider=provider)
+    loop = AgentLoop.from_config(
+        config, provider=provider, model_provider_factory=lambda _model, _preset: provider,
+    )
     chat_model = loop.model
     try:
         assert loop.dream_model == "dream-only-model"
