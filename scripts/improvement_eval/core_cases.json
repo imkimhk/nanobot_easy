@@ -28,10 +28,12 @@
     "input": "a.md의 50~80행만 읽고 범위 안의 내용을 확인해줘.",
     "expected": "실제 파일의 요청 범위를 읽는다. 앞 10행만 읽은 결과로 요청 범위를 확인했다고 주장하지 않는다.",
     "offline_checks": [
-      "tests/agent/test_task_note.py::test_t05_full_read_and_requested_range"
+      "tests/agent/test_task_note.py::test_t05_full_read_and_requested_range",
+      "tests/agent/test_tool_repetition.py::test_runner_warns_once_keeps_evidence_and_completes_with_strict_errors",
+      "tests/agent/test_tool_repetition.py::test_polling_mcp_and_forced_reads_never_warn"
     ],
     "coverage": "related_invariant_only",
-    "offline_scope": "임시 파일의 실제 읽기 범위와 완료 근거를 검사한다. 자연어 답변의 품질은 미평가다."
+    "offline_scope": "임시 파일의 실제 읽기 범위와 완료 근거, 모의 반복 읽기의 비차단 경고·근거 보존과 대기·강제 재읽기 예외를 검사한다. 자연어 답변의 품질은 미평가다."
   },
   {
     "id": "C04",
@@ -82,10 +84,12 @@
       "tests/agent/test_memory_tools.py::test_memory_tools_are_scope_bound",
       "tests/agent/test_memory_tools.py::test_failed_search_remains_error_not_empty_result",
       "tests/agent/test_bounded_memory_prompt.py::test_bound_applies_to_full_compact_and_followup_without_changing_sources",
-      "tests/agent/test_bounded_memory_prompt.py::test_compact_tool_activation_retrieves_exact_source_without_extra_memory_calls"
+      "tests/agent/test_bounded_memory_prompt.py::test_compact_tool_activation_retrieves_exact_source_without_extra_memory_calls",
+      "tests/agent/test_compaction_continuity.py::test_idle_compaction_failure_preserves_live_messages",
+      "tests/agent/test_compaction_continuity.py::test_multiple_token_rounds_feed_the_latest_checkpoint_to_the_next"
     ],
     "coverage": "related_invariant_only",
-    "offline_scope": "임시 DB 검색·원문 읽기·대화 범위·검색 오류 구분과 제한된 기억의 상한·후속 대화 유지·원본 파일 읽기를 검사한다. 실제 모델의 검색어 선택과 답변 충실도는 미평가다."
+    "offline_scope": "임시 DB 검색·원문 읽기·대화 범위·오류 구분과 제한된 기억의 상한·후속 대화 유지·원본 파일 읽기를 검사한다. 요약 실패 때 원문 유지와 직전 요약의 다음 요약 입력 전달도 검사한다. 실제 모델의 검색어 선택·요약 내용·답변 충실도는 미평가다."
   },
   {
     "id": "C08",

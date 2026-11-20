@@ -30,6 +30,7 @@ from nanobot.agent.context_selection import ContextCapacityError
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.premature_final import CORRECTION, INCOMPLETE, is_premature_final
 from nanobot.agent.repetition_guard import RepeatedSentenceGuard
+from nanobot.agent.tool_repetition import WARNING, ReadRepetitionObserver, active_read_observer
 from nanobot.agent.tools.registry import ToolRegistry, is_tool_error_result
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.session.history_visibility import is_hidden_history_message
@@ -350,6 +351,8 @@ class AgentRunner:
         if spec.task_state is not None and injected_messages:
             spec.task_state.revise(injected_messages)
             injected_messages.append(spec.task_state.guidance())
+        if injected_messages and (observer := active_read_observer.get()) is not None:
+            observer.reset()
         return injected_messages
 
     @staticmethod
@@ -397,6 +400,7 @@ class AgentRunner:
         hook = spec.hook or AgentHook()
         messages = list(spec.initial_messages)
         context = AgentRunHookContext(messages=deepcopy(messages))
+        read_observer_token = active_read_observer.set(ReadRepetitionObserver())
 
         try:
             await hook.before_run(context)
@@ -448,6 +452,7 @@ class AgentRunner:
             await hook.after_run(context)
             return result
         finally:
+            active_read_observer.reset(read_observer_token)
             if spec.selected_context:
                 spec.selected_context.trace.persist()
             active_context_trace.reset(trace_token)
@@ -1857,8 +1862,19 @@ class AgentRunner:
 
         tool = spec.tools.get(tool_call.name)
         async def operation():
-            return await self._run_tool_with_task_note(
+            result, event, error = await self._run_tool_with_task_note(
                 spec, tool_call, external_lookup_counts, workspace_violation_counts)
+            observer = active_read_observer.get()
+            if observer is not None and observer.observe(
+                    tool_call.name, tool_call.arguments, result, event.get("status"),
+                    observability=bool(getattr(tool, "observability", False))):
+                from nanobot.agent.tools.base import ToolResult
+
+                payload = ToolResult(result + WARNING)
+                payload.__dict__.update(getattr(result, "__dict__", {}))
+                result = payload
+                event = dict(event, repeat_warning=True)
+            return result, event, error
         token = current_tool_output_limit.set(spec.max_tool_result_chars)
         try:
             if spec.selected_context and tool is not None and not tool.read_only:
