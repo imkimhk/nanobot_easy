@@ -47,8 +47,7 @@ _FILE_OPERATION_BEFORE = re.compile(
     r"(?:\s+(?:the|file|document|contents? of))*\s+['\"`]?$", re.I,
 )
 _LOCAL_FILE_OBJECT = re.compile(
-    r"(?<![\w])(?:(?:그|해당|이|저)\s*(?:문서|설계서|파일)|(?:설계서\s*)?파일)"
-    r"|\b(?:the\s+)?(?:file|document)\b", re.I,
+    r"(?<![\w])(?:(?:그|해당|이|저)\s*(?:문서|설계서|파일)|(?:설계서\s*)?파일)", re.I,
 )
 _FILE_LIST_LINK = re.compile(r"\s*['\"`]?\s*(?:와|과|및|,|and|or)\s*['\"`]?\s*", re.I)
 _FILE_PAYLOAD_AFTER = re.compile(r"에\s+[^.!?\n]+?\s+(?:저장|작성)(?=\s|해|하|[.!?]|$)")
@@ -137,9 +136,10 @@ def _file_requests(instruction: str) -> tuple[list[str], bool, list[str]]:
         if (index + 1 in required and _FILE_LIST_LINK.fullmatch(
                 instruction[mentions[index].end():mentions[index + 1].start()])):
             required.add(index)
+    # Generic English nouns can describe supplied text or a prohibition. Local file
+    # obligations still come from concrete names above or the model's selected file scope.
     unnamed = any(not _PRESERVE_FILE.match(instruction[m.end():])
-                  and (_FILE_OPERATION_AFTER.match(instruction[m.end():])
-                       or _FILE_OPERATION_BEFORE.search(instruction[:m.start()]))
+                  and _FILE_OPERATION_AFTER.match(instruction[m.end():])
                   for m in _LOCAL_FILE_OBJECT.finditer(instruction))
     if ((unnamed and _INDIRECT_FILE.search(instruction))
             or (_CONDITIONAL_CLAUSE.search(instruction)

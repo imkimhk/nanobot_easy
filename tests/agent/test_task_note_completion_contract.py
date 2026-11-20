@@ -1,9 +1,36 @@
 """Small counterexamples for scope inference versus actual execution evidence."""
 import json
 
+import pytest
+
 from nanobot.agent.task_note import TaskNote
 from nanobot.agent.tools.filesystem import WriteFileTool
 from tests.agent.test_task_note import control, read, run, target, update
+
+
+@pytest.mark.parametrize("prompt,source", [
+    ("Analyze the exit code. Do not edit the file.", "none"),
+    ("Analyze the result. Do not read the document.", "none"),
+    ("Review the document below.\n본문: 매출은 10이고 비용은 7이다.", "provided"),
+    ("Review the document below. Do not edit the file.\n본문: 검토할 본문입니다.", "provided"),
+])
+async def test_english_restrictions_and_pasted_documents_finish_without_file_work(
+        tmp_path, prompt, source):
+    report = "분석 결과: 제공된 내용만 검토했으며 파일 작업은 하지 않았습니다."
+    result, provider, _ = await run(tmp_path, [
+        control(source=source, targets=[], final_answer=report),
+    ], request=prompt, max_iterations=1)
+    assert result.stop_reason == "completed"
+    assert result.final_content == report
+    assert result.tools_used == ["update_task"]
+    assert len(provider.calls) == 1
+
+
+def test_generic_document_still_requires_targets_when_file_scope_is_selected(tmp_path):
+    note = TaskNote([{"role": "user", "content": "Review the document."}], tmp_path, {})
+    note.accept(update(note, source="files", targets=[]))
+    assert "target_unresolved" in note.defects()
+    assert {"kind": "declared_file_source_without_target"} in note.scope_conflicts()
 
 
 async def test_research_and_concept_paraphrases_deliver_without_invented_file_work(tmp_path):

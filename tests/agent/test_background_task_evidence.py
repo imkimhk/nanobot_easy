@@ -37,7 +37,7 @@ def test_file_modification_prohibition_is_not_a_file_request(tmp_path, prompt):
 @pytest.mark.parametrize("prompt", [
     "파일을 검토해줘. 파일 수정은 하지 마.",
     "a.md를 검토해줘. 파일 수정은 하지 마.",
-    "Review the document. Do not modify any files.",
+    "Review a.md. Do not modify any files.",
     "파일 수정하지 말고 읽어줘.",
 ])
 def test_prohibition_does_not_hide_a_real_file_request(tmp_path, prompt):
