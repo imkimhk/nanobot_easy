@@ -70,6 +70,8 @@ def test_resolve_llm_call_timeout_defaults_and_bounds():
     assert resolve_llm_call_timeout_s(env_value="-5") is None
     assert resolve_llm_call_timeout_s(env_value="120") == 120.0
     assert resolve_llm_call_timeout_s(env_value="99999") == MAX_LLM_CALL_TIMEOUT_S
+    for invalid in ["nan", "inf", "-inf"]:
+        assert resolve_llm_call_timeout_s(env_value=invalid) == DEFAULT_LLM_CALL_TIMEOUT_S
 
 
 async def test_hung_non_streaming_call_ends_as_timeout(monkeypatch):
@@ -153,3 +155,21 @@ async def test_turn_hung_after_tool_result_ends_with_error_report(monkeypatch):
     assert any("LLM attempt end" in r and "error_kind=timeout" in r for r in records)
     assert any("LLM request end" in r and "iteration=1" in r and "error_kind=timeout" in r
                for r in records)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("shorter", ["request", "call"])
+async def test_call_timeout_preserves_the_shorter_request_deadline(monkeypatch, stream, shorter):
+    from nanobot.agent import task_budget
+
+    call_limit, request_limit = (5, 0.03) if shorter == "request" else (0.03, 5)
+    monkeypatch.setenv(LLM_CALL_TIMEOUT_ENV, str(call_limit))
+    budget = task_budget.TaskBudget("deadline-check", max_sends=3, deadline_s=request_limit)
+    monkeypatch.setattr(task_budget, "active_budget", lambda: budget)
+    provider = _HangingProvider(["hang"])
+    method = provider.chat_stream_with_retry if stream else provider.chat_with_retry
+    response = await asyncio.wait_for(method(messages=[{"role": "user", "content": "x"}]), 1)
+    assert response.error_kind == ("budget_exhausted" if shorter == "request" else "timeout")
+    assert budget.sends == 1
+    assert budget.unknown_usage == 1  # An interrupted call has unknown usage, not zero.
+    assert budget.stop_reason == ("budget_deadline" if shorter == "request" else None)

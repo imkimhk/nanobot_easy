@@ -46,9 +46,11 @@ history remain intact. Other traces and independent outcomes retain legacy count
 This does not reconstruct unknown historical counter drift or claim that every
 legacy use was a verified application. Reindexing preserves both counters.
 
-The running gateway has not been restarted for this change. Its DB migration takes
-effect when the updated SkillStore first opens that database; current verification
-used isolated test/evaluation databases only.
+The DB migration takes effect when the updated SkillStore first opens that
+database. Verification uses isolated test/evaluation databases. Integration review
+also opened a read-only backup of the operating database with the candidate code
+and checked preservation and idempotent reopening; the operating database was not
+migrated by that review.
 
 ## Verification
 

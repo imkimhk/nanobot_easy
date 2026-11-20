@@ -71,6 +71,22 @@ def test_compact_prompt_preserves_custom_policy_memory_and_summary(tmp_path):
     assert len(compact) < len(builder.build_system_prompt()) * 0.6
 
 
+def test_compact_respects_disabled_always_preloading_and_keeps_explicit_hot_skills(tmp_path):
+    for name, always, body in [("custom", True, "CUSTOM BODY"), ("hot", False, "HOT BODY")]:
+        skill = tmp_path / "skills" / name / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(
+            f"---\nname: {name}\ndescription: {name} policy\nalways: {str(always).lower()}\n---\n{body}"
+        )
+    builder = ContextBuilder(tmp_path, preload_always_skills=False,
+                             hot_path_skills=["hot"], on_demand_skills=["custom"])
+    compact = builder.build_compact_system_prompt()
+    full = builder.build_system_prompt()
+    assert "HOT BODY" in compact and "HOT BODY" in full
+    assert "CUSTOM BODY" not in compact and "CUSTOM BODY" not in full
+    assert "# On-demand Skills" in full and "skills/custom/SKILL.md" in full
+
+
 async def test_loop_simple_answer_one_call_then_real_file_work(tmp_path):
     provider = Script([LLMResponse(content="4"), call("activate_tools"),
                        call("read_file", path="a.md"), LLMResponse(content="file evidence"),

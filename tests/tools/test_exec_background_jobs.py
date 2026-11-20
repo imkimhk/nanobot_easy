@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import sys
@@ -101,8 +102,40 @@ async def test_jobs_are_scoped_to_the_starting_session(tmp_path):
     try:
         assert manager.get(job_id, "b") is None
         assert await jobs.execute(action="list") == "No background jobs."
+        assert is_tool_error_result("exec_job", await jobs.execute(action="status", job_id=job_id))
+        restarted = ExecJobTool(manager=ExecJobManager(), workspace=str(tmp_path))
+        assert is_tool_error_result("exec_job", await restarted.execute(action="status", job_id=job_id))
     finally:
         reset_request_context(token)
+    assert manager.get(job_id) is None  # Missing context cannot inspect another session either.
+
+
+@pytest.mark.parametrize("symlink", [False, True])
+async def test_untracked_metadata_cannot_read_a_log_outside_its_directory(tmp_path, symlink):
+    directory = tmp_path / ".nanobot/exec-jobs"
+    directory.mkdir(parents=True)
+    outside = tmp_path / "unrelated.txt"
+    outside.write_text("PRIVATE UNRELATED CONTENT")
+    path = outside
+    if symlink:
+        path = directory / "linked.log"
+        path.symlink_to(outside)
+    (directory / "123abc.json").write_text(json.dumps({
+        "owner_session_key": None, "log": str(path), "exit_code": 0,
+    }))
+    jobs = ExecJobTool(manager=ExecJobManager(), workspace=str(tmp_path))
+    result = await jobs.execute(action="status", job_id="123abc")
+    assert is_tool_error_result("exec_job", result)
+    assert "PRIVATE UNRELATED CONTENT" not in result
+
+
+async def test_background_log_directory_cannot_escape_workspace_through_symlink(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".nanobot").symlink_to(tmp_path / "outside")
+    result = await ExecTool(working_dir=str(workspace)).execute(command="echo hello", background=True)
+    assert is_tool_error_result("exec", result)
+    assert not (tmp_path / "outside").exists()
 
 
 async def test_status_of_job_from_earlier_runtime_uses_metadata_file(tmp_path):

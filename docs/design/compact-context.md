@@ -36,7 +36,9 @@ Lightweight mode keeps its independent `update_task` control available.
 
 The compact prompt preserves bootstrap files (`AGENTS.md`, `SOUL.md`, `USER.md`),
 long-term memory, archived summaries, configured hot skills, and non-built-in
-always-on skills. The original dialogue and runtime context remain intact.
+always-on skills when always-skill preloading is enabled. Disabling
+preloadAlwaysSkills still defers those bodies, while explicitly configured hot
+skills stay loaded. The original dialogue and runtime context remain intact.
 Permission gates and untrusted-input rules remain present from the first call.
 Built-in execution workflows are deferred, not deleted. Existing intent metadata,
 workspace checks, tool execution and verification are unchanged.
@@ -68,11 +70,12 @@ or workload. Operating gateway configuration was not changed by this evaluation.
 Reproduce in a fresh output directory:
 
 ```bash
-python -m scripts.improvement_eval.live_compact_context --out .local/evaluations/compact-new
 pytest tests/agent/test_compact_context.py tests/agent/test_context_builder.py tests/agent/test_loop_runner_integration.py tests/agent/test_task_note.py -q
+python -m scripts.improvement_eval.live_tool_context --config .local/config.json \
+  --out .local/evaluations/compact-new
 ```
 
-The live evaluator uses the existing Codex OAuth account and incurs model usage.
+The live evaluator uses the configured provider/model and incurs model usage.
 
 ## Tool-heavy context profile (2026-11-17)
 

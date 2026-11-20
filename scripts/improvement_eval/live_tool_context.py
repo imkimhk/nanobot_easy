@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import shutil
+import time
 from pathlib import Path
 
 from loguru import logger
@@ -13,12 +14,67 @@ from nanobot.agent.hook import SDKCaptureHook
 from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool
+from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.queue import MessageBus
 from nanobot.config.loader import load_config, set_config_path
+from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import make_provider
 from nanobot.utils.helpers import estimate_prompt_tokens
-from scripts.improvement_eval.live_integration import MeasuredProvider
-from scripts.improvement_eval.live_part3 import AuditRegistry
+
+
+class MeasuredProvider(LLMProvider):
+    def __init__(self, inner, journal):
+        super().__init__()
+        self.inner, self.journal = inner, journal
+        self.generation = inner.generation
+        self.records = []
+        self.case = ""
+
+    def get_default_model(self):
+        return self.inner.get_default_model()
+
+    async def chat(self, **kwargs):
+        if len(self.records) >= 48:
+            raise RuntimeError("Integration model-call limit reached")
+        row = {"case": self.case, "index": len(self.records) + 1}
+        self.records.append(row)
+        self.journal.write_text(json.dumps(self.records, ensure_ascii=False, indent=2))
+        started = time.monotonic()
+        try:
+            response = await self.inner.chat(**kwargs)
+            row.update(usage=response.usage, finish_reason=response.finish_reason,
+                       error_kind=response.error_kind,
+                       proposed_tools=[{"name": t.name, "arguments": t.arguments} for t in response.tool_calls])
+            return response
+        finally:
+            row["wall_s"] = round(time.monotonic() - started, 3)
+            self.journal.write_text(json.dumps(self.records, ensure_ascii=False, indent=2))
+
+
+class AuditRegistry(ToolRegistry):
+    def __init__(self, workspace):
+        super().__init__()
+        self.workspace = workspace
+        self.events = []
+
+    def register(self, tool):
+        original = tool.execute
+        async def execute(**params):
+            path = self.workspace / 'a.md'
+            row = {'name': tool.name, 'arguments': params,
+                   'file_before': path.read_text() if path.exists() else None}
+            self.events.append(row)
+            try:
+                result = await original(**params)
+                row.update(result=str(result), is_error=bool(getattr(result, 'is_error', False)))
+                return result
+            except BaseException as exc:
+                row['exception_type'] = type(exc).__name__
+                raise
+            finally:
+                row['file_after'] = path.read_text() if path.exists() else None
+        tool.execute = execute
+        super().register(tool)
 
 
 class SchemaOnlyTool(Tool):
