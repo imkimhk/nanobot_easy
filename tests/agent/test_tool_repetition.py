@@ -53,6 +53,18 @@ def test_changed_file_version_resets_even_when_the_requested_range_is_unchanged(
     assert not observer.observe("read_file", args, result, "ok")
 
 
+def test_size_change_resets_when_only_the_read_range_text_matches():
+    observer = ReadRepetitionObserver()
+    args = {"path": "notes.txt", "limit": 1}
+    same = ToolResult("1| first")
+    same.read_evidence = {"version": {"mtime_ns": 1, "size": 12}}
+    assert not observer.observe("read_file", args, same, "ok")
+    assert not observer.observe("read_file", args, same, "ok")
+    changed = ToolResult("1| first")
+    changed.read_evidence = {"version": {"mtime_ns": 2, "size": 18}}
+    assert not observer.observe("read_file", args, changed, "ok")
+
+
 def test_web_limit_distinguishes_case_and_extraction_options():
     one = external_lookup_signature("web_fetch", {"url": "https://example.com/Case"})
     assert one != external_lookup_signature("web_fetch", {"url": "https://example.com/case"})
@@ -120,3 +132,23 @@ async def test_new_user_instruction_resets_run_observer():
         assert not observer.observe("read_file", args, "old", "ok")
     finally:
         active_read_observer.reset(token)
+
+
+async def test_read_without_task_or_context_capture_notices_a_later_line_change(tmp_path):
+    from nanobot.agent.tools.filesystem import ReadFileTool
+
+    path = tmp_path / "notes.txt"
+    path.write_text("first\nsecond\n", encoding="utf-8")
+    tool = ReadFileTool(workspace=tmp_path, restrict_to_workspace=True)
+    args = {"path": str(path), "offset": 1, "limit": 1}
+    first = await tool.execute(path=str(path), offset=1, limit=1, force=True)
+    assert "first" in first and "second" not in first
+    assert first.read_evidence["version"]["size"] == path.stat().st_size
+    observer = ReadRepetitionObserver()
+    assert not observer.observe("read_file", args, first, "ok")
+    assert not observer.observe("read_file", args, first, "ok")
+    path.write_text("first\nsecond\nthird\n", encoding="utf-8")
+    second = await tool.execute(path=str(path), offset=1, limit=1, force=True)
+    assert "first" in second and "third" not in second
+    assert second.read_evidence["version"]["size"] != first.read_evidence["version"]["size"]
+    assert not observer.observe("read_file", args, second, "ok")

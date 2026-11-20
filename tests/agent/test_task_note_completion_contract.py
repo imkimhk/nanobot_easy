@@ -150,3 +150,32 @@ async def test_blocked_scope_delivers_known_findings_without_repeating_work(tmp_
     assert "버전 확인 필요" in result.final_content
     assert len(provider.calls) == 2
     assert result.tools_used == ["update_task", "update_task"]
+
+
+def test_selected_filename_must_match_the_whole_name(tmp_path):
+    note = TaskNote(
+        [{"role": "user", "content": "a.py와 data.py를 수정해줘."}],
+        tmp_path,
+        {},
+    )
+    note.accept(update(note, targets=[target(path=str(tmp_path / "data.py"), action="write")]))
+    assert {"kind": "requested_file_not_selected", "path": "a.py"} in note.scope_conflicts()
+
+    audit = TaskNote(
+        [{"role": "user", "content": "audit.py와 test_action_audit.py를 수정해줘."}],
+        tmp_path,
+        {},
+    )
+    audit.accept(update(
+        audit,
+        targets=[target(path=str(tmp_path / "test_action_audit.py"), action="write")],
+    ))
+    assert {"kind": "requested_file_not_selected", "path": "audit.py"} in audit.scope_conflicts()
+
+    exact = TaskNote(
+        [{"role": "user", "content": "data.py를 수정해줘."}],
+        tmp_path,
+        {},
+    )
+    exact.accept(update(exact, targets=[target(path=str(tmp_path / "data.py"), action="write")]))
+    assert exact.scope_conflicts() == []

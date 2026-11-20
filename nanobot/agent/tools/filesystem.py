@@ -504,7 +504,19 @@ class ReadFileTool(_FsTool):
         from nanobot.agent.task_note import active_task_note, file_version
 
         if active_task_note.get() is None and not active_evidence_capture.get():
-            return result
+            # No task or context capture is active, but a later-line change must
+            # still be distinguishable from an unchanged read of the same range.
+            try:
+                st = fp.stat()
+            except OSError:
+                return result
+            output = ToolResult(result)
+            output.read_evidence = {
+                "target": str(fp.resolve()), "unit": unit, "start": start, "end": end,
+                "total": total, "extraction_ok": extraction_ok,
+                "version": {"mtime_ns": st.st_mtime_ns, "size": st.st_size},
+            }
+            return output
         version = fingerprint(fp) if active_evidence_capture.get() else file_version(str(fp))
         if active_evidence_capture.get() and expected_hash is not None and (version or {}).get("sha256") != expected_hash:
             extraction_ok = False

@@ -815,8 +815,6 @@ class TaskNote:
             if not any(
                 self.canonical(path) == self.canonical(t.path)
                 or ("/" not in path and Path(t.path).name == path)
-                or (Path(t.path).name in instruction and path in Path(t.path).name)
-                or (t.path in instruction and path in t.path)
                 for t in update.targets
             ):
                 kind = ("requested_file_not_selected" if path in required

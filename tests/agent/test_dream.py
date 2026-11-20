@@ -702,3 +702,33 @@ class TestDreamContentDiff:
         store.git.auto_commit("initial")
         store.set_last_dream_cursor(99)  # only memory/.dream_cursor changes
         assert store.dream_content_diff() == ""
+
+
+async def test_dream_run_uses_configured_model_without_changing_the_chat_model(tmp_path):
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.config.schema import Config
+    from tests.agent.test_compact_context import Script
+
+    provider = Script([LLMResponse(content="dreamed")])
+    config = Config.model_validate({
+        "agents": {"defaults": {
+            "workspace": str(tmp_path),
+            "dream": {"model": "dream-only-model"},
+        }},
+    })
+    loop = AgentLoop.from_config(config, provider=provider)
+    chat_model = loop.model
+    try:
+        assert loop.dream_model == "dream-only-model"
+        assert chat_model != "dream-only-model"
+        result = await loop.process_direct(
+            "Consolidate memory.",
+            session_key="dream:test",
+            ephemeral=True,
+            model=loop.dream_model,
+        )
+        assert result is not None and result.content == "dreamed"
+        assert provider.calls[0]["model"] == "dream-only-model"
+        assert loop.model == chat_model
+    finally:
+        loop.stop()
