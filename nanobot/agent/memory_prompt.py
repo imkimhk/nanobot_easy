@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 SNAPSHOT_NAME = "prompt_snapshot.json"
 _MAX_SNAPSHOT_BYTES = 256_000
+_SUMMARY_CHUNK_CHARS = 1024
 
 
 def render_projection(summary: str, source: Path) -> str:
@@ -29,14 +30,79 @@ def render_projection(summary: str, source: Path) -> str:
     )
 
 
+def projection_tokens(summary: str, source: Path) -> int:
+    return estimate_message_tokens({
+        "role": "system", "content": "# Memory\n\n## Long-term Memory\n"
+        + render_projection(summary, source),
+    })
+
+
+def snapshot_summary(data: dict) -> str:
+    """Read legacy strings or losslessly chunked summaries, without altering prompt text."""
+    if not isinstance(data, dict):
+        raise ValueError("unsupported snapshot format")
+    if data.get("version") == 1 and isinstance(data.get("summary"), str):
+        return data["summary"]
+    if data.get("version") == 2:
+        chunks = data.get("summary_chunks")
+        if (isinstance(chunks, list) and chunks
+                and all(isinstance(s, str) and len(s) <= _SUMMARY_CHUNK_CHARS for s in chunks)):
+            return "".join(chunks)
+    raise ValueError("unsupported snapshot format or summary")
+
+
+def encode_snapshot(data: dict) -> bytes:
+    """Keep JSON physical lines readable within tool budgets; preserve every character."""
+    summary = snapshot_summary(data)
+    chunks = [line[i:i + _SUMMARY_CHUNK_CHARS] for line in summary.splitlines(keepends=True)
+              for i in range(0, len(line), _SUMMARY_CHUNK_CHARS)]
+    stored = {k: v for k, v in data.items() if k not in {"version", "summary", "summary_chunks"}}
+    stored = {"version": 2, **stored, "summary_chunks": chunks}
+    return (json.dumps(stored, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def append_only_summary(text: str, previous: dict) -> str | None:
+    """Reuse a reviewed prefix only when its entire source hash still matches exactly."""
+    summary = snapshot_summary(previous)
+    expected = previous.get("source_sha256")
+    digest = hashlib.sha256()
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        prefix = digest.copy()
+        prefix.update(body.encode("utf-8"))
+        if prefix.hexdigest() == expected and text[:offset + len(body)].strip():
+            return summary + "\n\n" + text[offset + len(body):]
+        digest.update(line.encode("utf-8"))
+        offset += len(line)
+        if digest.hexdigest() == expected and text[:offset].strip():
+            return summary + "\n\n" + text[offset:]
+    return None
+
+
+def apply_summary_edits(summary: str, edits: dict) -> str:
+    """Apply model-proposed exact edits in memory; ambiguous matches never execute."""
+    if not isinstance(edits, dict) or not isinstance(edits.get("edits"), list) or len(edits["edits"]) > 20:
+        raise ValueError("invalid summary edits")
+    for edit in edits["edits"]:
+        if (not isinstance(edit, dict) or set(edit) != {"old", "new"}
+                or not isinstance(edit["old"], str) or not isinstance(edit["new"], str)):
+            raise ValueError("invalid summary edit")
+        old, new = edit["old"], edit["new"]
+        if old:
+            if summary.count(old) != 1:
+                raise ValueError("summary edit is not unique")
+            summary = summary.replace(old, new, 1)
+        else:
+            summary += "\n\n" + new
+    return summary
+
+
 def make_snapshot(text: str, summary: str, source: Path, budget: int) -> dict:
     """Prepare an explicitly reviewed summary without editing the original."""
     if not summary.strip():
         raise ValueError("Memory summary must not be empty")
-    if budget <= 0 or estimate_message_tokens(
-        {"role": "system", "content": "# Memory\n\n## Long-term Memory\n"
-         + render_projection(summary, source)}
-    ) > budget:
+    if budget <= 0 or projection_tokens(summary, source) > budget:
         raise ValueError("Memory summary exceeds the token estimate budget; compact it first")
     return {
         "version": 1,
@@ -72,11 +138,7 @@ class BoundedMemoryPrompt:
             if len(raw) > _MAX_SNAPSHOT_BYTES:
                 raise ValueError("snapshot file is too large")
             data = json.loads(raw)
-            if not isinstance(data, dict) or data.get("version") != 1:
-                raise ValueError("unsupported snapshot format")
-            summary = data.get("summary")
-            if not isinstance(summary, str):
-                raise ValueError("snapshot summary must be text")
+            summary = snapshot_summary(data)
             expected = make_snapshot(text, summary, self.source, self.budget)
             if data.get("source_sha256") != expected["source_sha256"]:
                 raise ValueError("source changed")

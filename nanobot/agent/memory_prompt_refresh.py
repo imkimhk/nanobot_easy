@@ -15,14 +15,27 @@ from pathlib import Path
 from filelock import FileLock
 from loguru import logger
 
-from nanobot.agent.memory_prompt import _MAX_SNAPSHOT_BYTES, SNAPSHOT_NAME, make_snapshot
+from nanobot.agent.memory_prompt import (
+    _MAX_SNAPSHOT_BYTES,
+    SNAPSHOT_NAME,
+    append_only_summary,
+    apply_summary_edits,
+    encode_snapshot,
+    make_snapshot,
+    projection_tokens,
+    snapshot_summary,
+)
 from nanobot.providers.base import LLMProvider, hosted_tools_disabled
 from nanobot.utils.prompt_templates import render_template
 
 _MAX_SOURCE_BYTES = 128_000
-_REFRESH_TIMEOUT_S = 120
+_REFRESH_TIMEOUT_S = 180
 _RETRY_DELAY_S = 300
 _DEBOUNCE_S = 1
+
+
+class MemoryRefreshError(ValueError):
+    """A content-free reason code safe for the operator log."""
 
 
 class MemoryPromptRefresher:
@@ -112,10 +125,17 @@ class MemoryPromptRefresher:
                     {"role": "system", "content": render_template(template, strip=True)},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 ], tools=None, tool_choice=None, temperature=0, max_tokens=max_tokens,
-                max_retries=0,
+                max_retries=0, reasoning_effort="low",
             )
-        if response.finish_reason != "stop" or response.tool_calls or not response.content:
-            raise ValueError("Refresh requires complete text with no tool calls")
+        if response.finish_reason != "stop":
+            reason = response.finish_reason if response.finish_reason in {
+                "length", "error", "content_filter", "cancelled", "tool_calls", "refusal",
+            } else "unexpected"
+            raise MemoryRefreshError("response_" + reason)
+        if response.tool_calls:
+            raise MemoryRefreshError("unexpected_tool_calls")
+        if not response.content or not response.content.strip():
+            raise MemoryRefreshError("empty_response")
         return response.content.strip()
 
     async def _refresh(self, digest: str) -> None:
@@ -131,49 +151,96 @@ class MemoryPromptRefresher:
                     if hashlib.sha256(text.encode("utf-8")).hexdigest() != digest:
                         return  # A newer source will be detected on the next build.
                     before = self._read_snapshot()
+                    appended = None
+                    prior_summary = None
                     if before is not None:
                         try:
                             data = json.loads(before)
-                            if isinstance(data, dict) and isinstance(data.get("summary"), str):
-                                current = make_snapshot(text, data["summary"], self.source, self.budget)
-                                if data.get("version") == 1 and data.get("source_sha256") == current["source_sha256"]:
-                                    return  # Another process already refreshed it.
+                            loaded = snapshot_summary(data)
+                            current = make_snapshot(text, loaded, self.source, self.budget)
+                            prior_summary = loaded
+                            if data.get("source_sha256") == current["source_sha256"]:
+                                return  # Another process already refreshed it.
+                            appended = append_only_summary(text, data)
                         except (ValueError, TypeError, KeyError, RecursionError):
                             pass
                     method, model = "lossless", None
+                    attempts = 0
                     try:
-                        candidate = make_snapshot(text, text, self.source, self.budget)
+                        use_append = (appended is not None and projection_tokens(appended, self.source)
+                                      < projection_tokens(text, self.source))
+                        candidate = make_snapshot(text, appended if use_append else text,
+                                                  self.source, self.budget)
+                        if use_append:
+                            method = "append-only"
                     except ValueError:
                         provider, model = self.selection()
-                        phase = "generation"
-                        summary = await self._ask(provider, model, "agent/memory_prompt_refresh.md",
-                            {"source": text, "summary_token_target": max(1, int(self.budget * 0.8))},
-                            min(16_000, max(2048, self.budget * 2)))
-                        candidate = make_snapshot(text, summary, self.source, self.budget)
-                        phase = "review"
-                        review = json.loads(await self._ask(provider, model,
-                            "agent/memory_prompt_review.md", {"source": text, "summary": summary}, 2048))
-                        if (not isinstance(review, dict)
-                                or any(review.get(key) is not True for key in
-                                       ("constraints_preserved", "faithful", "no_new_authority"))
-                                or review.get("issues") != []):
-                            raise ValueError("Candidate did not pass review")
+                        template = "agent/memory_prompt_update.md" if prior_summary is not None else "agent/memory_prompt_refresh.md"
+                        payload = {"source": text, "summary_token_target": max(1, int(self.budget * 0.9))}
+                        if prior_summary is not None:
+                            payload["previous_summary"] = prior_summary
+                        for attempts in (1, 2):
+                            phase = "generation"
+                            summary = await self._ask(provider, model, template,
+                                payload, min(16_000, max(2048, self.budget * 2)))
+                            if prior_summary is not None:
+                                try:
+                                    summary = apply_summary_edits(payload["previous_summary"], json.loads(summary))
+                                except (ValueError, TypeError, RecursionError) as exc:
+                                    raise MemoryRefreshError("invalid_summary_edits") from exc
+                            phase = "budget"
+                            tokens = projection_tokens(summary, self.source)
+                            if tokens > self.budget:
+                                logger.info("Memory prompt candidate over budget: tokens={} budget={} attempt={}",
+                                            tokens, self.budget, attempts)
+                                if attempts == 2:
+                                    raise MemoryRefreshError("summary_over_budget")
+                                feedback = ["The draft exceeds the measured token budget. Compress historical "
+                                            "detail and repetition further; do not remove active constraints."]
+                            else:
+                                candidate = make_snapshot(text, summary, self.source, self.budget)
+                                phase = "review"
+                                review = json.loads(await self._ask(provider, model,
+                                    "agent/memory_prompt_review.md", {"source": text, "summary": summary}, 2048))
+                                checks = ("constraints_preserved", "faithful", "no_new_authority")
+                                if (not isinstance(review, dict)
+                                        or any(type(review.get(k)) is not bool for k in checks)
+                                        or not isinstance(review.get("issues"), list)):
+                                    raise MemoryRefreshError("invalid_review")
+                                if all(review[k] for k in checks) and review["issues"] == []:
+                                    break
+                                feedback = review["issues"]
+                                if (attempts == 2 or not feedback
+                                        or not all(isinstance(s, str) for s in feedback)
+                                        or sum(map(len, feedback)) > 4000):
+                                    raise MemoryRefreshError("review_rejected")
+                            if self._read_source() != text or self._read_snapshot() != before:
+                                raise MemoryRefreshError("source_or_snapshot_changed")
+                            logger.info("Memory prompt revising candidate once: phase={}", phase)
+                            payload = {"source": text, "previous_draft": summary, "review_feedback": feedback,
+                                       "summary_token_target": max(1, int(self.budget * 0.85))}
+                            if prior_summary is not None:
+                                payload["previous_summary"] = summary
                         method = "model-reviewed"
                     phase = "publication"
                     candidate["refresh"] = {"method": method, "model": model,
-                        "created_at": datetime.now(timezone.utc).isoformat()}
-                    raw = (json.dumps(candidate, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+                        "created_at": datetime.now(timezone.utc).isoformat(), "attempts": attempts,
+                        "summary_tokens": projection_tokens(candidate["summary"], self.source)}
+                    raw = encode_snapshot(candidate)
                     if len(raw) > _MAX_SNAPSHOT_BYTES:
                         raise ValueError("Candidate file is too large")
                     self._publish(text, before, raw)
-                    logger.info("Memory prompt refreshed: method={} source_sha256={}", method, digest)
+                    logger.info("Memory prompt refreshed: method={} source_sha256={} tokens={} attempts={}",
+                                method, digest, candidate["refresh"]["summary_tokens"], attempts)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             # Provider/parser errors may contain memory text or credentials.
-            logger.warning("Memory prompt refresh deferred: phase={} error={}; "
+            self._retry_at = time.monotonic() + _RETRY_DELAY_S
+            reason = str(exc) if isinstance(exc, MemoryRefreshError) else type(exc).__name__
+            logger.warning("Memory prompt refresh deferred: phase={} reason={}; "
                            "keeping current raw memory; retry cooldown={}s",
-                           phase, type(exc).__name__, _RETRY_DELAY_S)
+                           phase, reason, _RETRY_DELAY_S)
 
     def _publish(self, text: str, before: bytes | None, raw: bytes) -> None:
         fd, name = tempfile.mkstemp(prefix=".memory-prompt-", dir=self.source.parent)

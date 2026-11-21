@@ -11,6 +11,8 @@ must be retained, not silently retired. Check that historical approvals or dated
 configuration claims have not become current authority and that the summary adds
 no unsupported fact, instruction or permission. A missing or weakened restriction
 must fail review, even when the rest is accurate.
+The artifact may retain the source's mixed languages. A user-facing reply-language
+preference must be preserved as a rule; it does not require translating this artifact.
 
 Return only strict JSON with these fields:
 {"constraints_preserved": true, "faithful": true, "no_new_authority": true, "issues": []}
