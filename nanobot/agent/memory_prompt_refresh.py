@@ -21,6 +21,7 @@ from nanobot.agent.memory_prompt import (
     append_only_summary,
     apply_summary_edits,
     encode_snapshot,
+    has_review_receipt,
     make_snapshot,
     projection_tokens,
     snapshot_summary,
@@ -182,10 +183,12 @@ class MemoryPromptRefresher:
                             loaded = snapshot_summary(data)
                             current = make_snapshot(text, loaded, self.source, self.budget)
                             prior_summary = loaded
-                            if data.get("source_sha256") == current["source_sha256"]:
+                            checked = has_review_receipt(data)
+                            if checked and data.get("source_sha256") == current["source_sha256"]:
                                 self.status.update(status="current")
                                 return  # Another process already refreshed it.
-                            appended = append_only_summary(text, data)
+                            if checked:
+                                appended = append_only_summary(text, data)
                         except (ValueError, TypeError, KeyError, RecursionError):
                             pass
                     method, model = "lossless", None
@@ -263,7 +266,9 @@ class MemoryPromptRefresher:
                     phase = "publication"
                     candidate["refresh"] = {"method": method, "model": model,
                         "created_at": datetime.now(timezone.utc).isoformat(), "attempts": attempts,
-                        "summary_tokens": projection_tokens(candidate["summary"], self.source)}
+                        "summary_tokens": projection_tokens(candidate["summary"], self.source),
+                        "reviewed_source_sha256": candidate["source_sha256"],
+                        "reviewed_summary_sha256": hashlib.sha256(candidate["summary"].encode("utf-8")).hexdigest()}
                     raw = encode_snapshot(candidate)
                     if len(raw) > _MAX_SNAPSHOT_BYTES:
                         raise ValueError("Candidate file is too large")

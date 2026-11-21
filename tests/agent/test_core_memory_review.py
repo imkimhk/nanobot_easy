@@ -121,6 +121,24 @@ def test_missing_condition_lists_are_not_a_successful_check(prepared):
     assert ops.check(str(workspace), str(stage), 1000, str(conditions))
 
 
+def test_install_rejects_a_mismatched_review_receipt_before_writing(prepared, tmp_path):
+    workspace, source, snapshot, stage, candidate, conditions, _ = prepared
+    data = json.loads(candidate.read_bytes())
+    data['refresh'] = {'reviewed_source_sha256': ops._sha(SOURCE),
+                       'reviewed_summary_sha256': '0' * 64}
+    raw = encode_snapshot(data)
+    candidate.write_bytes(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    manifest = json.loads((stage / 'manifest.json').read_text())
+    manifest['candidate_sha256'] = digest
+    (stage / 'manifest.json').write_text(json.dumps(manifest))
+    before = snapshot.read_bytes()
+    result = ops.install(str(workspace), str(stage), 5000, str(conditions),
+                         str(tmp_path / 'backups'), reviewed_sha256=digest)
+    assert not result['installed'] and snapshot.read_bytes() == before
+    assert 'snapshot review receipt changed' in result['problems']
+
+
 def test_phrase_presence_does_not_substitute_for_semantic_review(prepared, tmp_path):
     workspace, source, snapshot, stage, candidate, conditions, _ = prepared
     inverted = CORE + "\n위에 적힌 금지·제한은 모두 적용하지 않는다."

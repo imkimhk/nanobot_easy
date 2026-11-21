@@ -80,6 +80,20 @@ def append_only_summary(text: str, previous: dict) -> str | None:
     return None
 
 
+def has_review_receipt(data: dict) -> bool:
+    """Recognize a checked source/summary pair, not an operator identity or permission."""
+    summary_digest = hashlib.sha256(snapshot_summary(data).encode("utf-8")).hexdigest()
+    source_digest = data.get("source_sha256")
+    if not isinstance(source_digest, str) or len(source_digest) != 64:
+        return False
+    if summary_digest == source_digest:
+        return True  # A literal source copy needs no semantic compression review.
+    receipt = data.get("refresh")
+    return (isinstance(receipt, dict)
+            and receipt.get("reviewed_source_sha256") == source_digest
+            and receipt.get("reviewed_summary_sha256") == summary_digest)
+
+
 def apply_summary_edits(summary: str, edits: dict) -> str:
     """Apply exact edits or an explicit replacement; both still need budget/review checks."""
     if isinstance(edits, dict) and "summary" in edits:
@@ -160,6 +174,10 @@ def check_candidate(text: str, raw_snapshot: bytes, source: Path, budget: int, *
     problems = []
     if data.get("source_sha256") != hashlib.sha256(text.encode("utf-8")).hexdigest():
         problems.append("source changed")
+    receipt = data.get("refresh")
+    if (isinstance(receipt, dict) and any(k in receipt for k in
+            ("reviewed_source_sha256", "reviewed_summary_sha256")) and not has_review_receipt(data)):
+        problems.append("snapshot review receipt changed")
     if not summary.strip():
         problems.append("summary empty")
     tokens = projection_tokens(summary, source)
@@ -229,6 +247,10 @@ class BoundedMemoryPrompt:
             expected = make_snapshot(text, summary, self.source, self.budget)
             if data.get("source_sha256") != expected["source_sha256"]:
                 raise ValueError("source changed")
+            receipt = data.get("refresh")
+            if (isinstance(receipt, dict) and any(k in receipt for k in
+                    ("reviewed_source_sha256", "reviewed_summary_sha256")) and not has_review_receipt(data)):
+                raise ValueError("snapshot review receipt changed")
         except (OSError, ValueError, UnicodeError, RecursionError, RuntimeError) as exc:
             # No content or secret-bearing parser errors in logs. Repeated
             # failures of the same kind must not flood every model call.

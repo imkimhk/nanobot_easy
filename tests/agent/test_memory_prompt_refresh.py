@@ -1,6 +1,7 @@
 """Automatic maintenance cannot block chat, lose source edits or grant permissions."""
 
 import asyncio
+import hashlib
 import json
 from contextvars import ContextVar
 
@@ -38,7 +39,10 @@ def setup(root, provider=None):
     source.write_text(text)
     loader = BoundedMemoryPrompt(source, 240)
     snapshot = source.with_name('prompt_snapshot.json')
-    snapshot.write_text(json.dumps(make_snapshot(text, RULE, source, 240)))
+    data = make_snapshot(text, RULE, source, 240)
+    data['refresh'] = {'reviewed_source_sha256': data['source_sha256'],
+                       'reviewed_summary_sha256': hashlib.sha256(RULE.encode()).hexdigest()}
+    snapshot.write_text(json.dumps(data))
     provider = provider or Script([draft(REVISED), LLMResponse(content=APPROVED)])
     refresh = MemoryPromptRefresher(source, 240, lambda: (provider, 'test'))
     loader.refresher = refresh
@@ -104,6 +108,55 @@ async def test_append_only_update_preserves_current_revision_without_model_calls
     assert snapshot_summary(data) == RULE + '\n\n' + added
     assert loader.build(source.read_text()) and provider.calls == []
     assert source.read_text() == previous + added
+    await refresh.close()
+
+
+@pytest.mark.parametrize('legacy', [True, False])
+async def test_append_cannot_silently_reuse_unreviewed_or_tampered_summary(tmp_path, legacy):
+    source, snapshot, loader, refresh, provider = setup(tmp_path)
+    data = json.loads(snapshot.read_text())
+    if legacy:
+        del data['refresh']
+    else:
+        data['summary'] += '\nUnsupported old permission.'
+    snapshot.write_text(json.dumps(data))
+    source.write_text(source.read_text() + '\nNew correction: never overwrite an existing report.')
+    provider.steps = iter([LLMResponse(content=json.dumps({'summary': REVISED})),
+                           LLMResponse(content=APPROVED)])
+    loader.build(source.read_text())
+    await refresh._task
+    assert len(provider.calls) == 2 and 'Unsupported old permission' not in snapshot_summary(json.loads(snapshot.read_text()))
+    assert json.loads(provider.calls[1]['messages'][1]['content'])['source'] == source.read_text()
+    await refresh.close()
+
+
+async def test_explicit_refresh_rechecks_legacy_current_hash_instead_of_treating_it_as_reviewed(tmp_path):
+    source, snapshot, loader, refresh, provider = setup(tmp_path)
+    data = json.loads(snapshot.read_text())
+    del data['refresh']
+    snapshot.write_text(json.dumps(data))
+    assert loader.build(source.read_text()) and refresh._task is None and provider.calls == []
+    provider.steps = iter([LLMResponse(content=json.dumps({'summary': RULE})),
+                           LLMResponse(content=APPROVED)])
+    await refresh._refresh(hashlib.sha256(source.read_text().encode()).hexdigest())
+    result = json.loads(snapshot.read_text())
+    assert len(provider.calls) == 2 and refresh.status['status'] == 'published'
+    assert result['refresh']['reviewed_source_sha256'] == result['source_sha256']
+    assert result['refresh']['reviewed_summary_sha256'] == hashlib.sha256(snapshot_summary(result).encode()).hexdigest()
+    await refresh.close()
+
+
+async def test_updating_only_the_source_hash_cannot_rebind_an_old_review(tmp_path):
+    source, snapshot, loader, refresh, provider = setup(tmp_path)
+    source.write_text(revise(source))
+    data = json.loads(snapshot.read_text())
+    data['source_sha256'] = hashlib.sha256(source.read_text().encode()).hexdigest()
+    snapshot.write_text(json.dumps(data))  # The old review still refers to the old source.
+    assert loader.build(source.read_text()) is None
+    assert loader.status['reason'] == 'snapshot review receipt changed'
+    await refresh._task
+    assert loader.build(source.read_text()) and len(provider.calls) == 2
+    assert REVISED in snapshot_summary(json.loads(snapshot.read_text()))
     await refresh.close()
 
 
