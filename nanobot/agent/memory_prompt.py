@@ -1,12 +1,18 @@
 """Opt-in bounded memory projection; stale/invalid projections retain legacy memory."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from loguru import logger
 
 from nanobot.utils.helpers import estimate_message_tokens
+
+if TYPE_CHECKING:
+    from nanobot.agent.memory_prompt_refresh import MemoryPromptRefresher
 
 SNAPSHOT_NAME = "prompt_snapshot.json"
 _MAX_SNAPSHOT_BYTES = 256_000
@@ -42,14 +48,15 @@ def make_snapshot(text: str, summary: str, source: Path, budget: int) -> dict:
 class BoundedMemoryPrompt:
     """Only a current, readable, in-budget snapshot replaces prompt memory.
 
-    No runtime LLM calls, writes, automatic summaries or request failures. The
-    budget is measured by the existing estimator, not a provider tokenizer.
+    Refresh, when explicitly enabled, runs separately from prompt building.
+    The budget uses the existing estimator, not a provider tokenizer.
     """
 
     def __init__(self, source: Path, budget: int):
         self.source = source
         self.budget = budget
         self._last_error: str | None = None
+        self.refresher: MemoryPromptRefresher | None = None
 
     def build(self, text: str) -> str | None:
         if self.budget <= 0:
@@ -72,7 +79,7 @@ class BoundedMemoryPrompt:
                 raise ValueError("snapshot summary must be text")
             expected = make_snapshot(text, summary, self.source, self.budget)
             if data.get("source_sha256") != expected["source_sha256"]:
-                raise ValueError("source changed; review and refresh the snapshot")
+                raise ValueError("source changed")
         except (OSError, ValueError, UnicodeError, RecursionError, RuntimeError) as exc:
             # No content or secret-bearing parser errors in logs. Repeated
             # failures of the same kind must not flood every model call.
@@ -82,9 +89,12 @@ class BoundedMemoryPrompt:
             if reason != self._last_error:
                 logger.warning(
                     "Bounded memory inactive ({}); keeping legacy memory. "
-                    "Review/compact memory and refresh its snapshot.", reason,
+                    "{}", reason, "Background refresh requested."
+                    if self.refresher else "Review/compact memory and refresh its snapshot.",
                 )
             self._last_error = reason
+            if self.refresher is not None:
+                self.refresher.request(text)
             return None
         self._last_error = None
         return render_projection(summary, self.source)
