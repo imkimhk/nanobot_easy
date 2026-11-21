@@ -25,6 +25,7 @@ from nanobot.agent.memory_prompt import (
     projection_tokens,
     snapshot_summary,
 )
+from nanobot.providers import usage_ledger
 from nanobot.providers.base import LLMProvider, hosted_tools_disabled
 from nanobot.utils.prompt_templates import render_template
 
@@ -58,6 +59,7 @@ class MemoryPromptRefresher:
         self._closed = False
         self._last_digest: str | None = None
         self._retry_at = 0.0
+        self._usage_job: usage_ledger.UsageScope | None = None
 
     def request(self, text: str) -> None:
         if self._closed or self.budget <= 0 or not text.strip():
@@ -75,7 +77,10 @@ class MemoryPromptRefresher:
         self._retry_at = time.monotonic() + _RETRY_DELAY_S
         # Do not inherit a chat's cancellation, permission, provider budget or
         # file-state ContextVars into a separate maintenance operation.
-        self._task = loop.create_task(self._refresh(digest), context=Context())
+        # Usage accounting keeps only the triggering request's opaque id, as a separate job.
+        job = usage_ledger.background_job("memory_refresh", parent=usage_ledger.current_scope(),
+                                          workspace=self.workspace)
+        self._task = loop.create_task(self._refresh(digest, job), context=Context())
 
     def stop(self) -> None:
         self._closed = True
@@ -118,8 +123,8 @@ class MemoryPromptRefresher:
             return None
 
     async def _ask(self, provider: LLMProvider, model: str, template: str,
-                   payload: dict, max_tokens: int) -> str:
-        with hosted_tools_disabled():
+                   payload: dict, max_tokens: int, purpose: str | None = None) -> str:
+        with hosted_tools_disabled(), usage_ledger.bound(self._usage_job, purpose):
             response = await provider.chat_with_retry(
                 model=model, messages=[
                     {"role": "system", "content": render_template(template, strip=True)},
@@ -138,8 +143,9 @@ class MemoryPromptRefresher:
             raise MemoryRefreshError("empty_response")
         return response.content.strip()
 
-    async def _refresh(self, digest: str) -> None:
+    async def _refresh(self, digest: str, usage_job: usage_ledger.UsageScope | None = None) -> None:
         phase = "path checks"
+        self._usage_job = usage_job
         try:
             await asyncio.sleep(_DEBOUNCE_S)
             self._check_paths()
@@ -182,7 +188,8 @@ class MemoryPromptRefresher:
                         for attempts in (1, 2):
                             phase = "generation"
                             summary = await self._ask(provider, model, template,
-                                payload, min(16_000, max(2048, self.budget * 2)))
+                                payload, min(16_000, max(2048, self.budget * 2)),
+                                purpose="memory_refresh_generate")
                             if prior_summary is not None:
                                 try:
                                     summary = apply_summary_edits(payload["previous_summary"], json.loads(summary))
@@ -201,7 +208,8 @@ class MemoryPromptRefresher:
                                 candidate = make_snapshot(text, summary, self.source, self.budget)
                                 phase = "review"
                                 review = json.loads(await self._ask(provider, model,
-                                    "agent/memory_prompt_review.md", {"source": text, "summary": summary}, 2048))
+                                    "agent/memory_prompt_review.md", {"source": text, "summary": summary}, 2048,
+                                    purpose="memory_refresh_review"))
                                 checks = ("constraints_preserved", "faithful", "no_new_authority")
                                 if (not isinstance(review, dict)
                                         or any(type(review.get(k)) is not bool for k in checks)
