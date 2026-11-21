@@ -75,7 +75,11 @@ class SearchMemoryTool(_MemoryToolBase):
     @property
     def description(self) -> str:
         return (
-            "Search scoped raw conversation memory for historical evidence. Use before answering questions about prior work, "
+            "Search current long-term memory sections and scoped conversation history. "
+            "For explicitly requested memory edits, locate the current section first; "
+            "event_types=['CURATED_MEMORY_EDIT'] restricts the search to document sections. "
+            "Use returned read_file_args to read that range before an authorized edit and re-read it afterward. "
+            "Use before answering questions about prior work, "
             "old decisions, previous file/tool changes, 'before/last time/that time', or when a past answer/review is requested. "
             "Reuse an applicable earlier result when available. Errors mean unverified, not no matches. "
             "For backend/index errors, retry at most once if potentially transient, then report retrieval unavailable. "

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import sqlite3
@@ -428,7 +429,7 @@ def format_search_result(result: SearchResult) -> str:
         lines.append(f"session: {row['session_id']}")
         lines.append(f"score: {row['score']:.2f}")
         if row.get("document"):
-            lines.append(document_source_line(row["document"]))
+            lines.append(document_source_line(row["document"], read_hint=True))
         lines.append(f"snippet: {row['snippet']}")
         if row.get("truncated"):
             lines.append("[snippet_truncated=true; use read_memory_events for raw content]")
@@ -443,11 +444,18 @@ def format_search_result(result: SearchResult) -> str:
     return rendered[: max(0, FORMATTED_RESULT_CHAR_BUDGET - len(suffix))].rstrip() + suffix
 
 
-def document_source_line(meta: dict[str, Any]) -> str:
+def document_source_line(meta: dict[str, Any], *, read_hint: bool = False) -> str:
     """Provenance of a MEMORY.md section: curated document, never a conversation transcript."""
-    return (f"source: {meta.get('source')} lines {meta.get('line_start')}-{meta.get('line_end')} "
-            f"(curated memory document, not a conversation transcript); "
-            f"version: {meta.get('status', 'unknown')} file_sha256={str(meta.get('file_sha256'))[:16]}")
+    provenance = (f"source: {meta.get('source')} lines {meta.get('line_start')}-{meta.get('line_end')} "
+                  f"(curated memory document, not a conversation transcript); "
+                  f"version: {meta.get('status', 'unknown')} file_sha256={str(meta.get('file_sha256'))[:16]}")
+    start, end = meta.get("line_start"), meta.get("line_end")
+    if (read_hint and meta.get("source") == "memory/MEMORY.md" and meta.get("status") == "current"
+            and type(start) is int and type(end) is int and 1 <= start <= end):
+        # A location hint never replaces a current filesystem read or grants write permission.
+        args = {"path": "memory/MEMORY.md", "offset": start, "limit": end - start + 1}
+        provenance += "\nread_file_args: " + json.dumps(args)
+    return provenance
 
 
 def _compact_rows_for_display(windows: tuple[EventWindow, ...], query: str) -> tuple[list[dict[str, Any]], int]:
