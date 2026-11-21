@@ -9,6 +9,9 @@ with the full source. Fix superseded facts and missing current limits. Preserve
 negation, scope, conditions and relevant dates. Do not expand already condensed
 historical references into a copy of the full source. Keep source languages and
 reply-language rules; this internal artifact is not a user-facing answer.
+Core memory keeps preferences, active limits, corrections, permission and role
+boundaries and behavior-critical exact values; completed work history and project
+detail stay retrievable by search and may be condensed, never a current limit.
 
 Return only strict JSON: {"edits":[{"old":"exact unique substring","new":"replacement"}]}.
 Each old string must occur exactly once in previous_summary after preceding edits.
