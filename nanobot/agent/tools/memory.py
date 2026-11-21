@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.base import Tool, ToolResult
 from nanobot.agent.tools.context import RequestContext, ToolContext, current_request_context
+from nanobot.memory.curated_source import DocSyncStatus, sync_memory_md
 from nanobot.memory.event_store import ConversationEventStore
 from nanobot.memory.models import MemoryScope
 from nanobot.memory.privacy import forget_events, purge_events
@@ -52,6 +54,18 @@ class _MemoryToolBase(Tool):
     def _scope(self) -> MemoryScope:
         return _scope_from_context(self.workspace, current_request_context() or self._ctx.get())
 
+    def _sync_document(self) -> DocSyncStatus:
+        """Cheap freshness check of memory/MEMORY.md; failures degrade to 'unverified', never raise."""
+        try:
+            return sync_memory_md(self.store, _workspace_id(self.workspace))
+        except Exception as exc:  # defensive: conversation memory must stay usable
+            return DocSyncStatus("unverified", error=f"sync failed: {type(exc).__name__}")
+
+    @staticmethod
+    def _with_note(text: str, status: DocSyncStatus) -> str:
+        note = status.note()
+        return f"{text}\n{note}" if note else text
+
 
 class SearchMemoryTool(_MemoryToolBase):
     @property
@@ -89,6 +103,7 @@ class SearchMemoryTool(_MemoryToolBase):
         }
 
     async def execute(self, **kwargs: Any) -> Any:
+        doc = await asyncio.to_thread(self._sync_document)
         result = MemorySearcher(self.store).search(
             scope=self._scope(),
             query=str(kwargs.get("query") or ""),
@@ -100,11 +115,12 @@ class SearchMemoryTool(_MemoryToolBase):
             limit=int(kwargs.get("limit") or 10),
             max_context_tokens=int(kwargs.get("max_context_tokens") or 4000),
             exclude_event_ids=kwargs.get("exclude_event_ids") or None,
+            include_documents=doc.verified,
         )
         from nanobot.agent.context_corrections import correction_notes
 
         ids = [eid for window in getattr(result, "windows", []) for eid in getattr(window, "event_ids", [])]
-        return format_search_result(result) + correction_notes(self.store, self._scope(), ids)
+        return self._with_note(format_search_result(result), doc) + correction_notes(self.store, self._scope(), ids)
 
 
 class ReadMemoryEventsTool(_MemoryToolBase):
@@ -131,20 +147,26 @@ class ReadMemoryEventsTool(_MemoryToolBase):
         }
 
     async def execute(self, **kwargs: Any) -> Any:
+        doc = await asyncio.to_thread(self._sync_document)
+        requested = [str(x) for x in kwargs.get("event_ids") or []]
         events = read_memory_events(
             self.store,
             self._scope(),
-            [str(x) for x in kwargs.get("event_ids") or []],
+            requested,
             max_total_tokens=kwargs.get("max_total_tokens"),
+            include_documents=doc.verified,
         )
         from nanobot.agent.context_corrections import correction_notes
         from nanobot.agent.context_evidence import active_evidence_capture
 
-        text = format_raw_events(events) + correction_notes(self.store, self._scope(), [e.event_id for e in events])
+        text = format_raw_events(events)
+        if not doc.verified and any(eid.startswith("memmd-") for eid in requested):
+            text = self._with_note(text, doc)
+        text += correction_notes(self.store, self._scope(), [e.event_id for e in events])
         if not active_evidence_capture.get():
             return text
-        originals = self.store.get_events(self._scope(), [e.event_id for e in events])
-        complete = (bool(events) and len(events) == len(originals) and all(
+        originals = self.store.get_events(self._scope(), [e.event_id for e in events], include_documents=True)
+        complete = (bool(events) and len(events) == len(set(requested)) == len(originals) and all(
             e.content is not None and not e.redacted_at and any(
                 raw.event_id == e.event_id and raw.content == e.content for raw in originals) for e in events))
         result = ToolResult(text)
@@ -180,5 +202,16 @@ class ForgetMemoryEventsTool(_MemoryToolBase):
     async def execute(self, **kwargs: Any) -> Any:
         ids = [str(x) for x in kwargs.get("event_ids") or []]
         mode = str(kwargs.get("mode") or "forget")
-        count = purge_events(self.store, self._scope(), ids) if mode == "purge" else forget_events(self.store, self._scope(), ids)
-        return f"{mode} applied to {count} scoped memory event(s)."
+        # Personal history keeps its existing purge semantics. Shared document changes must
+        # not let one chat remove evidence for every other user of the workspace.
+        scope = self._scope()
+        operation = purge_events if mode == "purge" else forget_events
+        count = await asyncio.to_thread(operation, self.store, scope, ids)
+        hidden = await asyncio.to_thread(self.store.hide_document_events, scope, ids)
+        text = f"{mode} applied to {count} scoped conversation memory event(s)."
+        if hidden:
+            text += (f" {hidden} shared document section(s) hidden from this user's retrieval only; "
+                     "other users are unaffected. This is not a complete deletion or shared-payload purge: "
+                     "the shared DB copy, MEMORY.md and system prompt remain. Complete removal requires "
+                     "an explicitly authorized edit of the source and its derived copies.")
+        return text
