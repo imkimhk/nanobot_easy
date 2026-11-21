@@ -69,6 +69,9 @@ async def test_stale_falls_back_immediately_then_refreshes_once_without_source_m
     assert 'Old implementation detail.' not in builder.build_compact_system_prompt()
     assert len(provider.calls) == 2
     assert all(c['tools'] is None and c['max_retries'] == 0 for c in provider.calls)
+    initial = json.loads(provider.calls[0]['messages'][1]['content'])
+    assert initial['summary_token_target'] == initial['summary_token_budget'] == 240
+    assert initial['previous_draft_tokens'] < 240
     assert len(provider.calls[1]['messages']) == 2  # Separate review, no draft conversation.
     assert json.loads(snapshot.read_text())['refresh']['method'] == 'model-reviewed'
     await refresh.close()

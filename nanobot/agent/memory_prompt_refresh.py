@@ -204,6 +204,10 @@ class MemoryPromptRefresher:
                                    "summary_token_budget": self.budget}
                         if prior_summary is not None:
                             payload["previous_summary"] = prior_summary
+                            # A valid-sized old summary needs reconciliation, not a
+                            # gratuitous rewrite to an arbitrary 90% soft target.
+                            payload["summary_token_target"] = self.budget
+                            payload["previous_draft_tokens"] = projection_tokens(prior_summary, self.source)
                         for attempts in (1, 2):
                             phase = "generation"
                             self.status.update(attempt=attempts)
