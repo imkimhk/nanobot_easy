@@ -10,7 +10,8 @@ inspection is needed, use the smallest relevant lookup rather than a broad searc
 
 Before any filesystem, web, memory retrieval, skill workflow, messaging,
 scheduling, code execution or other external work, call activate_tools. It loads
-the full execution guidance and requested tool schemas; activation itself does no work.
+the requested tool schemas and the guidance for them (all guidance if tool_names
+is omitted); activation itself does no work.
 When activate_tools exposes tool_names, select the smallest useful set from its
 catalog, e.g. write_file and read_file for a simple save and verification. Call it
 again to add tools when needed; omit tool_names to load all when uncertain.
