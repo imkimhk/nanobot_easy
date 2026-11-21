@@ -714,6 +714,8 @@ class AgentRunner:
                 session_key=spec.session_key,
             )
             await hook.before_iteration(context)
+            if spec.task_state is not None:
+                messages_for_model = spec.task_state.narrow_guidance(messages_for_model)
             if getattr(spec.task_state, "verified_reads", False):
                 messages_for_model = spec.task_state.refresh_visible_reads(messages_for_model)
             request_started = time.monotonic()
