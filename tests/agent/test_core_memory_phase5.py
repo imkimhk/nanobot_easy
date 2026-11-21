@@ -235,7 +235,7 @@ async def test_failed_candidates_are_never_published(tmp_path, case):
     assert loader.build(revised) is None
     await loader.refresher._task
     assert snapshot.read_bytes() == before  # nothing published
-    # Existing bounds: at most two drafts and two reviews, then the cooldown applies.
+    # At most two drafts and two reviews; unchanged quality failures do not repeat on chat turns.
     assert len(provider.calls) == {"over_budget": 2, "rejected": 4, "concurrent_edit": 2,
                                    "corrupted": 2}[case]
     if case != "concurrent_edit":

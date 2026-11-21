@@ -81,7 +81,11 @@ def append_only_summary(text: str, previous: dict) -> str | None:
 
 
 def apply_summary_edits(summary: str, edits: dict) -> str:
-    """Apply model-proposed exact edits in memory; ambiguous matches never execute."""
+    """Apply exact edits or an explicit replacement; both still need budget/review checks."""
+    if isinstance(edits, dict) and "summary" in edits:
+        if set(edits) != {"summary"} or not isinstance(edits["summary"], str) or not edits["summary"].strip():
+            raise ValueError("invalid summary replacement")
+        return edits["summary"]
     if not isinstance(edits, dict) or not isinstance(edits.get("edits"), list) or len(edits["edits"]) > 20:
         raise ValueError("invalid summary edits")
     for edit in edits["edits"]:

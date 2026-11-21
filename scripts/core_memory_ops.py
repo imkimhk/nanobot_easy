@@ -116,26 +116,52 @@ def inspect(workspace: str, config: str | None = None) -> dict:
     return row
 
 
-async def generate(workspace: str, staging: str, budget: int, provider, model: str) -> dict:
+class _StagedRefresher(MemoryPromptRefresher):
+    """Keep bounded diagnostic responses only in the explicitly private operator stage."""
+
+    async def _ask(self, provider, model, template, payload, max_tokens, purpose=None):
+        response = await super()._ask(provider, model, template, payload, max_tokens, purpose)
+        count = len(list(self.workspace.glob("attempt-*.json"))) + 1
+        record = {"purpose": purpose, "response": response}
+        raw = json.dumps(record, ensure_ascii=False).encode("utf-8")
+        if len(raw) > _MAX_FILE_BYTES:
+            record = {"purpose": purpose, "response_sha256": _sha(response),
+                      "omitted": "response exceeds private diagnostic size limit"}
+            raw = json.dumps(record).encode("utf-8")
+        _write_new(self.workspace / f"attempt-{count}.json", raw)
+        return response
+
+
+async def generate(workspace: str, staging: str, budget: int, provider, model: str, *,
+                   reuse_snapshot: bool = False) -> dict:
     """Generate/review on a new private copy; never reuse or unlink a previous stage."""
     if type(budget) is not int or not 1 <= budget <= 20_000:
         raise ValueError("budget must be between 1 and 20000")
-    root, source, _ = _paths(workspace)
+    root, source, snapshot = _paths(workspace)
     stage = _private_location(staging, root)
     text = _source_text(source)
+    previous = _read(snapshot) if reuse_snapshot and snapshot.exists() else None
+    if previous is not None:
+        snapshot_summary(json.loads(previous))  # Reject malformed input before creating the stage.
     stage.mkdir(parents=True, exist_ok=False, mode=0o700)
     (stage / "memory").mkdir(mode=0o700)
     staged = stage / "memory/MEMORY.md"
     _write_new(staged, text.encode("utf-8"))
-    refresher = MemoryPromptRefresher(staged, budget, lambda: (provider, model))
+    if previous is not None:
+        _write_new(stage / "memory" / SNAPSHOT_NAME, previous)
+    refresher = _StagedRefresher(staged, budget, lambda: (provider, model))
     await refresher._refresh(_sha(text))
     produced = stage / "memory" / SNAPSHOT_NAME
+    current = (produced.is_file() and refresher.status.get("status") in {"published", "current"}
+               and json.loads(_read(produced)).get("source_sha256") == _sha(text))
     manifest = {"workspace": str(root), "source_sha256": _sha(text), "budget": budget,
                 "created_at": datetime.now(timezone.utc).isoformat(),
-                "candidate_sha256": hashlib.sha256(_read(produced)).hexdigest() if produced.exists() else None}
+                "candidate_sha256": hashlib.sha256(_read(produced)).hexdigest() if current else None,
+                "refresh_status": refresher.status}
     _write_new(stage / "manifest.json", json.dumps(manifest).encode("utf-8"))
-    return {"candidate": produced.is_file(), "staging": str(stage),
-            "candidate_sha256": manifest["candidate_sha256"], "semantic_review_required": True}
+    return {"candidate": bool(current), "staging": str(stage),
+            "candidate_sha256": manifest["candidate_sha256"], "semantic_review_required": True,
+            "refresh_status": refresher.status}
 
 
 def _checked_candidate(root: Path, text: str, source: Path, stage: Path,
@@ -252,6 +278,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--conditions")
     parser.add_argument("--backup")
     parser.add_argument("--reviewed-sha256", help="SHA256 of the candidate separately reviewed for meaning")
+    parser.add_argument("--reuse-snapshot", action="store_true",
+                        help="Copy the existing snapshot into the private stage for a full-source-audited update")
     args = parser.parse_args(argv)
     required = {"inspect": [], "generate": ["staging", "budget", "config"],
                 "check": ["staging", "budget", "conditions"],
@@ -270,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config(Path(args.config))
             provider = make_provider(config)
             result = asyncio.run(generate(args.workspace, args.staging, args.budget, provider,
-                                          provider.get_default_model()))
+                                          provider.get_default_model(), reuse_snapshot=args.reuse_snapshot))
             success = result["candidate"]
         elif args.command == "check":
             problems = check(args.workspace, args.staging, args.budget, args.conditions)

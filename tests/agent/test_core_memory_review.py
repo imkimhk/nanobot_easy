@@ -207,3 +207,60 @@ def test_aggregate_counts_are_prompt_builds_and_log_at_bounded_intervals(prepare
     for _ in range(26):
         loader.build(SOURCE)
     assert loader.counts["builds"] == loader.counts["fallback_builds"] == 26
+
+
+async def test_private_stage_keeps_failed_review_diagnostics_without_publication(prepared, tmp_path):
+    workspace, source, snapshot, *_ = prepared
+    original = source.read_bytes(), snapshot.read_bytes()
+    revised = SOURCE.replace('synthetic_001', 'synthetic_changed', 1) + '\nCurrent rule: never send the report.'
+    source.write_text(revised)
+    rejected = json.dumps({'constraints_preserved': False, 'faithful': True,
+                           'no_new_authority': True, 'issues': ['Missing send restriction']})
+    provider = Script([
+        LLMResponse(content='{"edits":[]}'), LLMResponse(content=rejected),
+        LLMResponse(content='{"edits":[]}'), LLMResponse(content=rejected)])
+    stage = tmp_path / 'diagnostic-stage'
+    result = await ops.generate(str(workspace), str(stage), 1000, provider, 'test', reuse_snapshot=True)
+    assert not result['candidate'] and result['candidate_sha256'] is None
+    assert result['refresh_status']['reason'] == 'review_rejected'
+    assert snapshot.read_bytes() == original[1]
+    assert source.read_text() == revised
+    assert len(list(stage.glob('attempt-*.json'))) == 4
+    assert json.loads((stage / 'attempt-2.json').read_text())['response'] == rejected
+    assert json.loads((stage / 'manifest.json').read_text())['candidate_sha256'] is None
+    assert not list(workspace.glob('attempt-*.json'))
+    import os
+    if os.name != 'nt':
+        assert stage.stat().st_mode & 0o777 == 0o700
+        assert all(p.stat().st_mode & 0o777 == 0o600 for p in stage.glob('attempt-*.json'))
+
+
+async def test_reused_snapshot_is_reconciled_against_full_source_and_reviewed(prepared, tmp_path):
+    workspace, source, snapshot, *_ = prepared
+    source.write_text(SOURCE.replace('synthetic_001', 'synthetic_changed', 1)
+                      + '\nNew limit: no report sending.')
+    approved = json.dumps({'constraints_preserved': True, 'faithful': True,
+                           'no_new_authority': True, 'issues': []})
+    provider = Script([
+        LLMResponse(content='{"edits":[{"old":"","new":"New limit: no report sending."}]}'),
+        LLMResponse(content=approved)])
+    before = snapshot.read_bytes()
+    stage = tmp_path / 'updated-stage'
+    result = await ops.generate(str(workspace), str(stage), 1000, provider, 'test', reuse_snapshot=True)
+    assert result['candidate'] and snapshot.read_bytes() == before
+    first = json.loads(provider.calls[0]['messages'][1]['content'])
+    assert first['source'] == source.read_text() and first['previous_summary'] == CORE
+    second = json.loads(provider.calls[1]['messages'][1]['content'])
+    assert second['source'] == source.read_text() and 'New limit: no report sending.' in second['summary']
+
+
+async def test_same_source_oversized_old_snapshot_is_not_a_successful_candidate(prepared, tmp_path):
+    workspace, source, snapshot, *_ = prepared
+    huge = 'Historical detail. ' * 2000
+    snapshot.write_bytes(encode_snapshot(make_snapshot(SOURCE, huge, source, 20000)))
+    before = snapshot.read_bytes()
+    result = await ops.generate(str(workspace), str(tmp_path / 'oversized-stage'), 1000,
+                                Script([LLMResponse(content=huge)] * 2), 'test', reuse_snapshot=True)
+    assert not result['candidate'] and result['candidate_sha256'] is None
+    assert result['refresh_status']['reason'] == 'summary_over_budget'
+    assert snapshot.read_bytes() == before
