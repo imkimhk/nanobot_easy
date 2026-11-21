@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from nanobot.agent.task_progress import TaskProgress
 from nanobot.agent.tools.base import Tool, ToolResult
+from nanobot.agent.write_scope import protected_files
 from nanobot.session.history_visibility import is_hidden_history_message
 
 _WORK = re.compile(r"검토|분석|비교|수정|저장|구현|파악|판정|진단|조사|review|analy[sz]|compare|edit|save|diagnos|investigat", re.I)
@@ -22,7 +23,6 @@ _FOLLOWUP = re.compile(r"^(네|예|응|q\d+|yes|ok)[.!\s]*$|그\s*(파일|문서
 _ADVICE = re.compile(r"설명|방법|절차|개념|의미|\b(?:explain|how|should\s+i)\b", re.I)
 _REVIEW = re.compile(r"검토|분석|비교|파악|판정|진단|조사|review|analy[sz]|compare|diagnos|investigat", re.I)
 _ACTION = re.compile(r"(?:저장|수정|변경|삭제|실행|구현)\s*(?:해(?=[\s.!?]|$)|해\s*(?:줘|주세요)|하(?:세요|십시오|라))", re.I)
-_NO_WRITE = re.compile(r"저장\s*(?:하지\s*(?:마|말)|금지)|수정\s*하지\s*(?:마|말)|검토만|읽기\s*전용|do not (?:save|write|edit)|review only", re.I)
 _FILES = re.compile(r"(?:(?<=['\"`])[\w.~ /-]+|(?:[\w.~/-]+/)?[\w.~-]+)\.(?:md|txt|py|json|pdf|docx|xlsx|csv|yaml|yml|ts|tsx)(?![A-Za-z0-9_])", re.I)
 _SAVE = re.compile(
     r"(?:저장|수정)\s*(?:해\s*(?:줘|주세요)|하(?:세요|십시오|라))|고쳐\s*(?:줘|주세요)"
@@ -390,7 +390,12 @@ class TaskNote:
             "For a short answer connected to the latest option, use that conversation; do not "
             "search memory unless a necessary past constraint is absent. "
             "A file mentioned only in a standalone keep/forbid clause is not a read/write "
-            "deliverable; do not acquire it merely to register it. For a question explicitly "
+            "deliverable; do not acquire it merely to register it. Apply a file-specific ban "
+            "only to that file, while respecting independently authorized writes. If the "
+            "allowed scope is unclear, ask a specific question with status=clarification; "
+            "do not broaden scope or inspect guard implementation merely to get around "
+            "a blocked action. "
+            "For a question explicitly "
             "limited to this conversation's history of past reads/approvals, use source=none "
             "and targets=[]; do not open the mentioned files or search disk for permission. "
             "When a conditional change lacks confirmed permission, report that limit with "
@@ -685,8 +690,36 @@ class TaskNote:
             return "Only the final report needs correction. Do not repeat or start state-changing work."
         if not self.update:
             return "Intent unconfirmed. Record the latest intent with update_task before mutation."
-        if _NO_WRITE.search(self.request):
-            return "The latest request forbids changes. Continue read-only analysis or ask a question."
+        protected = protected_files(_instruction_text(self.request), self.workspace)
+        if protected is None:
+            return ("The latest request forbids changes or its allowed scope is unresolved. "
+                    "Continue read-only work. If a change is needed, ask which file may be "
+                    "changed and use status=clarification; do not broaden scope or bypass the guard.")
+        if protected:
+            # Only real file-tool arguments enumerate effects. A declared target or a
+            # shell command string cannot prove which files a command/delegate will touch.
+            paths = []
+            if name in {"write_file", "edit_file"}:
+                paths = [params.get("path")]
+            elif name == "apply_patch" and isinstance(params.get("edits"), list):
+                paths = [e.get("path") if isinstance(e, dict) else None for e in params["edits"]]
+            if not paths or any(not isinstance(path, str) or not path for path in paths):
+                return ("This tool does not expose all affected files for the user's file "
+                        "restriction. Use a file tool with explicit paths for an already "
+                        "authorized change, or ask a specific scope question "
+                        "(status=clarification). Do not bypass through shell or delegation.")
+            for path in paths:
+                canonical = self.canonical(path)
+                if any(self.canonical(ref) == canonical
+                       or ("/" not in ref and "\\" not in ref and Path(canonical).name == ref)
+                       or (ref.endswith("/") and Path(canonical).is_relative_to(self.canonical(ref)))
+                       for ref in protected):
+                    return ("This file is protected by the latest user request. Do not change "
+                            "it or bypass the restriction. If it is needed to finish the task, "
+                            "ask a specific question and use status=clarification.")
+                if not any(t.action == "write" and self.canonical(t.path) == canonical
+                           for t in self.update.targets):
+                    return "Write target is not connected to the current structured request."
         if self.update.intent == "withdraw":
             return "The current task was withdrawn; do not mutate."
         if self.update.status in {"blocked", "clarification"}:
@@ -919,8 +952,8 @@ class TaskNote:
                         status, "execution_required") + f":{target.path}")
                 elif events[-1]["id"] not in update.result_refs:
                     defects.append(f"answer_correction:{target.path}:missing_result_reference")
-        if _SAVE.search(instruction) and not _NO_WRITE.search(instruction) and not any(
-                t.action == "write" for t in update.targets):
+        if (_SAVE.search(instruction) and protected_files(instruction, self.workspace) is not None
+                and not any(t.action == "write" for t in update.targets)):
             defects.append("write_target_unresolved")
         if not update.analysis_complete:
             defects.append("analysis_incomplete")
