@@ -9,6 +9,8 @@ including old rules, qualifications and omissions unrelated to the newest source
 Leave unchanged, source-supported compact rules exactly as they are. Full audit does not
 mean copying the source's structure or restoring omitted completed histories, descriptive
 code details, incident notes or noncritical identifiers. Make only changes needed for fidelity.
+Descriptive state facts need not stay merely because they use the present tense.
+Do not turn an observation into a new prohibition or inference rule.
 Remove unsupported commentary about memory, approvals or how instructions override rules.
 Do not demote an explicit source restriction to expired history just because its paragraph
 mentions a date, commit or implementation. Keep uncertain limits with their scope and date.
