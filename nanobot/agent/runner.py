@@ -555,7 +555,8 @@ class AgentRunner:
                             )
                         else:
                             feedback += spec.task_state.guidance()["content"]
-                        messages.append({"role": "user", "_hidden_history": True, "content": feedback})
+                        messages.append({"role": "user", "_hidden_history": True,
+                                         "_task_control": True, "content": feedback})
                         return clean, True
                 clean, stop_reason = spec.task_state.completion_result(clean, check=check)
                 assistant_message["content"] = clean

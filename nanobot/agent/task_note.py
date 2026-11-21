@@ -253,7 +253,11 @@ class TaskUpdate(BaseModel):
     )
     source: Literal["files", "provided", "none"]
     analysis_complete: bool
-    status: Literal["active", "completed", "cancelled", "partial", "blocked", "clarification"]
+    status: Literal["active", "completed", "cancelled", "partial", "blocked", "clarification"] = Field(
+        description="If reading/writing cannot proceed, use blocked or partial with the report "
+                    "in final_answer. This includes 'if absent, just report' and 'if already "
+                    "present, do not overwrite'. Never mark unperformed acquisition/writing completed.",
+    )
     explanation: str = Field(min_length=1, max_length=2000)
     result_refs: list[str] = Field(default_factory=list, max_length=40)
     final_answer: str = Field(
@@ -337,8 +341,28 @@ class TaskNote:
         self.events = []
         self.persist("active")
 
+    def prompt_evidence(self) -> list[dict]:
+        """Expose relevant proofs without removing candidates from the persisted ledger."""
+        if self.update is not None:
+            paths = [t.path for t in self.update.targets]
+            if not paths and self.update.source == "files":
+                return self.evidence[-20:]  # Scope is unresolved; keep discovery candidates.
+        else:
+            instruction = _instruction_text(self.request)
+            paths, _, unresolved = _file_requests(instruction)
+            if not paths and _SAVE.search(instruction):
+                paths = unresolved  # Named save payloads also identify prompt candidates, not approval.
+            if not paths:
+                return self.evidence[-20:]  # Deictic follow-ups still need earlier candidates.
+        try:
+            targets = {self.canonical(path) for path in paths}
+        except (OSError, RuntimeError, ValueError):
+            return self.evidence[-20:]  # A prompt optimisation must not prevent error reporting.
+        return [e for e in self.evidence if e.get("request_id") == self.request_id
+                or e.get("target") in targets][-20:]
+
     def guidance(self) -> dict:
-        return {"role": "user", "_hidden_history": True, "content": (
+        return {"role": "user", "_hidden_history": True, "_task_control": True, "content": (
             f"[Task evidence control; current request_id={self.request_id}]\n"
             "Use update_task in the existing tool loop for this request. Interpret the latest user "
             "instruction against the conversation; record selected targets and requested ranges. "
@@ -356,6 +380,9 @@ class TaskNote:
             "discovery or a question, not the first match. For a section request identify its actual "
             "line/page range, not the section number as a line number. Before changing state record "
             "the current intent. After analysis record analysis_complete and the actual status. "
+            "A completed fallback report is not a completed read/write: when a user condition "
+            "prevents that operation (missing material or an existing file that must not be "
+            "overwritten), use blocked/partial with the actual report in final_answer. "
             "A successful search is not document acquisition. Read coverage is checked from tool "
             "contracts, not your declaration. Use source=provided only when the requested material "
             "is actually supplied, not merely an example code block alongside a file request. "
@@ -402,7 +429,7 @@ class TaskNote:
             "a job is not completion; report running/unknown as partial and never relaunch "
             "to repair reporting. A known nonzero exit or timeout must be reported honestly.\n"
             + (self._VERIFIED_READS_NOTE if self.verified_reads else "")
-            + json.dumps({"cached_reads": self.evidence[-20:],
+            + json.dumps({"cached_reads": self.prompt_evidence(),
                           "write_results": self.write_results(),
                           "scope_conflicts": self.scope_conflicts(),
                           "superseded_mutations": self.superseded_mutations[-20:],
@@ -645,7 +672,7 @@ class TaskNote:
         self.persist("active")
         return json.dumps({"request_id": self.request_id, "defects": defects,
                            "scope_conflicts": self.scope_conflicts(),
-                           "evidence": self.evidence[-20:],
+                           "evidence": self.prompt_evidence(),
                            "write_results": self.write_results(),
                            "runtime_linked_result_refs": self.runtime_linked_result_refs[-40:],
                            "superseded_mutations": self.superseded_mutations[-20:]},
