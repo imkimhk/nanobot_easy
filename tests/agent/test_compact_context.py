@@ -196,9 +196,11 @@ async def test_empty_catalog_still_allows_legacy_activation():
     assert overlay.get_definitions() == []
 
 
-def test_compact_config_is_explicit_and_default_off():
-    assert Config().agents.defaults.compact_context is False
-    assert Config.model_validate({"agents": {"defaults": {"compactContext": True}}}).agents.defaults.compact_context
+def test_compact_config_is_explicit_and_default_on():
+    assert Config().agents.defaults.compact_context is True
+    assert not Config.model_validate(
+        {"agents": {"defaults": {"compactContext": False}}}
+    ).agents.defaults.compact_context
 
 
 async def test_compact_and_lightweight_preserve_both_paths(tmp_path):
